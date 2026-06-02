@@ -1,0 +1,22 @@
+[package]
+name = "oxih5-format"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Low-level HDF5 binary format parsers for OxiH5"
+categories = ["parser-implementations", "science"]
+keywords = ["hdf5", "h5", "parser", "cooljapan", "oxih5"]
+
+[features]
+default = []
+parallel = ["dep:rayon"]
+szip = ["dep:oxiarc-szip"]
+
+[dependencies]
+oxih5-core     = { workspace = true }
+oxiarc-deflate = { workspace = true }
+oxiarc-szip    = { workspace = true, optional = true }
+rayon          = { workspace = true, optional = true }

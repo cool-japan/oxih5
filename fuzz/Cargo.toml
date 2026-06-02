@@ -1,0 +1,40 @@
+[workspace]
+
+[package]
+name = "oxih5-fuzz"
+version = "0.1.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxih5-format = { path = "../crates/oxih5-format" }
+oxih5-core = { path = "../crates/oxih5-core" }
+oxih5 = { path = "../crates/oxih5" }
+
+[[bin]]
+name = "fuzz_superblock"
+path = "fuzz_targets/fuzz_superblock.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_header"
+path = "fuzz_targets/fuzz_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_message"
+path = "fuzz_targets/fuzz_message.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_file_open"
+path = "fuzz_targets/fuzz_file_open.rs"
+test = false
+doc = false

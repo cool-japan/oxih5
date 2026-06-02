@@ -1,0 +1,28 @@
+[package]
+name = "oxih5-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Core types and error for OxiH5 (Pure Rust HDF5 reader)"
+categories = ["parser-implementations", "science"]
+keywords = ["hdf5", "h5", "pure-rust", "cooljapan", "oxih5"]
+
+[features]
+default = []
+ndarray = ["dep:ndarray"]
+dhat-heap = ["dep:dhat"]
+
+[dependencies]
+thiserror = { workspace = true }
+ndarray = { workspace = true, optional = true }
+dhat = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "conv_bench"
+harness = false

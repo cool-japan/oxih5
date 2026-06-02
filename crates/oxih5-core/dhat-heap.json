@@ -1,0 +1,18 @@
+{
+"dhatFileVersion": 2,
+"mode": "rust-heap",
+"verb": "Allocated",
+"bklt": true,
+"bkacc": false,
+"tu": "µs",
+"Mtu": "s",
+"tuth": 10,
+"cmd": "/Users/kitasan/work/noffi/oxih5/target/debug/deps/dhat_test-8204f0ce6633d3d6 --exact lazy_iter_allocates_less_than_eager --nocapture",
+"pid": 46442,
+"tg": 0,
+"te": 359404,
+"pps": [],
+"ftbl": [
+"[root]"
+]
+}
