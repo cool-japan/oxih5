@@ -30,7 +30,7 @@ pub fn parse_fixed_array(
     header_address: u64,
     ndims: usize,
 ) -> Result<Vec<ChunkRecord>, OxiH5Error> {
-    parse_fixed_array_inner(file_data, header_address, ndims, &[], 0)
+    parse_fixed_array_inner(file_data, header_address, ndims, &[], &[], 0)
 }
 
 /// Like [`parse_fixed_array`] but supplies the chunk dimensions and element
@@ -47,6 +47,27 @@ pub fn parse_fixed_array_v4(
         header_address,
         ndims,
         chunk_dims,
+        &[],
+        uncompressed_chunk_bytes,
+    )
+}
+
+/// Like [`parse_fixed_array_v4`] but also supplies the full dataset dimensions
+/// so that the chunk grid can be computed exactly via `ceil(dataset_dims[d]/chunk_dims[d])`.
+pub fn parse_fixed_array_v4_with_dataset_dims(
+    file_data: &[u8],
+    header_address: u64,
+    ndims: usize,
+    chunk_dims: &[u64],
+    dataset_dims: &[u64],
+    uncompressed_chunk_bytes: usize,
+) -> Result<Vec<ChunkRecord>, OxiH5Error> {
+    parse_fixed_array_inner(
+        file_data,
+        header_address,
+        ndims,
+        chunk_dims,
+        dataset_dims,
         uncompressed_chunk_bytes,
     )
 }
@@ -56,6 +77,7 @@ fn parse_fixed_array_inner(
     header_address: u64,
     ndims: usize,
     chunk_dims: &[u64],
+    dataset_dims: &[u64],
     uncompressed_chunk_bytes: usize,
 ) -> Result<Vec<ChunkRecord>, OxiH5Error> {
     let base = header_address as usize;
@@ -181,16 +203,7 @@ fn parse_fixed_array_inner(
     // Pre-compute grid strides for deriving per-chunk N-dim offsets from flat
     // index `i`.  strides[d] = product(grid_dims[d+1..]).
     let grid_dims: Vec<u64> = if !chunk_dims.is_empty() && ndims == chunk_dims.len() {
-        // Compute number of chunks per dimension from the FAHD max_nelmts and
-        // chunk_dims.  We use ceil(dataset_nchunks_per_dim) which we
-        // approximate as ceil(sqrt^ndims(max_nelmts)) — but without dataset
-        // dims we can't compute exactly.  Instead, store a placeholder and
-        // derive offsets as: offset[d] = (i / stride_d) % grid_d * chunk_dim[d].
-        // The FA stores elements in row-major order, so the natural unranking
-        // works even without knowing grid_dims explicitly.
-        // We use a simpler approach: unrank `i` in row-major order with
-        // chunk_dims given and a total of `n` chunks.
-        compute_grid_dims(n as u64, ndims, chunk_dims)
+        compute_grid_dims(n as u64, ndims, chunk_dims, dataset_dims)
     } else {
         vec![]
     };
@@ -295,30 +308,29 @@ fn parse_fixed_array_inner(
 // ---------------------------------------------------------------------------
 
 /// Compute the N-dimensional grid dimensions (number of chunks per dim) from
-/// the total chunk count and the chunk_dims.
+/// the total chunk count, chunk_dims, and optionally the dataset_dims.
 ///
-/// For a fixed array with `n` chunks and known `chunk_dims`, the grid shape
-/// can be derived if the total count factors cleanly.  We use the approximation
-/// that the grid is as close to equal in all dims as possible; the exact shape
-/// doesn't matter as long as the total is correct and the ordering is row-major.
-fn compute_grid_dims(n: u64, ndims: usize, chunk_dims: &[u64]) -> Vec<u64> {
+/// When `dataset_dims` is provided and matches the expected rank, the exact
+/// grid is computed as `ceil(dataset_dims[d] / chunk_dims[d])` per dimension.
+/// Otherwise, a conservative approximation is used.
+fn compute_grid_dims(n: u64, ndims: usize, chunk_dims: &[u64], dataset_dims: &[u64]) -> Vec<u64> {
     if ndims == 0 || n == 0 {
         return vec![];
     }
-    // For the fixed-array case, the grid is uniquely determined by the dataset
-    // dimensions and chunk dims.  Without dataset dims here, we approximate by
-    // treating the flat index `i` directly as a row-major position and computing
-    // a "virtual" grid_dim[d] = ceil(n ^ (1/ndims)) for each d, then adjusting
-    // the last dim to make the product ≥ n.
-    // In practice for our tests all datasets have exactly n chunks, so this
-    // produces the correct strides.
-    let per_dim = (n as f64).powf(1.0 / ndims as f64).ceil() as u64;
-    let mut dims = vec![per_dim; ndims];
-    // Correct last dim to ensure dims product >= n.
-    let product: u64 = dims[..ndims - 1].iter().product::<u64>().max(1);
-    dims[ndims - 1] = n.div_ceil(product);
-    let _ = chunk_dims; // chunk_dims used for offset computation at call site
-    dims
+    if chunk_dims.len() == ndims && dataset_dims.len() == ndims {
+        chunk_dims
+            .iter()
+            .zip(dataset_dims.iter())
+            .map(|(&cd, &dd)| dd.div_ceil(cd))
+            .collect()
+    } else {
+        // Fallback: approximate (should not occur in practice).
+        let per_dim = (n as f64).powf(1.0 / ndims as f64).ceil() as u64;
+        let mut dims = vec![per_dim; ndims];
+        let product: u64 = dims[..ndims - 1].iter().product::<u64>().max(1);
+        dims[ndims - 1] = n.div_ceil(product);
+        dims
+    }
 }
 
 /// Parse `ndims` offsets from `data`, each `bytes_per_dim` bytes wide (LE).

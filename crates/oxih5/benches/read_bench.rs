@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use oxih5::File;
 use std::io::Write;
 use std::path::PathBuf;
@@ -90,11 +90,127 @@ fn bench_dataset_names(c: &mut Criterion) {
     let _ = std::fs::remove_file(&path);
 }
 
+// ---------------------------------------------------------------------------
+// Throughput benchmark 5: contiguous f64 full read (heap-backed)
+//
+// Writes a fresh ~4 MB contiguous f64 dataset (500_000 elements × 8 B = 4 MB)
+// to a temp file using FileWriter, then measures the full open + dataset +
+// as_f64 cycle.  Throughput::Bytes lets criterion report MB/s.
+// ---------------------------------------------------------------------------
+
+const THROUGHPUT_N_ELEMS: usize = 500_000; // 500_000 × 8 = 4_000_000 bytes
+
+fn throughput_contiguous_f64(c: &mut Criterion) {
+    let n = THROUGHPUT_N_ELEMS;
+    let n_bytes = (n * 8) as u64;
+
+    let data: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let tmp = std::env::temp_dir().join("oxih5_bench_throughput_contig_f64.h5");
+
+    oxih5::FileWriter::new()
+        .write_dataset_f64("data", &data, &[n])
+        .unwrap()
+        .build(&tmp)
+        .unwrap();
+
+    let mut group = c.benchmark_group("throughput_contiguous_f64");
+    group.throughput(Throughput::Bytes(n_bytes));
+
+    group.bench_function("heap", |b| {
+        b.iter(|| {
+            let f = File::open(&tmp).unwrap();
+            let ds = f.dataset("data").unwrap();
+            let _vals = ds.as_f64().unwrap();
+        });
+    });
+
+    group.finish();
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// ---------------------------------------------------------------------------
+// Throughput benchmark 6: contiguous f64 full read (mmap-backed)
+//
+// Identical dataset as bench 5, but opened via File::open_mmap so the OS
+// pages in only the touched regions.  Reports the same MB/s metric for
+// direct comparison with the heap path.
+// ---------------------------------------------------------------------------
+
+fn throughput_mmap_f64(c: &mut Criterion) {
+    let n = THROUGHPUT_N_ELEMS;
+    let n_bytes = (n * 8) as u64;
+
+    let data: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let tmp = std::env::temp_dir().join("oxih5_bench_throughput_mmap_f64.h5");
+
+    oxih5::FileWriter::new()
+        .write_dataset_f64("data", &data, &[n])
+        .unwrap()
+        .build(&tmp)
+        .unwrap();
+
+    let mut group = c.benchmark_group("throughput_mmap_f64");
+    group.throughput(Throughput::Bytes(n_bytes));
+
+    group.bench_function("mmap", |b| {
+        b.iter(|| {
+            let f = File::open_mmap(&tmp).unwrap();
+            let ds = f.dataset("data").unwrap();
+            let _vals = ds.as_f64().unwrap();
+        });
+    });
+
+    group.finish();
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// ---------------------------------------------------------------------------
+// Throughput benchmark 7: chunked + gzip full read
+//
+// Reads the committed chunked_gzip_f4_1d.h5 fixture (float32, dataset "data").
+// The element count is determined at setup from the dataset shape so that
+// Throughput::Bytes always matches the actual uncompressed payload even if the
+// fixture is regenerated with different dimensions.
+// ---------------------------------------------------------------------------
+
+fn throughput_chunked_gzip(c: &mut Criterion) {
+    let path = write_fixture_to_tmp("bench_throughput_chunked_gzip", CHUNKED_GZIP_F4_1D);
+
+    // Determine the uncompressed byte count once at setup time.
+    let n_elems: usize = {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("data").unwrap();
+        ds.len()
+    };
+    // float32 = 4 bytes per element
+    let n_bytes = (n_elems * 4) as u64;
+
+    let mut group = c.benchmark_group("throughput_chunked_gzip");
+    group.throughput(Throughput::Bytes(n_bytes));
+
+    group.bench_function("heap", |b| {
+        b.iter(|| {
+            let f = File::open(&path).unwrap();
+            let ds = f.dataset("data").unwrap();
+            let _vals = ds.as_f32().unwrap();
+        });
+    });
+
+    group.finish();
+
+    let _ = std::fs::remove_file(&path);
+}
+
 criterion_group!(
     benches,
     bench_open_contiguous,
     bench_open_mmap,
     bench_chunked_gzip,
-    bench_dataset_names
+    bench_dataset_names,
+    throughput_contiguous_f64,
+    throughput_mmap_f64,
+    throughput_chunked_gzip,
 );
 criterion_main!(benches);

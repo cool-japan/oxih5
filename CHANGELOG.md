@@ -7,6 +7,63 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.1] - 2026-06-04
+
+### Added
+
+- **`oxinetcdf` crate** — new workspace member providing a NetCDF-4 reader built
+  atop OxiH5: `NcFile::open` / `open_from_bytes`, `NcFile::root_group()`, full
+  `NcGroup` / `NcVariable` / `NcDimension` / `NcAxis` / `NcAttribute` model,
+  NetCDF-4 convention resolution (DIMENSION_SCALE, `_Netcdf4Dimid`,
+  DIMENSION_LIST object-reference axis linkage), reserved-attribute filtering,
+  pure-dimension sentinel parsing, and phony-dimension naming.
+- **`AttrView<'a>`** (new public type in `oxih5`) — file-context-aware attribute
+  accessor that owns the `Attribute` data and borrows the file bytes; exposes
+  `as_strings()` (fixed-length and vlen), `as_object_refs()`,
+  `as_compound()`, `as_vlen_sequence()`, and all scalar helpers.
+- **`File::attr_views(path)`** — returns `Vec<AttrView<'_>>` for all attributes on
+  any dataset or group path.
+- **`File::object_at(addr)`** — resolves an HDF5 object-reference address
+  (obtained from `AttrView::as_object_refs()`) to an `ObjectKind::Dataset` or
+  `ObjectKind::Group`; returns `OxiH5Error::NotFound` for null references
+  (`u64::MAX`).
+- **`File::dataset_at(addr)`** — convenience wrapper around `object_at` that
+  returns `TypeMismatch` when the referenced object is a group.
+- **`File::dataset_hyperslab(path, selection)`** and free function
+  **`read_dataset_hyperslab`** — strided HDF5 hyperslab selection
+  (`DimSelection` + `Hyperslab`); only chunks overlapping the bounding box are
+  decompressed; non-selected elements inside chunks are dropped without
+  allocation.
+- **`Attribute` scalar accessors** (`as_i64`, `as_u64`, `as_f64`,
+  `as_str_fixed`, `is_scalar`, `shape`) — decode fixed-width integer/float and
+  fixed-length string attributes directly on the `Attribute` type in
+  `oxih5-core`.
+- **`f16_to_f32`** exposed as a public function from `oxih5-core`; correctly
+  handles subnormals, ±infinity, and NaN.
+- **`ndarray` bridge extended** — `to_array_u8`, `to_array_u16`, `to_array_u32`,
+  `to_array_u64`, `to_array_i8`, `to_array_i16`, `to_array_i64`,
+  `to_array_f16` added (feature-gated behind `ndarray`).
+- **Criterion benchmarks** for `oxih5-format`: `parse_bench` (superblock v0/v2/v3
+  and object-header parsing) and `traverse_bench` (group traversal throughput).
+- **`oxih5-format` hyperslab and values modules** — `hyperslab.rs` and `values.rs`
+  implementing strided selection logic and typed value decoding (`Value` enum,
+  vlen-string decode, object-ref decode, compound decode, vlen-sequence decode).
+- **`oxih5-format` chunked hyperslab module** — `chunked_hyperslab.rs` providing
+  per-chunk hyperslab intersection for efficient partial-read of chunked datasets.
+- Tests for all new APIs: `test_attribute_scalar_accessors`, `test_to_array_u8/u16/u32/u64/i8/i16/i64/f16`, `AttrView` unit tests, hyperslab integration tests.
+
+### Changed
+
+- `Dataset` typed-accessor methods (`as_f32`, `as_f64`, `as_i32`, etc.) and lazy
+  iterators (`iter_f32`, …) extracted into a dedicated `dataset_convert` module in
+  `oxih5-core`; public API is unchanged.
+- `File::dataset_slice` now uses lazy per-chunk loading for chunked datasets
+  (previously loaded the full dataset first, then sliced in memory).
+- `oxih5` re-exports `Value` from `oxih5_format::values` and `DimSelection` /
+  `Hyperslab` from `oxih5_format`.
+
+---
+
 ## [0.1.0] — 2026-06-01
 
 ### Added
@@ -133,4 +190,5 @@ message.rs          — decode all standard message types
 
 ---
 
+[0.1.1]: https://github.com/cool-japan/oxih5/releases/tag/v0.1.1
 [0.1.0]: https://github.com/cool-japan/oxih5/releases/tag/v0.1.0

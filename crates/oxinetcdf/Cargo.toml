@@ -1,0 +1,20 @@
+[package]
+name = "oxinetcdf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pure-Rust NetCDF-4 conventions reader atop OxiH5 (no libnetcdf/libhdf5 FFI)"
+categories = ["parser-implementations", "science"]
+keywords = ["netcdf", "netcdf4", "pure-rust", "cooljapan"]
+
+[features]
+default = []
+ndarray = ["oxih5/ndarray", "oxih5-core/ndarray"]
+
+[dependencies]
+oxih5       = { workspace = true }
+oxih5-core  = { workspace = true }
+thiserror   = { workspace = true }

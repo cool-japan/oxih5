@@ -14,12 +14,14 @@ keywords = ["hdf5", "h5", "pure-rust", "cooljapan", "oxih5"]
 default = []
 ndarray  = ["oxih5-core/ndarray"]
 parallel = ["oxih5-format/parallel", "dep:rayon"]
+dhat-heap = ["dep:dhat"]
 
 [dependencies]
 oxih5-core   = { workspace = true }
 oxih5-format = { workspace = true }
 memmap2      = { workspace = true }
 rayon        = { workspace = true, optional = true }
+dhat         = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

@@ -1,6 +1,5 @@
 use crate::superblock::{read_u16_le, read_u32_le, read_u64_le};
 use oxih5_core::OxiH5Error;
-use std::collections::HashSet;
 
 /// Continuation message type — points to an additional header block.
 const MSG_CONTINUATION_V1: u16 = 0x0010;
@@ -128,7 +127,7 @@ fn parse_messages_v1(file_data: &[u8], offset: u64) -> Result<Vec<Message>, OxiH
     // the 16-byte header prefix).
     let header_data_size = read_u32_le(file_data, off + 8)? as usize;
 
-    let mut messages: Vec<Message> = Vec::new();
+    let mut messages: Vec<Message> = Vec::with_capacity((header_data_size / 8).min(64));
     // Continuation blocks discovered while parsing; processed after the primary block.
     let mut continuations: Vec<(u64, u64)> = Vec::new();
 
@@ -241,9 +240,41 @@ fn parse_v1_message_block(
 // ---------------------------------------------------------------------------
 
 fn parse_messages_v2(file_data: &[u8], offset: u64) -> Result<Vec<Message>, OxiH5Error> {
-    let mut messages = Vec::new();
-    let mut seen: HashSet<u64> = HashSet::new();
-    parse_v2_block(file_data, offset, &mut messages, &mut seen, 0)?;
+    let base = usize::try_from(offset).unwrap_or(usize::MAX);
+    let capacity = if base < file_data.len() {
+        let off = base + 6;
+        let chunk_size_field_width =
+            1usize << (file_data.get(base + 5).copied().unwrap_or(0) & 0x03);
+        let chunk0_size = if off + chunk_size_field_width <= file_data.len() {
+            match chunk_size_field_width {
+                1 => file_data[off] as usize,
+                2 => u16::from_le_bytes([file_data[off], file_data[off + 1]]) as usize,
+                4 => u32::from_le_bytes([
+                    file_data[off],
+                    file_data[off + 1],
+                    file_data[off + 2],
+                    file_data[off + 3],
+                ]) as usize,
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        (chunk0_size / 4).min(64)
+    } else {
+        0
+    };
+    let mut messages = Vec::with_capacity(capacity);
+    let first_addr = offset;
+    let mut extra_seen: Option<std::collections::HashSet<u64>> = None;
+    parse_v2_block(
+        file_data,
+        offset,
+        &mut messages,
+        first_addr,
+        &mut extra_seen,
+        0,
+    )?;
     Ok(messages)
 }
 
@@ -252,11 +283,15 @@ fn parse_messages_v2(file_data: &[u8], offset: u64) -> Result<Vec<Message>, OxiH
 /// For the main OHDR block the length is encoded in the `chunk #0 size` field.
 /// For OCHK continuation blocks the length comes from the continuation message that
 /// pointed here; we derive it as `(cont_length - 8)` where 8 = sig(4) + checksum(4).
+///
+/// `first_addr` holds the very first block address (always known); `extra_seen` is
+/// allocated lazily only when a second distinct block address appears (T3: deferred HashSet).
 fn parse_v2_block(
     file_data: &[u8],
     block_start: u64,
     messages: &mut Vec<Message>,
-    seen: &mut HashSet<u64>,
+    first_addr: u64,
+    extra_seen: &mut Option<std::collections::HashSet<u64>>,
     depth: u32,
 ) -> Result<(), OxiH5Error> {
     if depth > 256 {
@@ -264,10 +299,18 @@ fn parse_v2_block(
             "object header v2: continuation depth limit exceeded".into(),
         ));
     }
-    if !seen.insert(block_start) {
+    if block_start == first_addr && depth > 0 {
         return Err(OxiH5Error::Format(format!(
             "object header v2: cycle detected at block {block_start:#x}"
         )));
+    }
+    if depth > 0 {
+        let seen = extra_seen.get_or_insert_with(std::collections::HashSet::new);
+        if !seen.insert(block_start) {
+            return Err(OxiH5Error::Format(format!(
+                "object header v2: cycle detected at block {block_start:#x}"
+            )));
+        }
     }
 
     let base = usize::try_from(block_start).map_err(|_| {
@@ -375,7 +418,8 @@ fn parse_v2_block(
                     cont_offset,
                     cont_length,
                     messages,
-                    seen,
+                    first_addr,
+                    extra_seen,
                     depth + 1,
                 )?;
             }
@@ -402,7 +446,8 @@ fn parse_v2_ochk_block(
     block_start: u64,
     cont_length: u64,
     messages: &mut Vec<Message>,
-    seen: &mut HashSet<u64>,
+    first_addr: u64,
+    extra_seen: &mut Option<std::collections::HashSet<u64>>,
     depth: u32,
 ) -> Result<(), OxiH5Error> {
     if depth > 256 {
@@ -410,10 +455,18 @@ fn parse_v2_ochk_block(
             "object header v2: continuation depth limit exceeded".into(),
         ));
     }
-    if !seen.insert(block_start) {
+    if block_start == first_addr {
         return Err(OxiH5Error::Format(format!(
             "object header v2: cycle detected at OCHK {block_start:#x}"
         )));
+    }
+    {
+        let seen = extra_seen.get_or_insert_with(std::collections::HashSet::new);
+        if !seen.insert(block_start) {
+            return Err(OxiH5Error::Format(format!(
+                "object header v2: cycle detected at OCHK {block_start:#x}"
+            )));
+        }
     }
 
     let base = usize::try_from(block_start).map_err(|_| {
@@ -470,7 +523,15 @@ fn parse_v2_ochk_block(
             if msg_size >= 16 {
                 let sub_offset = read_u64_at(file_data, data_start)?;
                 let sub_length = read_u64_at(file_data, data_start + 8)?;
-                parse_v2_ochk_block(file_data, sub_offset, sub_length, messages, seen, depth + 1)?;
+                parse_v2_ochk_block(
+                    file_data,
+                    sub_offset,
+                    sub_length,
+                    messages,
+                    first_addr,
+                    extra_seen,
+                    depth + 1,
+                )?;
             }
         } else {
             messages.push(Message {

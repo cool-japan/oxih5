@@ -8,7 +8,6 @@ use oxih5_format::{
     btree, btree_v1_chunk, btree_v2, context::ParseContext, datatype, ea_index, fa_index,
     fractal_heap, global_heap, header, heap, message, snod, superblock,
 };
-use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Deterministic xorshift64 PRNG
@@ -102,10 +101,9 @@ fn fuzz_extra_parsers(data: &[u8], addr: u64, state: &mut u64) {
         let _ = fa_index::parse_fixed_array_v4(data, addr, ndims, &[], 0);
     }
 
-    // fractal_heap::FractalHeap::parse — takes (Arc<Vec<u8>>, header_address, size_of_offsets)
-    let arc_data = Arc::new(data.to_vec());
+    // fractal_heap::FractalHeap::parse — takes (&[u8], header_address, size_of_offsets)
     for soo in [4u8, 8] {
-        if let Ok(fh) = fractal_heap::FractalHeap::parse(Arc::clone(&arc_data), addr, soo) {
+        if let Ok(fh) = fractal_heap::FractalHeap::parse(data, addr, soo) {
             // If the header parsed successfully, try reading with garbage heap IDs
             let heap_id_len = fh.heap_id_len() as usize;
             if heap_id_len > 0 {

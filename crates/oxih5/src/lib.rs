@@ -1,11 +1,30 @@
 #![deny(unsafe_code)]
 
 pub use oxih5_core::{Attribute, ByteOrder, Dataset, Dtype, OxiH5Error};
+pub use oxih5_format::values::Value;
+pub use oxih5_format::{DimSelection, Hyperslab};
 
 mod write;
 pub use write::FileWriter;
 
+mod attr_view;
+pub use attr_view::AttrView;
+
 use oxih5_format::{btree, group, header, heap, message, snod, superblock, ChunkIndexCache};
+
+// ---------------------------------------------------------------------------
+// ObjectKind — returned by File::object_at
+// ---------------------------------------------------------------------------
+
+/// The kind of object referenced by an HDF5 object reference.
+///
+/// Returned by [`File::object_at`] and [`File::dataset_at`].
+pub enum ObjectKind {
+    /// A dataset at the referenced address.
+    Dataset(Dataset),
+    /// A group at the referenced address.
+    Group(Group),
+}
 
 // ---------------------------------------------------------------------------
 // FileData — backing-store abstraction
@@ -98,6 +117,18 @@ pub fn open_mmap<P: AsRef<std::path::Path>>(path: P) -> Result<File, OxiH5Error>
 /// Read a single dataset by name from an HDF5 file (one-shot convenience wrapper).
 pub fn read_dataset<P: AsRef<std::path::Path>>(path: P, name: &str) -> Result<Dataset, OxiH5Error> {
     open(path)?.dataset(name)
+}
+
+/// Read a sub-region of a named dataset in an HDF5 file using a strided hyperslab selection.
+///
+/// Each [`DimSelection`] specifies `start`/`stride`/`count`/`block` for one dimension.
+/// For chunked datasets only the chunks overlapping the selection bounding box are decompressed.
+pub fn read_dataset_hyperslab<P: AsRef<std::path::Path>>(
+    path: P,
+    name: &str,
+    selection: &[DimSelection],
+) -> Result<Dataset, OxiH5Error> {
+    File::open(path)?.dataset_hyperslab(name, selection)
 }
 
 /// Returns the crate version string.
@@ -316,19 +347,43 @@ impl File {
         }
     }
 
-    /// Read a sub-region of a dataset.
+    /// Read a sub-region of a dataset using lazy (per-chunk) loading.
     ///
     /// `ranges` specifies one `Range<usize>` per dimension.  For a 1-D dataset of
     /// length 100, `ranges = [10..20]` returns elements 10–19.
     ///
-    /// This is a thin convenience wrapper around [`File::dataset`] followed by
-    /// [`Dataset::slice`].
+    /// For chunked datasets only the chunks overlapping `ranges` are decompressed.
+    /// For contiguous/compact datasets the full data is loaded first.
     pub fn dataset_slice(
         &self,
         path: &str,
         ranges: &[std::ops::Range<usize>],
     ) -> Result<Dataset, OxiH5Error> {
-        self.dataset(path)?.slice(ranges)
+        read_dataset_slice_lazy(
+            &self.data,
+            path,
+            ranges,
+            &self.source_dir,
+            &self.chunk_cache,
+        )
+    }
+
+    /// Read a sub-region of a dataset using a strided HDF5 hyperslab selection.
+    ///
+    /// Each [`DimSelection`] specifies `start`/`stride`/`count`/`block` for one
+    /// dimension.  For chunked datasets only the chunks overlapping the selection
+    /// bounding box are decompressed — interior elements not passing the stride/block
+    /// filter are dropped without reading.  For contiguous/compact datasets the full
+    /// data is loaded and then sampled.
+    pub fn dataset_hyperslab(
+        &self,
+        path: &str,
+        selection: &[DimSelection],
+    ) -> Result<Dataset, OxiH5Error> {
+        let hs = Hyperslab {
+            dims: selection.to_vec(),
+        };
+        read_dataset_hyperslab_internal(&self.data, path, &hs, &self.source_dir, &self.chunk_cache)
     }
 
     /// Check whether the given path (dataset or group) exists in the file.
@@ -397,6 +452,132 @@ impl File {
             length_size: sb.size_of_lengths,
         })
     }
+
+    /// Resolve an HDF5 object reference (absolute byte address) to a `Dataset` or `Group`.
+    ///
+    /// `addr` is the absolute byte offset of the target object's header, as returned
+    /// by `AttrView::as_object_refs()` or `values::decode_object_refs()`.
+    /// Returns `OxiH5Error::NotFound` for `u64::MAX` (undefined reference).
+    pub fn object_at(&self, addr: u64) -> Result<ObjectKind, OxiH5Error> {
+        if addr == u64::MAX {
+            return Err(OxiH5Error::NotFound("undefined object reference".into()));
+        }
+        // Check whether the object at `addr` is a group by looking for a
+        // SymbolTable (0x0011) or LinkInfo (0x0002) message.
+        let msgs = header::parse_messages(&self.data, addr)?;
+        let is_group = msgs
+            .iter()
+            .any(|m| m.msg_type == 0x0011 || m.msg_type == 0x0002);
+        if is_group {
+            // Determine old-style vs new-style.
+            let (btree_address, heap_address, new_style) =
+                if let Some((bt, hp)) = find_symbol_table_addresses(&msgs) {
+                    (bt, hp, false)
+                } else {
+                    (0, 0, true)
+                };
+            Ok(ObjectKind::Group(Group {
+                name: format!("@{addr:#x}"),
+                object_header_address: addr,
+                btree_address,
+                heap_address,
+                new_style,
+                file_data: self.data.clone(),
+                source_dir: self.source_dir.clone(),
+                chunk_cache: self.chunk_cache.clone(),
+            }))
+        } else {
+            // Treat as dataset.
+            let ds = read_dataset_from_object_header(
+                &self.data,
+                addr,
+                &format!("@{addr:#x}"),
+                Some(&self.chunk_cache),
+            )?;
+            Ok(ObjectKind::Dataset(ds))
+        }
+    }
+
+    /// Resolve an object reference directly to a `Dataset`.
+    ///
+    /// Convenience wrapper around `object_at` that returns `TypeMismatch` if the
+    /// referenced object is a group rather than a dataset.
+    pub fn dataset_at(&self, addr: u64) -> Result<Dataset, OxiH5Error> {
+        match self.object_at(addr)? {
+            ObjectKind::Dataset(ds) => Ok(ds),
+            ObjectKind::Group(_) => Err(OxiH5Error::TypeMismatch),
+        }
+    }
+
+    /// Return `AttrView` wrappers for all attributes on a dataset at `path`.
+    ///
+    /// Each `AttrView` owns its `Attribute` data and borrows the file bytes
+    /// from `self` for the duration of the returned views' lifetime.
+    pub fn attr_views(&self, path: &str) -> Result<Vec<AttrView<'_>>, OxiH5Error> {
+        let header_addr = self.resolve_dataset_header_addr(path)?;
+        let attrs = read_attributes_from_header(&self.data, header_addr)?;
+        Ok(attrs
+            .into_iter()
+            .map(|a| AttrView::new(a, &self.data))
+            .collect())
+    }
+
+    /// Internal helper: resolve the object header address for the dataset at `path`.
+    fn resolve_dataset_header_addr(&self, path: &str) -> Result<u64, OxiH5Error> {
+        let sb = superblock::parse(&self.data)?;
+        let root_msgs = header::parse_messages(&self.data, sb.root_object_header_address)?;
+        let normalized = path.trim_start_matches('/');
+        let mut parts: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+        let dataset_name = parts
+            .pop()
+            .ok_or_else(|| OxiH5Error::NotFound(path.to_string()))?;
+
+        if let Some((root_btree, root_heap)) = find_symbol_table_addresses(&root_msgs) {
+            let (btree, heap) = if parts.is_empty() {
+                (root_btree, root_heap)
+            } else {
+                navigate_to_group(&self.data, root_btree, root_heap, &parts)?
+            };
+            group::find_dataset(&self.data, btree, heap, dataset_name)
+        } else {
+            let mut current_header = sb.root_object_header_address;
+            for segment in &parts {
+                current_header = find_new_style_child(&self.data, current_header, segment)?;
+            }
+            resolve_new_style_header_address(
+                &self.data,
+                current_header,
+                dataset_name,
+                &self.source_dir,
+            )
+        }
+    }
+
+    /// Decode a vlen-string dataset as `Vec<String>`.
+    ///
+    /// A convenience shortcut for the common pattern of reading a vlen-string
+    /// dataset and decoding all elements to UTF-8 `String`s.
+    ///
+    /// Returns `OxiH5Error::TypeMismatch` if the dataset dtype is not a vlen string.
+    pub fn dataset_strings(&self, path: &str) -> Result<Vec<String>, OxiH5Error> {
+        let ds = self.dataset(path)?;
+        match &ds.dtype {
+            Dtype::String {
+                fixed_len: None, ..
+            } => {
+                // vlen string dataset: data contains n_elems × 16-byte heap refs
+                let n_elems = ds.len();
+                oxih5_format::values::decode_vlen_strings(&self.data, &ds.data, n_elems)
+            }
+            Dtype::String {
+                fixed_len: Some(_), ..
+            } => {
+                // fixed-length string dataset: use Dataset::as_string
+                ds.as_string()
+            }
+            _ => Err(OxiH5Error::TypeMismatch),
+        }
+    }
 }
 
 impl std::fmt::Debug for File {
@@ -463,22 +644,67 @@ impl Group {
         )
     }
 
-    /// Read a sub-region of a dataset by name within this group.
+    /// Read a sub-region of a dataset by name within this group using lazy chunk loading.
     ///
     /// `ranges` specifies one `Range<usize>` per dimension.
-    /// This is a thin convenience wrapper around [`Group::dataset`] followed by
-    /// [`Dataset::slice`].
+    /// For chunked datasets only the chunks overlapping `ranges` are decompressed.
     pub fn dataset_slice(
         &self,
         name: &str,
         ranges: &[std::ops::Range<usize>],
     ) -> Result<Dataset, OxiH5Error> {
-        self.dataset(name)?.slice(ranges)
+        read_dataset_slice_lazy_from_group(
+            &self.file_data,
+            self.object_header_address,
+            self.btree_address,
+            self.heap_address,
+            self.new_style,
+            name,
+            ranges,
+            &self.source_dir,
+            &self.chunk_cache,
+        )
+    }
+
+    /// Read a sub-region of a dataset in this group using a strided HDF5 hyperslab selection.
+    ///
+    /// Each [`DimSelection`] specifies `start`/`stride`/`count`/`block` for one dimension.
+    pub fn dataset_hyperslab(
+        &self,
+        name: &str,
+        selection: &[DimSelection],
+    ) -> Result<Dataset, OxiH5Error> {
+        let hs = Hyperslab {
+            dims: selection.to_vec(),
+        };
+        read_dataset_hyperslab_from_group_internal(
+            &self.file_data,
+            self.object_header_address,
+            self.btree_address,
+            self.heap_address,
+            self.new_style,
+            name,
+            &hs,
+            &self.source_dir,
+            &self.chunk_cache,
+        )
     }
 
     /// List all attributes attached to this group.
     pub fn attrs(&self) -> Result<Vec<Attribute>, OxiH5Error> {
         read_attributes_from_header(&self.file_data, self.object_header_address)
+    }
+
+    /// Return `AttrView` wrappers for all attributes attached to this group.
+    ///
+    /// Each `AttrView` owns its `Attribute` data and borrows the file bytes
+    /// from this `Group` handle for the duration of the returned views' lifetime.
+    pub fn attr_views(&self) -> Result<Vec<AttrView<'_>>, OxiH5Error> {
+        let attrs = read_attributes_from_header(&self.file_data, self.object_header_address)?;
+        Ok(attrs
+            .into_iter()
+            .map(|a| AttrView::new(a, &self.file_data))
+            .collect())
     }
 
     /// List all entries in this group, partitioned by whether they are groups.
@@ -492,7 +718,8 @@ impl Group {
 
         let tree = btree::parse(&self.file_data, self.btree_address)?;
         let local_heap = heap::parse(&self.file_data, self.heap_address)?;
-        let mut names = Vec::new();
+        // T6: pre-size with a reasonable hint (8 entries per leaf is typical).
+        let mut names = Vec::with_capacity(tree.leaf_addresses.len() * 8);
 
         for &leaf_addr in &tree.leaf_addresses {
             let entries = snod::parse(&self.file_data, leaf_addr)?;
@@ -707,6 +934,392 @@ fn resolve_external_link(
     })
 }
 
+/// Lazy slice reader for `File::dataset_slice`: resolves the path, extracts
+/// messages, and for chunked layouts calls `read_chunked_slice` directly.
+fn read_dataset_slice_lazy(
+    file_data: &FileData,
+    path: &str,
+    ranges: &[std::ops::Range<usize>],
+    source_dir: &std::path::Path,
+    cache: &ChunkIndexCache,
+) -> Result<Dataset, OxiH5Error> {
+    let sb = superblock::parse(file_data)?;
+    let root_msgs = header::parse_messages(file_data, sb.root_object_header_address)?;
+
+    let normalized = path.trim_start_matches('/');
+    let mut parts: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+    let dataset_name = parts
+        .pop()
+        .ok_or_else(|| OxiH5Error::NotFound(path.to_string()))?;
+
+    let header_addr = if let Some((root_btree, root_heap)) = find_symbol_table_addresses(&root_msgs)
+    {
+        let (btree, heap) = if parts.is_empty() {
+            (root_btree, root_heap)
+        } else {
+            navigate_to_group(file_data, root_btree, root_heap, &parts)?
+        };
+        group::find_dataset(file_data, btree, heap, dataset_name)?
+    } else {
+        let mut current_header = sb.root_object_header_address;
+        for segment in &parts {
+            current_header = find_new_style_child(file_data, current_header, segment)?;
+        }
+        resolve_new_style_header_address(file_data, current_header, dataset_name, source_dir)?
+    };
+
+    slice_dataset_at_header(file_data, header_addr, dataset_name, ranges, Some(cache))
+}
+
+/// Lazy slice reader for `Group::dataset_slice`.
+#[allow(clippy::too_many_arguments)]
+fn read_dataset_slice_lazy_from_group(
+    file_data: &FileData,
+    object_header_address: u64,
+    btree_address: u64,
+    heap_address: u64,
+    new_style: bool,
+    name: &str,
+    ranges: &[std::ops::Range<usize>],
+    source_dir: &std::path::Path,
+    cache: &ChunkIndexCache,
+) -> Result<Dataset, OxiH5Error> {
+    let header_addr = if new_style {
+        resolve_new_style_header_address(file_data, object_header_address, name, source_dir)?
+    } else {
+        group::find_dataset(file_data, btree_address, heap_address, name)?
+    };
+    slice_dataset_at_header(file_data, header_addr, name, ranges, Some(cache))
+}
+
+/// Hyperslab reader for `File::dataset_hyperslab`.
+fn read_dataset_hyperslab_internal(
+    file_data: &FileData,
+    path: &str,
+    selection: &Hyperslab,
+    source_dir: &std::path::Path,
+    cache: &ChunkIndexCache,
+) -> Result<Dataset, OxiH5Error> {
+    let sb = superblock::parse(file_data)?;
+    let root_msgs = header::parse_messages(file_data, sb.root_object_header_address)?;
+
+    let normalized = path.trim_start_matches('/');
+    let mut parts: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+    let dataset_name = parts
+        .pop()
+        .ok_or_else(|| OxiH5Error::NotFound(path.to_string()))?;
+
+    let header_addr = if let Some((root_btree, root_heap)) = find_symbol_table_addresses(&root_msgs)
+    {
+        let (btree, heap) = if parts.is_empty() {
+            (root_btree, root_heap)
+        } else {
+            navigate_to_group(file_data, root_btree, root_heap, &parts)?
+        };
+        group::find_dataset(file_data, btree, heap, dataset_name)?
+    } else {
+        let mut current_header = sb.root_object_header_address;
+        for segment in &parts {
+            current_header = find_new_style_child(file_data, current_header, segment)?;
+        }
+        resolve_new_style_header_address(file_data, current_header, dataset_name, source_dir)?
+    };
+
+    hyperslab_dataset_at_header(file_data, header_addr, dataset_name, selection, Some(cache))
+}
+
+/// Hyperslab reader for `Group::dataset_hyperslab`.
+#[allow(clippy::too_many_arguments)]
+fn read_dataset_hyperslab_from_group_internal(
+    file_data: &FileData,
+    object_header_address: u64,
+    btree_address: u64,
+    heap_address: u64,
+    new_style: bool,
+    name: &str,
+    selection: &Hyperslab,
+    source_dir: &std::path::Path,
+    cache: &ChunkIndexCache,
+) -> Result<Dataset, OxiH5Error> {
+    let header_addr = if new_style {
+        resolve_new_style_header_address(file_data, object_header_address, name, source_dir)?
+    } else {
+        group::find_dataset(file_data, btree_address, heap_address, name)?
+    };
+    hyperslab_dataset_at_header(file_data, header_addr, name, selection, Some(cache))
+}
+
+/// Parse messages at `header_addr` and perform a hyperslab read.
+///
+/// For chunked layouts with an in-bounds bounding box, only the overlapping
+/// chunks are decompressed.  For other layouts (or when out-of-bounds) the full
+/// data is loaded and then sampled with `gather_hyperslab_contiguous`.
+fn hyperslab_dataset_at_header(
+    file_data: &[u8],
+    header_addr: u64,
+    name: &str,
+    selection: &Hyperslab,
+    cache: Option<&ChunkIndexCache>,
+) -> Result<Dataset, OxiH5Error> {
+    let ds_messages = header::parse_messages(file_data, header_addr)?;
+
+    let mut dataspace = None;
+    let mut datatype = None;
+    let mut layout = None;
+    let mut filter_pipeline = None;
+    let mut fill_value: Option<Vec<u8>> = None;
+
+    for msg in &ds_messages {
+        match msg.msg_type {
+            0x0001 => dataspace = Some(message::parse_dataspace(&msg.data)?),
+            0x0003 => datatype = Some(message::parse_datatype(&msg.data)?),
+            0x0005 => {
+                if let Ok(fv) = message::parse_fill_value(&msg.data) {
+                    fill_value = fv;
+                }
+            }
+            0x0008 => layout = Some(message::parse_layout(&msg.data)?),
+            0x000B => filter_pipeline = Some(message::parse_filter_pipeline(&msg.data)?),
+            _ => {}
+        }
+    }
+
+    let dsp = dataspace
+        .ok_or_else(|| OxiH5Error::Format(format!("no dataspace message in dataset '{name}'")))?;
+    let dtp = datatype
+        .ok_or_else(|| OxiH5Error::Format(format!("no datatype message in dataset '{name}'")))?;
+    let lay = layout
+        .ok_or_else(|| OxiH5Error::Format(format!("no layout message in dataset '{name}'")))?;
+
+    use oxih5_format::message::LayoutInfo;
+
+    // Attempt the lazy chunked-hyperslab path first.
+    if let LayoutInfo::Chunked { .. } = &lay {
+        let ndims = dsp.dims.len();
+        if ndims >= 1 && selection.dims.len() == ndims {
+            let bbox = selection.bounding_ranges();
+            let all_in_bounds = bbox
+                .iter()
+                .zip(dsp.dims.iter())
+                .all(|(r, &dim)| r.end <= dim);
+
+            if all_in_bounds {
+                let elem_size = dtp.dtype.size().ok_or_else(|| {
+                    OxiH5Error::NotImplemented(format!(
+                        "chunked dataset '{name}': variable-length element size not supported"
+                    ))
+                })?;
+                let dataset_dims: Vec<u64> = dsp.dims.clone();
+                let pipeline = filter_pipeline
+                    .clone()
+                    .unwrap_or_else(|| oxih5_core::FilterPipeline { filters: vec![] });
+                let out_shape: Vec<usize> = selection
+                    .output_shape()
+                    .iter()
+                    .map(|&s| s as usize)
+                    .collect();
+
+                let raw = oxih5_format::chunked_hyperslab::read_chunked_hyperslab(
+                    file_data,
+                    &lay,
+                    &pipeline,
+                    &dataset_dims,
+                    oxih5_format::chunked::ChunkSliceParams {
+                        elem_size,
+                        fill_value: fill_value.as_deref(),
+                    },
+                    selection,
+                    cache,
+                )?;
+
+                let attributes =
+                    read_attributes_from_header(file_data, header_addr).unwrap_or_default();
+                return Ok(Dataset {
+                    data: raw,
+                    shape: out_shape,
+                    dtype: dtp.dtype,
+                    attributes,
+                });
+            }
+        }
+    }
+
+    // Fallback: full read then gather via contiguous sampler.
+    let full_ds = read_dataset_from_object_header(file_data, header_addr, name, cache)?;
+    let dataset_dims_u64: Vec<u64> = full_ds.shape.iter().map(|&s| s as u64).collect();
+    let elem_size = full_ds.dtype.size().ok_or_else(|| {
+        OxiH5Error::NotImplemented(format!(
+            "dataset '{name}': variable-length element size not supported for hyperslab fallback"
+        ))
+    })?;
+
+    let raw = oxih5_format::chunked_hyperslab::gather_hyperslab_contiguous(
+        &full_ds.data,
+        &dataset_dims_u64,
+        selection,
+        elem_size,
+    )?;
+    let out_shape: Vec<usize> = selection
+        .output_shape()
+        .iter()
+        .map(|&s| s as usize)
+        .collect();
+    Ok(Dataset {
+        data: raw,
+        shape: out_shape,
+        dtype: full_ds.dtype,
+        attributes: full_ds.attributes,
+    })
+}
+
+/// Resolve the object header address for `name` within a new-style group.
+fn resolve_new_style_header_address(
+    file_data: &[u8],
+    parent_header_addr: u64,
+    name: &str,
+    source_dir: &std::path::Path,
+) -> Result<u64, OxiH5Error> {
+    let sb = superblock::parse(file_data)?;
+    let ctx = oxih5_format::context::ParseContext::new(
+        sb.size_of_offsets,
+        sb.size_of_lengths,
+        sb.base_address,
+    );
+    let links = group::list_new_style_links(file_data, parent_header_addr, &ctx)?;
+    for pl in &links {
+        if pl.name == name {
+            match &pl.link {
+                oxih5_core::Link::Hard { address } => return Ok(*address),
+                oxih5_core::Link::External {
+                    file: ext_file,
+                    path: ext_path,
+                } => {
+                    let resolved = if std::path::Path::new(ext_file).is_absolute() {
+                        std::path::PathBuf::from(ext_file)
+                    } else {
+                        source_dir.join(ext_file)
+                    };
+                    let ext = open(&resolved).map_err(|e| {
+                        OxiH5Error::NotFound(format!(
+                            "external link target '{}': {e}",
+                            resolved.display()
+                        ))
+                    })?;
+                    let ds = ext.dataset(ext_path.trim_start_matches('/'))?;
+                    return Err(OxiH5Error::NotImplemented(format!(
+                        "lazy slice across external link not supported; loaded full dataset for '{}' (shape {:?})",
+                        name, ds.shape
+                    )));
+                }
+                _ => {
+                    return Err(OxiH5Error::NotImplemented(format!(
+                        "link type not supported for lazy slice of '{name}'"
+                    )));
+                }
+            }
+        }
+    }
+    Err(OxiH5Error::NotFound(name.to_string()))
+}
+
+/// Extract messages at `header_addr` and perform a lazy slice.
+///
+/// For chunked layouts only the overlapping chunks are decompressed.
+/// For other layouts the full data is loaded and then sliced in memory.
+fn slice_dataset_at_header(
+    file_data: &[u8],
+    header_addr: u64,
+    name: &str,
+    ranges: &[std::ops::Range<usize>],
+    cache: Option<&ChunkIndexCache>,
+) -> Result<Dataset, OxiH5Error> {
+    let ds_messages = header::parse_messages(file_data, header_addr)?;
+
+    let mut dataspace = None;
+    let mut datatype = None;
+    let mut layout = None;
+    let mut filter_pipeline = None;
+    let mut fill_value: Option<Vec<u8>> = None;
+
+    for msg in &ds_messages {
+        match msg.msg_type {
+            0x0001 => dataspace = Some(message::parse_dataspace(&msg.data)?),
+            0x0003 => datatype = Some(message::parse_datatype(&msg.data)?),
+            0x0005 => {
+                if let Ok(fv) = message::parse_fill_value(&msg.data) {
+                    fill_value = fv;
+                }
+            }
+            0x0008 => layout = Some(message::parse_layout(&msg.data)?),
+            0x000B => filter_pipeline = Some(message::parse_filter_pipeline(&msg.data)?),
+            _ => {}
+        }
+    }
+
+    let dsp = dataspace
+        .ok_or_else(|| OxiH5Error::Format(format!("no dataspace message in dataset '{name}'")))?;
+    let dtp = datatype
+        .ok_or_else(|| OxiH5Error::Format(format!("no datatype message in dataset '{name}'")))?;
+    let lay = layout
+        .ok_or_else(|| OxiH5Error::Format(format!("no layout message in dataset '{name}'")))?;
+
+    use oxih5_format::message::LayoutInfo;
+
+    // Attempt lazy chunked slice first.
+    if let LayoutInfo::Chunked { .. } = &lay {
+        let ndims = dsp.dims.len();
+        if ndims >= 1 && ranges.len() == ndims {
+            let all_in_bounds = ranges
+                .iter()
+                .zip(dsp.dims.iter())
+                .all(|(r, &dim)| r.end <= dim as usize);
+
+            if all_in_bounds {
+                let elem_size = dtp.dtype.size().ok_or_else(|| {
+                    OxiH5Error::NotImplemented(format!(
+                        "chunked dataset '{name}': variable-length element size not supported"
+                    ))
+                })?;
+                let dataset_dims: Vec<u64> = dsp.dims.clone();
+                let pipeline = filter_pipeline
+                    .clone()
+                    .unwrap_or_else(|| oxih5_core::FilterPipeline { filters: vec![] });
+                let ranges_u64: Vec<std::ops::Range<u64>> = ranges
+                    .iter()
+                    .map(|r| r.start as u64..r.end as u64)
+                    .collect();
+                let out_shape: Vec<usize> = ranges.iter().map(|r| r.len()).collect();
+
+                let raw = oxih5_format::chunked::read_chunked_slice(
+                    file_data,
+                    &lay,
+                    &pipeline,
+                    &dataset_dims,
+                    oxih5_format::chunked::ChunkSliceParams {
+                        elem_size,
+                        fill_value: fill_value.as_deref(),
+                    },
+                    &ranges_u64,
+                    cache,
+                )?;
+
+                let attributes =
+                    read_attributes_from_header(file_data, header_addr).unwrap_or_default();
+                return Ok(Dataset {
+                    data: raw,
+                    shape: out_shape,
+                    dtype: dtp.dtype,
+                    attributes,
+                });
+            }
+        }
+    }
+
+    // Fallback: full read then in-memory slice.
+    let full_ds = read_dataset_from_object_header(file_data, header_addr, name, cache)?;
+    full_ds.slice(ranges)
+}
+
 /// Read a dataset directly from its object header address (new-style groups).
 ///
 /// This bypasses the B-tree/SNOD lookup because the address was already
@@ -777,6 +1390,7 @@ fn read_dataset_from_object_header(
                 &pipeline,
                 &dataset_dims,
                 elem_size,
+                None,
                 cache,
             )?
         }
@@ -875,6 +1489,7 @@ fn read_dataset_from_group(
                 &pipeline,
                 &dataset_dims,
                 elem_size,
+                None,
                 cache,
             )?
         }

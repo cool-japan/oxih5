@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+mod dataset_convert;
+pub use dataset_convert::f16_to_f32;
+
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,9 +122,7 @@ impl Dtype {
     ///
     /// For variable-length and string-with-no-fixed-length types the stored
     /// element is a global-heap reference / pointer whose on-disk footprint is
-    /// not fixed by the datatype alone, so this returns `None`.  Fixed-width
-    /// numeric, opaque, bitfield, reference, compound, array and enum types all
-    /// return a concrete size.
+    /// not fixed by the datatype alone, so this returns `None`.
     pub fn size(&self) -> Option<usize> {
         match self {
             Dtype::Int { size, .. }
@@ -129,9 +130,6 @@ impl Dtype {
             | Dtype::Bitfield { size, .. }
             | Dtype::Opaque { size, .. } => Some(*size),
             Dtype::String { fixed_len, .. } => *fixed_len,
-            // Object references are 8 bytes, region references 12 bytes in the
-            // common 8-byte-offset file; we report the object-reference size
-            // which is what fixed-width reference datasets use.
             Dtype::Reference { ref_type } => Some(match ref_type {
                 RefType::Object => 8,
                 RefType::Region => 12,
@@ -142,8 +140,6 @@ impl Dtype {
                 base.size().map(|s| s * elems)
             }
             Dtype::Compound { fields } => {
-                // Compound size is the max(offset + member_size); members may be
-                // padded, so this is a lower bound when trailing padding exists.
                 let mut total = 0usize;
                 for f in fields {
                     let fs = f.dtype.size()?;
@@ -172,6 +168,164 @@ pub struct Attribute {
     pub dtype: Dtype,
     pub dataspace: Dataspace,
     pub data: Vec<u8>,
+}
+
+impl Attribute {
+    /// Try to decode this attribute as a scalar i64 value.
+    ///
+    /// Accepts any signed or unsigned integer dtype of size 1/2/4/8 and widens
+    /// to i64.  Unsigned values are reinterpreted via the bit pattern (u64 cast
+    /// to i64) when they exceed i64::MAX — callers are responsible for
+    /// interpreting the signedness correctly from `dtype`.
+    pub fn as_i64(&self) -> Option<i64> {
+        match &self.dtype {
+            Dtype::Int {
+                size,
+                signed,
+                order,
+            } => {
+                let sz = *size;
+                if self.data.len() < sz {
+                    return None;
+                }
+                let bytes = &self.data[..sz];
+                Some(match (sz, order, signed) {
+                    (1, _, true) => i64::from(bytes[0] as i8),
+                    (1, _, false) => i64::from(bytes[0]),
+                    (2, ByteOrder::Little, true) => {
+                        i64::from(i16::from_le_bytes([bytes[0], bytes[1]]))
+                    }
+                    (2, ByteOrder::Big, true) => {
+                        i64::from(i16::from_be_bytes([bytes[0], bytes[1]]))
+                    }
+                    (2, ByteOrder::Little, false) => {
+                        i64::from(u16::from_le_bytes([bytes[0], bytes[1]]))
+                    }
+                    (2, ByteOrder::Big, false) => {
+                        i64::from(u16::from_be_bytes([bytes[0], bytes[1]]))
+                    }
+                    (4, ByteOrder::Little, true) => {
+                        i64::from(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                    }
+                    (4, ByteOrder::Big, true) => {
+                        i64::from(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                    }
+                    (4, ByteOrder::Little, false) => {
+                        i64::from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                    }
+                    (4, ByteOrder::Big, false) => {
+                        i64::from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                    }
+                    (8, ByteOrder::Little, true) => i64::from_le_bytes(bytes.try_into().ok()?),
+                    (8, ByteOrder::Big, true) => i64::from_be_bytes(bytes.try_into().ok()?),
+                    (8, ByteOrder::Little, false) => {
+                        u64::from_le_bytes(bytes.try_into().ok()?) as i64
+                    }
+                    (8, ByteOrder::Big, false) => u64::from_be_bytes(bytes.try_into().ok()?) as i64,
+                    _ => return None,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Try to decode this attribute as a scalar u64 value.
+    ///
+    /// Only works for unsigned integer dtypes; signed integers return `None`.
+    pub fn as_u64(&self) -> Option<u64> {
+        match &self.dtype {
+            Dtype::Int {
+                size,
+                signed: false,
+                order,
+            } => {
+                let sz = *size;
+                if self.data.len() < sz {
+                    return None;
+                }
+                let bytes = &self.data[..sz];
+                Some(match (sz, order) {
+                    (1, _) => u64::from(bytes[0]),
+                    (2, ByteOrder::Little) => u64::from(u16::from_le_bytes([bytes[0], bytes[1]])),
+                    (2, ByteOrder::Big) => u64::from(u16::from_be_bytes([bytes[0], bytes[1]])),
+                    (4, ByteOrder::Little) => {
+                        u64::from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                    }
+                    (4, ByteOrder::Big) => {
+                        u64::from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                    }
+                    (8, ByteOrder::Little) => u64::from_le_bytes(bytes.try_into().ok()?),
+                    (8, ByteOrder::Big) => u64::from_be_bytes(bytes.try_into().ok()?),
+                    _ => return None,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Try to decode this attribute as a scalar f64 value.
+    pub fn as_f64(&self) -> Option<f64> {
+        match &self.dtype {
+            Dtype::Float { size: 8, order } => {
+                if self.data.len() < 8 {
+                    return None;
+                }
+                let arr: [u8; 8] = self.data[..8].try_into().ok()?;
+                Some(match order {
+                    ByteOrder::Little => f64::from_le_bytes(arr),
+                    ByteOrder::Big => f64::from_be_bytes(arr),
+                })
+            }
+            Dtype::Float { size: 4, order } => {
+                if self.data.len() < 4 {
+                    return None;
+                }
+                let arr: [u8; 4] = self.data[..4].try_into().ok()?;
+                Some(match order {
+                    ByteOrder::Little => f64::from(f32::from_le_bytes(arr)),
+                    ByteOrder::Big => f64::from(f32::from_be_bytes(arr)),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Try to decode a fixed-length string attribute as a `String`.
+    ///
+    /// Trims NUL padding.  Returns `None` for vlen-string or non-string dtypes.
+    pub fn as_str_fixed(&self) -> Option<String> {
+        match &self.dtype {
+            Dtype::String {
+                fixed_len: Some(n), ..
+            } => {
+                let n = *n;
+                let bytes = self.data.get(..n)?;
+                let trimmed = bytes.split(|&b| b == 0).next().unwrap_or(bytes);
+                String::from_utf8(trimmed.to_vec()).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns true if the dataspace is a scalar or has exactly one element.
+    pub fn is_scalar(&self) -> bool {
+        match &self.dataspace {
+            Dataspace::Scalar => true,
+            Dataspace::Simple { dims, .. } => dims.iter().product::<u64>() <= 1,
+            Dataspace::Null => false,
+        }
+    }
+
+    /// Returns the shape of the attribute's dataspace as a `Vec<u64>`.
+    ///
+    /// Scalar → `[]`, Null → `[0]`, Simple → the dim vec.
+    pub fn shape(&self) -> Vec<u64> {
+        match &self.dataspace {
+            Dataspace::Scalar => vec![],
+            Dataspace::Null => vec![0],
+            Dataspace::Simple { dims, .. } => dims.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -245,292 +399,7 @@ impl Dataset {
         self.len() == 0
     }
 
-    pub fn as_f32(&self) -> Result<Vec<f32>, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Float { size: 4, order } => {
-                if self.data.len() % 4 != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let mut out = Vec::with_capacity(self.data.len() / 4);
-                for chunk in self.data.chunks_exact(4) {
-                    let arr: [u8; 4] = chunk.try_into().map_err(|_| OxiH5Error::DataTruncated)?;
-                    let v = match order {
-                        ByteOrder::Little => f32::from_le_bytes(arr),
-                        ByteOrder::Big => f32::from_be_bytes(arr),
-                    };
-                    out.push(v);
-                }
-                Ok(out)
-            }
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    pub fn as_f64(&self) -> Result<Vec<f64>, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Float { size: 8, order } => {
-                if self.data.len() % 8 != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let mut out = Vec::with_capacity(self.data.len() / 8);
-                for chunk in self.data.chunks_exact(8) {
-                    let arr: [u8; 8] = chunk.try_into().map_err(|_| OxiH5Error::DataTruncated)?;
-                    let v = match order {
-                        ByteOrder::Little => f64::from_le_bytes(arr),
-                        ByteOrder::Big => f64::from_be_bytes(arr),
-                    };
-                    out.push(v);
-                }
-                Ok(out)
-            }
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    pub fn as_i32(&self) -> Result<Vec<i32>, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Int {
-                size: 4,
-                signed: true,
-                order,
-            } => {
-                if self.data.len() % 4 != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let mut out = Vec::with_capacity(self.data.len() / 4);
-                for chunk in self.data.chunks_exact(4) {
-                    let arr: [u8; 4] = chunk.try_into().map_err(|_| OxiH5Error::DataTruncated)?;
-                    let v = match order {
-                        ByteOrder::Little => i32::from_le_bytes(arr),
-                        ByteOrder::Big => i32::from_be_bytes(arr),
-                    };
-                    out.push(v);
-                }
-                Ok(out)
-            }
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    pub fn as_u8(&self) -> Result<Vec<u8>, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Int {
-                size: 1,
-                signed: false,
-                ..
-            } => Ok(self.data.clone()),
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    pub fn as_u16(&self) -> Result<Vec<u16>, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Int {
-                size: 2,
-                signed: false,
-                order,
-            } => {
-                if self.data.len() % 2 != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let mut out = Vec::with_capacity(self.data.len() / 2);
-                for chunk in self.data.chunks_exact(2) {
-                    let arr: [u8; 2] = chunk.try_into().map_err(|_| OxiH5Error::DataTruncated)?;
-                    let v = match order {
-                        ByteOrder::Little => u16::from_le_bytes(arr),
-                        ByteOrder::Big => u16::from_be_bytes(arr),
-                    };
-                    out.push(v);
-                }
-                Ok(out)
-            }
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    pub fn as_u32(&self) -> Result<Vec<u32>, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Int {
-                size: 4,
-                signed: false,
-                order,
-            } => {
-                if self.data.len() % 4 != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let mut out = Vec::with_capacity(self.data.len() / 4);
-                for chunk in self.data.chunks_exact(4) {
-                    let arr: [u8; 4] = chunk.try_into().map_err(|_| OxiH5Error::DataTruncated)?;
-                    let v = match order {
-                        ByteOrder::Little => u32::from_le_bytes(arr),
-                        ByteOrder::Big => u32::from_be_bytes(arr),
-                    };
-                    out.push(v);
-                }
-                Ok(out)
-            }
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    pub fn as_u64(&self) -> Result<Vec<u64>, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Int {
-                size: 8,
-                signed: false,
-                order,
-            } => {
-                if self.data.len() % 8 != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let mut out = Vec::with_capacity(self.data.len() / 8);
-                for chunk in self.data.chunks_exact(8) {
-                    let arr: [u8; 8] = chunk.try_into().map_err(|_| OxiH5Error::DataTruncated)?;
-                    let v = match order {
-                        ByteOrder::Little => u64::from_le_bytes(arr),
-                        ByteOrder::Big => u64::from_be_bytes(arr),
-                    };
-                    out.push(v);
-                }
-                Ok(out)
-            }
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    pub fn as_i8(&self) -> Result<Vec<i8>, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Int {
-                size: 1,
-                signed: true,
-                ..
-            } => Ok(self.data.iter().map(|&b| b as i8).collect()),
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    pub fn as_i16(&self) -> Result<Vec<i16>, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Int {
-                size: 2,
-                signed: true,
-                order,
-            } => {
-                if self.data.len() % 2 != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let mut out = Vec::with_capacity(self.data.len() / 2);
-                for chunk in self.data.chunks_exact(2) {
-                    let arr: [u8; 2] = chunk.try_into().map_err(|_| OxiH5Error::DataTruncated)?;
-                    let v = match order {
-                        ByteOrder::Little => i16::from_le_bytes(arr),
-                        ByteOrder::Big => i16::from_be_bytes(arr),
-                    };
-                    out.push(v);
-                }
-                Ok(out)
-            }
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    pub fn as_i64(&self) -> Result<Vec<i64>, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Int {
-                size: 8,
-                signed: true,
-                order,
-            } => {
-                if self.data.len() % 8 != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let mut out = Vec::with_capacity(self.data.len() / 8);
-                for chunk in self.data.chunks_exact(8) {
-                    let arr: [u8; 8] = chunk.try_into().map_err(|_| OxiH5Error::DataTruncated)?;
-                    let v = match order {
-                        ByteOrder::Little => i64::from_le_bytes(arr),
-                        ByteOrder::Big => i64::from_be_bytes(arr),
-                    };
-                    out.push(v);
-                }
-                Ok(out)
-            }
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    pub fn as_f16(&self) -> Result<Vec<f32>, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Float { size: 2, order } => {
-                if self.data.len() % 2 != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let mut out = Vec::with_capacity(self.data.len() / 2);
-                for chunk in self.data.chunks_exact(2) {
-                    let arr: [u8; 2] = chunk.try_into().map_err(|_| OxiH5Error::DataTruncated)?;
-                    let bits = match order {
-                        ByteOrder::Little => u16::from_le_bytes(arr),
-                        ByteOrder::Big => u16::from_be_bytes(arr),
-                    };
-                    out.push(f16_to_f32(bits));
-                }
-                Ok(out)
-            }
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    pub fn as_string(&self) -> Result<Vec<std::string::String>, OxiH5Error> {
-        match &self.dtype {
-            Dtype::String {
-                fixed_len: Some(n), ..
-            } => {
-                let n = *n;
-                if n == 0 {
-                    return Err(OxiH5Error::Format("fixed string length is zero".into()));
-                }
-                if self.data.len() % n != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let mut out = Vec::with_capacity(self.data.len() / n);
-                for chunk in self.data.chunks_exact(n) {
-                    let trimmed: Vec<u8> = chunk.iter().copied().take_while(|&b| b != 0).collect();
-                    let s = std::string::String::from_utf8(trimmed)
-                        .map_err(|e| OxiH5Error::Format(format!("invalid UTF-8: {}", e)))?;
-                    out.push(s);
-                }
-                Ok(out)
-            }
-            Dtype::String {
-                fixed_len: None, ..
-            } => Err(OxiH5Error::NotImplemented(
-                "VarLen string decode".to_string(),
-            )),
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    /// Returns the byte size of a single element for fixed-width dtypes.
-    fn dtype_size(&self) -> Result<usize, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Int { size, .. }
-            | Dtype::Float { size, .. }
-            | Dtype::Bitfield { size, .. }
-            | Dtype::Opaque { size, .. } => Ok(*size),
-            Dtype::String {
-                fixed_len: Some(n), ..
-            } => Ok(*n),
-            _ => Err(OxiH5Error::NotImplemented(format!(
-                "dtype_size for {:?}",
-                self.dtype
-            ))),
-        }
-    }
-
     /// Extract a sub-region of the dataset using index ranges.
-    ///
-    /// `ranges`: a slice of `std::ops::Range<usize>`, one per dimension.
-    /// Returns a new `Dataset` containing only the selected elements.
     pub fn slice(&self, ranges: &[std::ops::Range<usize>]) -> Result<Dataset, OxiH5Error> {
         let ndims = self.shape.len();
         if ranges.len() != ndims {
@@ -541,7 +410,6 @@ impl Dataset {
             )));
         }
 
-        // Validate ranges
         for (dim, (range, &dim_size)) in ranges.iter().zip(self.shape.iter()).enumerate() {
             if range.start > range.end {
                 return Err(OxiH5Error::Format(format!(
@@ -562,7 +430,6 @@ impl Dataset {
         let out_elems: usize = out_shape.iter().product();
         let mut out_data = vec![0u8; out_elems * elem_size];
 
-        // Short-circuit for empty output
         if out_elems == 0 {
             return Ok(Dataset {
                 data: out_data,
@@ -572,17 +439,14 @@ impl Dataset {
             });
         }
 
-        // Compute row-major strides for the source shape
         let mut src_strides = vec![1usize; ndims];
         for d in (0..ndims.saturating_sub(1)).rev() {
             src_strides[d] = src_strides[d + 1] * self.shape[d + 1];
         }
 
-        // Walk all multi-dimensional output positions
         let mut coords = vec![0usize; ndims];
         let mut dst_flat = 0usize;
         loop {
-            // Compute the flat index in the source
             let src_flat: usize = coords
                 .iter()
                 .enumerate()
@@ -597,7 +461,6 @@ impl Dataset {
             }
             dst_flat += 1;
 
-            // Increment coords in last-dimension-first (row-major) order
             let mut carry = true;
             for d in (0..ndims).rev() {
                 if carry {
@@ -622,260 +485,7 @@ impl Dataset {
         })
     }
 
-    // -----------------------------------------------------------------------
-    // Lazy iterators — stream typed values directly from the raw byte buffer
-    // without allocating an intermediate Vec.
-    // -----------------------------------------------------------------------
-
-    /// Lazily iterate over `f32` values decoded from a 32-bit float dataset.
-    ///
-    /// Returns `Err(OxiH5Error::TypeMismatch)` when the dtype is not a 4-byte
-    /// float.  Returns `Err(OxiH5Error::DataTruncated)` when the buffer length
-    /// is not a multiple of 4.
-    pub fn iter_f32(&self) -> Result<impl Iterator<Item = f32> + '_, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Float { size: 4, order } => {
-                if self.data.len() % 4 != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let order = *order;
-                Ok(self.data.chunks_exact(4).map(move |chunk| {
-                    let arr: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
-                    match order {
-                        ByteOrder::Little => f32::from_le_bytes(arr),
-                        ByteOrder::Big => f32::from_be_bytes(arr),
-                    }
-                }))
-            }
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    /// Lazily iterate over `f64` values decoded from a 64-bit float dataset.
-    pub fn iter_f64(&self) -> Result<impl Iterator<Item = f64> + '_, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Float { size: 8, order } => {
-                if self.data.len() % 8 != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let order = *order;
-                Ok(self.data.chunks_exact(8).map(move |chunk| {
-                    let arr: [u8; 8] = [
-                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
-                        chunk[7],
-                    ];
-                    match order {
-                        ByteOrder::Little => f64::from_le_bytes(arr),
-                        ByteOrder::Big => f64::from_be_bytes(arr),
-                    }
-                }))
-            }
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    /// Lazily iterate over `i32` values decoded from a signed 32-bit integer dataset.
-    pub fn iter_i32(&self) -> Result<impl Iterator<Item = i32> + '_, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Int {
-                size: 4,
-                signed: true,
-                order,
-            } => {
-                if self.data.len() % 4 != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let order = *order;
-                Ok(self.data.chunks_exact(4).map(move |chunk| {
-                    let arr: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
-                    match order {
-                        ByteOrder::Little => i32::from_le_bytes(arr),
-                        ByteOrder::Big => i32::from_be_bytes(arr),
-                    }
-                }))
-            }
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    /// Lazily iterate over `u8` values from an unsigned 8-bit integer dataset.
-    pub fn iter_u8(&self) -> Result<impl Iterator<Item = u8> + '_, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Int {
-                size: 1,
-                signed: false,
-                ..
-            } => Ok(self.data.iter().copied()),
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    /// Lazily iterate over `i8` values from a signed 8-bit integer dataset.
-    pub fn iter_i8(&self) -> Result<impl Iterator<Item = i8> + '_, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Int {
-                size: 1,
-                signed: true,
-                ..
-            } => Ok(self.data.iter().map(|&b| b as i8)),
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    /// Lazily iterate over `u16` values decoded from an unsigned 16-bit integer dataset.
-    pub fn iter_u16(&self) -> Result<impl Iterator<Item = u16> + '_, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Int {
-                size: 2,
-                signed: false,
-                order,
-            } => {
-                if self.data.len() % 2 != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let order = *order;
-                Ok(self.data.chunks_exact(2).map(move |chunk| {
-                    let arr: [u8; 2] = [chunk[0], chunk[1]];
-                    match order {
-                        ByteOrder::Little => u16::from_le_bytes(arr),
-                        ByteOrder::Big => u16::from_be_bytes(arr),
-                    }
-                }))
-            }
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    /// Lazily iterate over `i16` values decoded from a signed 16-bit integer dataset.
-    pub fn iter_i16(&self) -> Result<impl Iterator<Item = i16> + '_, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Int {
-                size: 2,
-                signed: true,
-                order,
-            } => {
-                if self.data.len() % 2 != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let order = *order;
-                Ok(self.data.chunks_exact(2).map(move |chunk| {
-                    let arr: [u8; 2] = [chunk[0], chunk[1]];
-                    match order {
-                        ByteOrder::Little => i16::from_le_bytes(arr),
-                        ByteOrder::Big => i16::from_be_bytes(arr),
-                    }
-                }))
-            }
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    /// Lazily iterate over `u32` values decoded from an unsigned 32-bit integer dataset.
-    pub fn iter_u32(&self) -> Result<impl Iterator<Item = u32> + '_, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Int {
-                size: 4,
-                signed: false,
-                order,
-            } => {
-                if self.data.len() % 4 != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let order = *order;
-                Ok(self.data.chunks_exact(4).map(move |chunk| {
-                    let arr: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
-                    match order {
-                        ByteOrder::Little => u32::from_le_bytes(arr),
-                        ByteOrder::Big => u32::from_be_bytes(arr),
-                    }
-                }))
-            }
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    /// Lazily iterate over `i64` values decoded from a signed 64-bit integer dataset.
-    pub fn iter_i64(&self) -> Result<impl Iterator<Item = i64> + '_, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Int {
-                size: 8,
-                signed: true,
-                order,
-            } => {
-                if self.data.len() % 8 != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let order = *order;
-                Ok(self.data.chunks_exact(8).map(move |chunk| {
-                    let arr: [u8; 8] = [
-                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
-                        chunk[7],
-                    ];
-                    match order {
-                        ByteOrder::Little => i64::from_le_bytes(arr),
-                        ByteOrder::Big => i64::from_be_bytes(arr),
-                    }
-                }))
-            }
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    /// Lazily iterate over `u64` values decoded from an unsigned 64-bit integer dataset.
-    pub fn iter_u64(&self) -> Result<impl Iterator<Item = u64> + '_, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Int {
-                size: 8,
-                signed: false,
-                order,
-            } => {
-                if self.data.len() % 8 != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let order = *order;
-                Ok(self.data.chunks_exact(8).map(move |chunk| {
-                    let arr: [u8; 8] = [
-                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
-                        chunk[7],
-                    ];
-                    match order {
-                        ByteOrder::Little => u64::from_le_bytes(arr),
-                        ByteOrder::Big => u64::from_be_bytes(arr),
-                    }
-                }))
-            }
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    /// Lazily iterate over `f32` values decoded from a 16-bit (half-precision) float dataset.
-    ///
-    /// Each f16 is decoded to f32 via software conversion.
-    pub fn iter_f16(&self) -> Result<impl Iterator<Item = f32> + '_, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Float { size: 2, order } => {
-                if self.data.len() % 2 != 0 {
-                    return Err(OxiH5Error::DataTruncated);
-                }
-                let order = *order;
-                Ok(self.data.chunks_exact(2).map(move |chunk| {
-                    let arr: [u8; 2] = [chunk[0], chunk[1]];
-                    let bits = match order {
-                        ByteOrder::Little => u16::from_le_bytes(arr),
-                        ByteOrder::Big => u16::from_be_bytes(arr),
-                    };
-                    f16_to_f32(bits)
-                }))
-            }
-            _ => Err(OxiH5Error::TypeMismatch),
-        }
-    }
-
-    /// Validate and "reshape" the dataset to a new shape.
-    ///
-    /// This does not copy or reorder data — it just validates the total element
-    /// count matches, then returns a new `Dataset` with the new shape and
-    /// the same (cloned) data.
+    /// Reshape the dataset to a new shape (zero-copy — validates element count only).
     pub fn reshape(&self, new_shape: &[usize]) -> Result<Dataset, OxiH5Error> {
         let old_count: usize = if self.shape.is_empty() {
             1
@@ -899,83 +509,6 @@ impl Dataset {
             dtype: self.dtype.clone(),
             attributes: self.attributes.clone(),
         })
-    }
-}
-
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = u32::from((bits >> 15) & 1);
-    let exp = u32::from((bits >> 10) & 0x1F);
-    let mantissa = u32::from(bits & 0x3FF);
-
-    let f32_bits: u32 = if exp == 0 {
-        if mantissa == 0 {
-            sign << 31
-        } else {
-            let mut m = mantissa;
-            let mut e = 127u32.wrapping_sub(14);
-            while m & 0x400 == 0 {
-                m <<= 1;
-                e = e.wrapping_sub(1);
-            }
-            m &= 0x3FF;
-            (sign << 31) | (e << 23) | (m << 13)
-        }
-    } else if exp == 31 {
-        (sign << 31) | (0xFF << 23) | (mantissa << 13)
-    } else {
-        let e = exp + 127 - 15;
-        (sign << 31) | (e << 23) | (mantissa << 13)
-    };
-
-    f32::from_bits(f32_bits)
-}
-
-// ---------------------------------------------------------------------------
-// ndarray bridge (feature-gated)
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "ndarray")]
-impl Dataset {
-    /// Convert typed data to an `ndarray::ArrayD<f32>`.
-    ///
-    /// Requires the `ndarray` feature.
-    pub fn to_array_f32(&self) -> Result<ndarray::ArrayD<f32>, OxiH5Error> {
-        let values = self.as_f32()?;
-        let shape: Vec<usize> = if self.shape.is_empty() {
-            vec![1]
-        } else {
-            self.shape.clone()
-        };
-        ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&shape), values)
-            .map_err(|e| OxiH5Error::Format(format!("ndarray shape error: {}", e)))
-    }
-
-    /// Convert typed data to an `ndarray::ArrayD<f64>`.
-    ///
-    /// Requires the `ndarray` feature.
-    pub fn to_array_f64(&self) -> Result<ndarray::ArrayD<f64>, OxiH5Error> {
-        let values = self.as_f64()?;
-        let shape: Vec<usize> = if self.shape.is_empty() {
-            vec![1]
-        } else {
-            self.shape.clone()
-        };
-        ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&shape), values)
-            .map_err(|e| OxiH5Error::Format(format!("ndarray shape error: {}", e)))
-    }
-
-    /// Convert typed data to an `ndarray::ArrayD<i32>`.
-    ///
-    /// Requires the `ndarray` feature.
-    pub fn to_array_i32(&self) -> Result<ndarray::ArrayD<i32>, OxiH5Error> {
-        let values = self.as_i32()?;
-        let shape: Vec<usize> = if self.shape.is_empty() {
-            vec![1]
-        } else {
-            self.shape.clone()
-        };
-        ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&shape), values)
-            .map_err(|e| OxiH5Error::Format(format!("ndarray shape error: {}", e)))
     }
 }
 
@@ -1052,7 +585,6 @@ mod tests {
             .size(),
             Some(10)
         );
-        // Variable-length string has no fixed element size.
         assert_eq!(
             Dtype::String {
                 fixed_len: None,
@@ -1061,7 +593,6 @@ mod tests {
             .size(),
             None
         );
-        // Array: base size * product(dims).
         assert_eq!(
             Dtype::Array {
                 base: Box::new(Dtype::Int {
@@ -1074,7 +605,6 @@ mod tests {
             .size(),
             Some(2 * 12)
         );
-        // Enum inherits its base type's size.
         assert_eq!(
             Dtype::Enum {
                 base: Box::new(Dtype::Int {
@@ -1087,7 +617,6 @@ mod tests {
             .size(),
             Some(4)
         );
-        // Compound: max(offset + member size).
         assert_eq!(
             Dtype::Compound {
                 fields: vec![
@@ -1113,7 +642,6 @@ mod tests {
             .size(),
             Some(12)
         );
-        // Object reference is 8 bytes, variable-length has no fixed size.
         assert_eq!(
             Dtype::Reference {
                 ref_type: RefType::Object
@@ -1332,7 +860,6 @@ mod tests {
 
     #[test]
     fn test_slice_2d() {
-        // 3x4 matrix of u8 = [0..12]
         let data: Vec<u8> = (0u8..12).collect();
         let ds = Dataset {
             data,
@@ -1344,8 +871,6 @@ mod tests {
             },
             attributes: vec![],
         };
-        // Row 1: [4,5,6,7], Row 2: [8,9,10,11]
-        // Slice rows 1..3, cols 1..3 = [5,6,9,10]
         let ranges = [
             std::ops::Range { start: 1, end: 3 },
             std::ops::Range { start: 1, end: 3 },
@@ -1405,8 +930,53 @@ mod tests {
         assert_eq!(reshaped.shape, vec![2, 6]);
         assert_eq!(reshaped.data.len(), 12);
 
-        // Wrong element count should fail
         assert!(ds.reshape(&[2, 7]).is_err());
+    }
+
+    #[test]
+    fn test_attribute_scalar_accessors() {
+        // Test as_i64 with i32 LE
+        let attr = Attribute {
+            name: "count".into(),
+            dtype: Dtype::Int {
+                size: 4,
+                signed: true,
+                order: ByteOrder::Little,
+            },
+            dataspace: Dataspace::Scalar,
+            data: 42i32.to_le_bytes().to_vec(),
+        };
+        assert_eq!(attr.as_i64(), Some(42));
+        assert!(attr.is_scalar());
+        assert_eq!(attr.shape(), vec![]);
+
+        // Test as_f64 with f64 LE
+        let pi = std::f64::consts::PI;
+        let attr_f = Attribute {
+            name: "scale".into(),
+            dtype: Dtype::Float {
+                size: 8,
+                order: ByteOrder::Little,
+            },
+            dataspace: Dataspace::Scalar,
+            data: pi.to_le_bytes().to_vec(),
+        };
+        let v = attr_f.as_f64().unwrap();
+        assert!((v - pi).abs() < 1e-10);
+
+        // Test as_str_fixed
+        let mut str_data = b"hello\0\0\0".to_vec();
+        str_data.resize(8, 0);
+        let attr_s = Attribute {
+            name: "label".into(),
+            dtype: Dtype::String {
+                fixed_len: Some(8),
+                charset: Charset::Utf8,
+            },
+            dataspace: Dataspace::Scalar,
+            data: str_data,
+        };
+        assert_eq!(attr_s.as_str_fixed(), Some("hello".into()));
     }
 }
 
@@ -1417,7 +987,6 @@ mod ndarray_tests {
 
     #[test]
     fn test_to_array_f32() {
-        // 1.0f32 LE bytes = [0x00, 0x00, 0x80, 0x3F], 2.0f32 LE = [0x00, 0x00, 0x00, 0x40]
         let ds = Dataset {
             data: vec![0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x00, 0x40],
             shape: vec![2],
@@ -1450,5 +1019,170 @@ mod ndarray_tests {
         assert_eq!(arr.shape(), &[2, 3]);
         assert_eq!(arr[[0, 0]], 0);
         assert_eq!(arr[[1, 2]], 5);
+    }
+
+    #[test]
+    fn test_to_array_u8() {
+        let data: Vec<u8> = vec![1, 2, 3, 4, 5, 6];
+        let ds = Dataset {
+            data,
+            shape: vec![2, 3],
+            dtype: Dtype::Int {
+                signed: false,
+                size: 1,
+                order: ByteOrder::Little,
+            },
+            attributes: vec![],
+        };
+        let arr = ds.to_array_u8().expect("to_array_u8");
+        assert_eq!(arr.shape(), &[2, 3]);
+        assert_eq!(arr[[0, 0]], 1u8);
+        assert_eq!(arr[[1, 2]], 6u8);
+    }
+
+    #[test]
+    fn test_to_array_u16() {
+        let data: Vec<u8> = (1u16..=6).flat_map(|v| v.to_le_bytes()).collect();
+        let ds = Dataset {
+            data,
+            shape: vec![2, 3],
+            dtype: Dtype::Int {
+                signed: false,
+                size: 2,
+                order: ByteOrder::Little,
+            },
+            attributes: vec![],
+        };
+        let arr = ds.to_array_u16().expect("to_array_u16");
+        assert_eq!(arr.shape(), &[2, 3]);
+        assert_eq!(arr[[0, 0]], 1u16);
+        assert_eq!(arr[[1, 2]], 6u16);
+    }
+
+    #[test]
+    fn test_to_array_u32() {
+        let data: Vec<u8> = (1u32..=6).flat_map(|v| v.to_le_bytes()).collect();
+        let ds = Dataset {
+            data,
+            shape: vec![2, 3],
+            dtype: Dtype::Int {
+                signed: false,
+                size: 4,
+                order: ByteOrder::Little,
+            },
+            attributes: vec![],
+        };
+        let arr = ds.to_array_u32().expect("to_array_u32");
+        assert_eq!(arr.shape(), &[2, 3]);
+        assert_eq!(arr[[0, 0]], 1u32);
+        assert_eq!(arr[[1, 2]], 6u32);
+    }
+
+    #[test]
+    fn test_to_array_u64() {
+        let data: Vec<u8> = (1u64..=6).flat_map(|v| v.to_le_bytes()).collect();
+        let ds = Dataset {
+            data,
+            shape: vec![2, 3],
+            dtype: Dtype::Int {
+                signed: false,
+                size: 8,
+                order: ByteOrder::Little,
+            },
+            attributes: vec![],
+        };
+        let arr = ds.to_array_u64().expect("to_array_u64");
+        assert_eq!(arr.shape(), &[2, 3]);
+        assert_eq!(arr[[0, 0]], 1u64);
+        assert_eq!(arr[[1, 2]], 6u64);
+    }
+
+    #[test]
+    fn test_to_array_i8() {
+        let data: Vec<u8> = (-3i8..=2).map(|v| v as u8).collect();
+        let ds = Dataset {
+            data,
+            shape: vec![2, 3],
+            dtype: Dtype::Int {
+                signed: true,
+                size: 1,
+                order: ByteOrder::Little,
+            },
+            attributes: vec![],
+        };
+        let arr = ds.to_array_i8().expect("to_array_i8");
+        assert_eq!(arr.shape(), &[2, 3]);
+        assert_eq!(arr[[0, 0]], -3i8);
+        assert_eq!(arr[[1, 2]], 2i8);
+    }
+
+    #[test]
+    fn test_to_array_i16() {
+        let data: Vec<u8> = (-3i16..=2).flat_map(|v| v.to_le_bytes()).collect();
+        let ds = Dataset {
+            data,
+            shape: vec![2, 3],
+            dtype: Dtype::Int {
+                signed: true,
+                size: 2,
+                order: ByteOrder::Little,
+            },
+            attributes: vec![],
+        };
+        let arr = ds.to_array_i16().expect("to_array_i16");
+        assert_eq!(arr.shape(), &[2, 3]);
+        assert_eq!(arr[[0, 0]], -3i16);
+        assert_eq!(arr[[1, 2]], 2i16);
+    }
+
+    #[test]
+    fn test_to_array_i64() {
+        let data: Vec<u8> = (1i64..=6).flat_map(|v| v.to_le_bytes()).collect();
+        let ds = Dataset {
+            data,
+            shape: vec![2, 3],
+            dtype: Dtype::Int {
+                signed: true,
+                size: 8,
+                order: ByteOrder::Little,
+            },
+            attributes: vec![],
+        };
+        let arr = ds.to_array_i64().expect("to_array_i64");
+        assert_eq!(arr.shape(), &[2, 3]);
+        assert_eq!(arr[[0, 0]], 1i64);
+        assert_eq!(arr[[1, 2]], 6i64);
+    }
+
+    #[test]
+    fn test_to_array_f16() {
+        let data: Vec<u8> = vec![0x00, 0x3C, 0x00, 0x40];
+        let ds = Dataset {
+            data,
+            shape: vec![2],
+            dtype: Dtype::Float {
+                size: 2,
+                order: ByteOrder::Little,
+            },
+            attributes: vec![],
+        };
+        let arr = ds.to_array_f16().expect("to_array_f16");
+        assert_eq!(arr.shape(), &[2]);
+        assert!((arr[[0]] - 1.0_f32).abs() < 1e-3);
+        assert!((arr[[1]] - 2.0_f32).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_to_array_u8_type_mismatch() {
+        let ds = Dataset {
+            data: vec![0u8, 0, 0, 0],
+            shape: vec![1],
+            dtype: Dtype::Float {
+                size: 4,
+                order: ByteOrder::Little,
+            },
+            attributes: vec![],
+        };
+        assert!(ds.to_array_u8().is_err());
     }
 }

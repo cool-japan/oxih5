@@ -78,5 +78,9 @@ Foundation types in place: `Dtype` (Int/Float), `ByteOrder`, `Dataset` with `as_
   - **Done:** oxih5-format datatype.rs produces all oxih5-core Dtype variants — 2026-05-25
 - [x] Ensure oxih5 facade constructs `Dataset` correctly from format-level parsed components
   - **Done:** oxih5 facade constructs Dataset from oxih5-format parsed layout/datatype/dataspace correctly — 2026-05-25
-- [~] Coordinate with SciRS2 / NumRS2 for ndarray bridge requirements
-  - **Plan:** oxih5-core type expansion — 2026-05-25
+- [x] Coordinate with SciRS2 / NumRS2 for ndarray bridge requirements — implement full numeric `to_array_*` coverage now; external SciRS2 coordination stays open (planned 2026-06-02)
+  - **Goal:** `Dataset::to_array_{u8,u16,u32,u64,i8,i16,i64,f16}` behind the `ndarray` feature, returning `ndarray::ArrayD<T>` (f16 widens to `ArrayD<f32>`). Closes the SciRS2/NumRS2 array-surface gap for all numeric dtypes.
+  - **Design:** Extend the `#[cfg(feature = "ndarray")] impl Dataset` block (currently lines 937–980 of `src/lib.rs`) with 8 new methods, each mirroring the existing `to_array_{f32,f64,i32}` pattern: call the matching scalar accessor (`as_u8`/…/`as_f16`), normalise empty shape to `vec![1]`, `ArrayD::from_shape_vec(IxDyn(&shape), values)`, map err to `OxiH5Error::Format`. Optionally use a private declarative macro `impl_to_array!` to stay DRY. No `unwrap`, no `#[allow]`.
+  - **Files:** `crates/oxih5-core/src/lib.rs` (extend ndarray impl block).
+  - **Tests:** `#[cfg(feature = "ndarray")]`-gated tests in `crates/oxih5-core`: round-trip each new accessor on a 2-D `Dataset`, assert `.shape()` and element values; one type-mismatch error case.
+  - **Risk:** Low (pure additive). `to_array_f16` naming explicitly documents the widen-to-f32 contract.

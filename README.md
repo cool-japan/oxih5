@@ -9,10 +9,10 @@ provides a minimal write path for flat contiguous datasets.
 
 ---
 
-## Release: 0.1.0 (2026-06-01)
+## Release: 0.1.1 (2026-06-04)
 
-273 unit + integration tests; all pass.  Full workspace
-(~11.7 k SLOC of Rust across three crates).
+345 unit + integration tests; all pass.  Full workspace
+(~11.7 k SLOC of Rust across four crates).
 
 ---
 
@@ -58,7 +58,7 @@ message.rs          — decode all standard message types
 
 ---
 
-## What Works (v0.1.0)
+## What Works (v0.1.1)
 
 ### Superblock
 

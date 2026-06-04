@@ -20,3 +20,14 @@ oxih5-core     = { workspace = true }
 oxiarc-deflate = { workspace = true }
 oxiarc-szip    = { workspace = true, optional = true }
 rayon          = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "parse_bench"
+harness = false
+
+[[bench]]
+name = "traverse_bench"
+harness = false

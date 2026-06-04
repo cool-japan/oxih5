@@ -224,6 +224,9 @@ pub fn resolve_chunk_index(
 /// * `pipeline`      – the dataset's filter pipeline (empty ⇒ no filters)
 /// * `dataset_dims`  – full dataset dimensions in elements
 /// * `elem_size`     – element size in bytes
+/// * `fill_value`    – optional per-element fill bytes (length must equal `elem_size`);
+///   when `Some` the output buffer and any sparse chunks are initialised with
+///   the tiled fill pattern rather than zeros.
 /// * `cache`         – optional pre-parsed chunk index cache; when `Some` the
 ///   chunk records for this index address are computed at most once across
 ///   repeated calls.  Pass `None` to disable caching.
@@ -233,6 +236,7 @@ pub fn read_chunked(
     pipeline: &FilterPipeline,
     dataset_dims: &[u64],
     elem_size: usize,
+    fill_value: Option<&[u8]>,
     cache: Option<&ChunkIndexCache>,
 ) -> Result<Vec<u8>, OxiH5Error> {
     let LayoutInfo::Chunked {
@@ -294,13 +298,15 @@ pub fn read_chunked(
     let chunks_arc: Arc<Vec<ChunkRecord>> = if let Some(c) = cache {
         let uncompressed_for_fa = real_chunk_dims.iter().product::<u64>() as usize * elem_size;
         let real_chunk_dims_clone = real_chunk_dims.clone();
+        let dataset_dims_clone = dataset_dims.to_vec();
         c.get_or_insert((*data_address, ndims), move || {
             if index == ChunkIndex::FixedArray {
-                fa_index::parse_fixed_array_v4(
+                fa_index::parse_fixed_array_v4_with_dataset_dims(
                     file_data,
                     *data_address,
                     ndims,
                     &real_chunk_dims_clone,
+                    &dataset_dims_clone,
                     uncompressed_for_fa,
                 )
             } else {
@@ -311,11 +317,12 @@ pub fn read_chunked(
         // No cache: compute directly.
         let records = if index == ChunkIndex::FixedArray {
             let uncompressed = real_chunk_dims.iter().product::<u64>() as usize * elem_size;
-            fa_index::parse_fixed_array_v4(
+            fa_index::parse_fixed_array_v4_with_dataset_dims(
                 file_data,
                 *data_address,
                 ndims,
                 &real_chunk_dims,
+                dataset_dims,
                 uncompressed,
             )?
         } else {
@@ -326,8 +333,21 @@ pub fn read_chunked(
 
     #[cfg(feature = "parallel")]
     {
+        // Build the output buffer, tiled with the fill value if provided.
+        let make_fill_buf = |n_elems: usize| -> Vec<u8> {
+            match fill_value {
+                Some(fv) if fv.len() == elem_size && elem_size > 0 => fv
+                    .iter()
+                    .cycle()
+                    .take(n_elems * elem_size)
+                    .cloned()
+                    .collect(),
+                _ => vec![0u8; n_elems * elem_size],
+            }
+        };
+
         let total_elems: u64 = dataset_dims.iter().product();
-        let mut output = vec![0u8; total_elems as usize * elem_size];
+        let mut output = make_fill_buf(total_elems as usize);
 
         // Phase 1 (parallel): read + decompress each chunk concurrently.
         let decompressed: Vec<(Vec<u64>, Vec<u8>)> = chunks_arc
@@ -355,12 +375,13 @@ pub fn read_chunked(
     }
 
     #[cfg(not(feature = "parallel"))]
-    assemble_chunks(
+    assemble_chunks_with_fill(
         &chunks_arc,
         file_data,
         &real_chunk_dims,
         dataset_dims,
         elem_size,
+        fill_value,
         |raw, mask| {
             if pipeline.filters.is_empty() {
                 Ok(raw.to_vec())
@@ -369,6 +390,14 @@ pub fn read_chunked(
             }
         },
     )
+}
+
+/// Grouped parameters for [`read_chunked_slice`] to keep the argument count ≤ 7.
+pub struct ChunkSliceParams<'a> {
+    /// Element size in bytes.
+    pub elem_size: usize,
+    /// Optional per-element fill bytes for sparse chunks (length must equal `elem_size`).
+    pub fill_value: Option<&'a [u8]>,
 }
 
 /// Read only the chunks that overlap with `ranges` from a chunked dataset.
@@ -382,7 +411,7 @@ pub fn read_chunked(
 /// * `layout`       – the parsed chunked layout message
 /// * `pipeline`     – the dataset's filter pipeline (empty ⇒ no filters)
 /// * `dataset_dims` – full dataset dimensions in elements
-/// * `elem_size`    – element size in bytes
+/// * `params`       – element size and optional fill value (use `ChunkSliceParams`)
 /// * `ranges`       – one `Range<u64>` per dimension specifying the requested sub-region
 /// * `cache`        – optional pre-parsed chunk index cache; pass `None` to disable caching
 pub fn read_chunked_slice(
@@ -390,10 +419,12 @@ pub fn read_chunked_slice(
     layout: &LayoutInfo,
     pipeline: &FilterPipeline,
     dataset_dims: &[u64],
-    elem_size: usize,
+    params: ChunkSliceParams<'_>,
     ranges: &[std::ops::Range<u64>],
     cache: Option<&ChunkIndexCache>,
 ) -> Result<Vec<u8>, OxiH5Error> {
+    let elem_size = params.elem_size;
+    let fill_value = params.fill_value;
     let LayoutInfo::Chunked {
         data_address,
         dimensionality,
@@ -470,13 +501,15 @@ pub fn read_chunked_slice(
     let chunks_arc: Arc<Vec<ChunkRecord>> = if let Some(c) = cache {
         let uncompressed_for_fa = real_chunk_dims.iter().product::<u64>() as usize * elem_size;
         let real_chunk_dims_clone = real_chunk_dims.clone();
+        let dataset_dims_clone = dataset_dims.to_vec();
         c.get_or_insert((*data_address, ndims), move || {
             if index == ChunkIndex::FixedArray {
-                crate::fa_index::parse_fixed_array_v4(
+                crate::fa_index::parse_fixed_array_v4_with_dataset_dims(
                     file_data,
                     *data_address,
                     ndims,
                     &real_chunk_dims_clone,
+                    &dataset_dims_clone,
                     uncompressed_for_fa,
                 )
             } else {
@@ -486,11 +519,12 @@ pub fn read_chunked_slice(
     } else {
         let records = if index == ChunkIndex::FixedArray {
             let uncompressed = real_chunk_dims.iter().product::<u64>() as usize * elem_size;
-            crate::fa_index::parse_fixed_array_v4(
+            crate::fa_index::parse_fixed_array_v4_with_dataset_dims(
                 file_data,
                 *data_address,
                 ndims,
                 &real_chunk_dims,
+                dataset_dims,
                 uncompressed,
             )?
         } else {
@@ -501,6 +535,19 @@ pub fn read_chunked_slice(
 
     #[cfg(feature = "parallel")]
     {
+        // Build a sparse-chunk fill buffer of the right size.
+        let make_sparse_fill = |n_elems: usize| -> Vec<u8> {
+            match fill_value {
+                Some(fv) if fv.len() == elem_size && elem_size > 0 => fv
+                    .iter()
+                    .cycle()
+                    .take(n_elems * elem_size)
+                    .cloned()
+                    .collect(),
+                _ => vec![0u8; n_elems * elem_size],
+            }
+        };
+
         let out_dims: Vec<u64> = ranges.iter().map(|r| r.end - r.start).collect();
         let out_elems: u64 = out_dims.iter().product();
         let mut output = vec![0u8; out_elems as usize * elem_size];
@@ -557,7 +604,7 @@ pub fn read_chunked_slice(
         // Build a map from origin → decompressed data for scatter phase.
         let decomp_map: HashMap<Vec<u64>, Vec<u8>> = decompressed.into_iter().collect();
 
-        // Phase 2 (sequential): iterate cells and scatter (sparse chunks → zero).
+        // Phase 2 (sequential): iterate cells and scatter (sparse chunks → fill).
         for cell_flat in 0..total_cells as usize {
             let ci_rel = flat_to_coords(cell_flat, &ci_strides, ndims);
             let origin: Vec<u64> = (0..ndims)
@@ -567,7 +614,7 @@ pub fn read_chunked_slice(
             let chunk_data: std::borrow::Cow<[u8]> = if let Some(data) = decomp_map.get(&origin) {
                 std::borrow::Cow::Borrowed(data.as_slice())
             } else {
-                std::borrow::Cow::Owned(vec![0u8; chunk_volume as usize * elem_size])
+                std::borrow::Cow::Owned(make_sparse_fill(chunk_volume as usize))
             };
 
             scatter_chunk_slice(
@@ -589,8 +636,11 @@ pub fn read_chunked_slice(
         file_data,
         &real_chunk_dims,
         dataset_dims,
-        elem_size,
         ranges,
+        SliceElemConfig {
+            elem_size,
+            fill_value,
+        },
         |raw, mask| {
             if pipeline.filters.is_empty() {
                 Ok(raw.to_vec())
@@ -601,12 +651,110 @@ pub fn read_chunked_slice(
     )
 }
 
+/// Assemble a complete chunked dataset with optional fill value support.
+///
+/// Like [`assemble_chunks`] but initialises the output buffer and sparse chunks
+/// with `fill_value` bytes instead of zeros.
+///
+/// Used by the sequential (non-parallel) code path in [`read_chunked`].
+#[cfg(any(not(feature = "parallel"), test))]
+fn assemble_chunks_with_fill(
+    chunks: &[ChunkRecord],
+    file_data: &[u8],
+    chunk_dims: &[u64],
+    dataset_dims: &[u64],
+    elem_size: usize,
+    fill_value: Option<&[u8]>,
+    apply_filters: impl Fn(&[u8], u32) -> Result<Vec<u8>, OxiH5Error>,
+) -> Result<Vec<u8>, OxiH5Error> {
+    let ndims = dataset_dims.len();
+    if chunk_dims.len() != ndims {
+        return Err(OxiH5Error::Format(format!(
+            "assemble_chunks_with_fill: chunk_dims ({}) and dataset_dims ({}) length mismatch",
+            chunk_dims.len(),
+            ndims,
+        )));
+    }
+    if elem_size == 0 {
+        return Err(OxiH5Error::Format(
+            "assemble_chunks_with_fill: elem_size must be > 0".into(),
+        ));
+    }
+
+    let total_elems: u64 = dataset_dims.iter().product();
+    let n_total = total_elems as usize;
+    let mut output = match fill_value {
+        Some(fv) if fv.len() == elem_size => fv
+            .iter()
+            .cycle()
+            .take(n_total * elem_size)
+            .cloned()
+            .collect(),
+        _ => vec![0u8; n_total * elem_size],
+    };
+
+    let dataset_strides = row_major_strides(dataset_dims);
+    let chunk_strides = row_major_strides(chunk_dims);
+    let chunk_volume: u64 = chunk_dims.iter().product();
+
+    for chunk in chunks {
+        if chunk.offsets.len() < ndims {
+            return Err(OxiH5Error::Format(format!(
+                "chunk at {:#x}: offsets length {} < ndims {}",
+                chunk.address,
+                chunk.offsets.len(),
+                ndims,
+            )));
+        }
+        let raw = read_chunk_bytes(file_data, chunk)?;
+        let chunk_data = apply_filters(raw, chunk.filter_mask)?;
+        let n_chunk_elems = (chunk_data.len() / elem_size).min(chunk_volume as usize);
+
+        for flat_chunk_idx in 0..n_chunk_elems {
+            let chunk_coords = flat_to_coords(flat_chunk_idx, &chunk_strides, ndims);
+            let mut dataset_flat = 0usize;
+            let mut in_bounds = true;
+
+            for d in 0..ndims {
+                let dataset_coord = chunk.offsets[d] + chunk_coords[d];
+                if dataset_coord >= dataset_dims[d] {
+                    in_bounds = false;
+                    break;
+                }
+                dataset_flat += dataset_coord as usize * dataset_strides[d];
+            }
+
+            if !in_bounds {
+                continue;
+            }
+
+            let src_off = flat_chunk_idx * elem_size;
+            let dst_off = dataset_flat * elem_size;
+
+            if src_off + elem_size <= chunk_data.len() && dst_off + elem_size <= output.len() {
+                output[dst_off..dst_off + elem_size]
+                    .copy_from_slice(&chunk_data[src_off..src_off + elem_size]);
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Parameters for [`assemble_chunks_slice`] that pack element config together
+/// to keep the argument count under the clippy limit.
+#[cfg(any(not(feature = "parallel"), test))]
+struct SliceElemConfig<'a> {
+    elem_size: usize,
+    fill_value: Option<&'a [u8]>,
+}
+
 /// Assemble only the chunks that overlap with `ranges` into an output buffer
 /// of shape `[r.len() for r in ranges]` (row-major).
 ///
 /// For each chunk-grid cell that intersects the requested hyperslab, we read
 /// and decompress the chunk, then scatter the overlapping elements into the
-/// output buffer.  Absent (sparse) chunks are left as zero.
+/// output buffer.  Absent (sparse) chunks are filled with `fill_value` or zero.
 ///
 /// Used by the sequential (non-parallel) code path in [`read_chunked_slice`].
 #[cfg(any(not(feature = "parallel"), test))]
@@ -615,10 +763,12 @@ fn assemble_chunks_slice(
     file_data: &[u8],
     chunk_dims: &[u64],
     dataset_dims: &[u64],
-    elem_size: usize,
     ranges: &[std::ops::Range<u64>],
+    cfg: SliceElemConfig<'_>,
     apply_filters: impl Fn(&[u8], u32) -> Result<Vec<u8>, OxiH5Error>,
 ) -> Result<Vec<u8>, OxiH5Error> {
+    let elem_size = cfg.elem_size;
+    let fill_value = cfg.fill_value;
     let ndims = dataset_dims.len();
 
     // Derive output shape directly from ranges.
@@ -685,7 +835,7 @@ fn assemble_chunks_slice(
         // Find this chunk's record (if it exists; absent chunks stay zero).
         let maybe_record = chunk_map.get(&origin);
 
-        // Decompress (or create zero-filled buffer for sparse chunks).
+        // Decompress (or create fill-value buffer for sparse chunks).
         let chunk_data: Vec<u8> = if let Some(&rec_idx) = maybe_record {
             let cr = &chunks[rec_idx];
             let addr = cr.address as usize;
@@ -700,8 +850,16 @@ fn assemble_chunks_slice(
             })?;
             apply_filters(raw, cr.filter_mask)?
         } else {
-            // Sparse chunk — treat as all-zero (HDF5 default fill value).
-            vec![0u8; chunk_volume as usize * elem_size]
+            let n_elems = chunk_volume as usize;
+            match fill_value {
+                Some(fv) if fv.len() == elem_size && elem_size > 0 => fv
+                    .iter()
+                    .cycle()
+                    .take(n_elems * elem_size)
+                    .cloned()
+                    .collect(),
+                _ => vec![0u8; n_elems * elem_size],
+            }
         };
 
         // Overlap shape (number of elements per dimension in the intersection).
@@ -781,8 +939,7 @@ pub(crate) fn read_chunk_bytes<'a>(
 /// When `pipeline` is `None` or has no filters, returns a copy of `raw`.
 /// When filters are present, delegates to [`filters::apply_pipeline`].
 ///
-/// Used by the `parallel` feature code path and unit tests.
-#[cfg(any(feature = "parallel", test))]
+/// Used by both the serial and parallel chunked-read paths.
 pub(crate) fn apply_filters_to_chunk(
     raw: &[u8],
     filter_mask: u32,
@@ -919,7 +1076,7 @@ pub(crate) fn scatter_chunk_slice(
 ///
 /// stride\[d\] = product of dims\[d+1..N\], so that
 /// `flat_index = sum_d(coord[d] * stride[d])`.
-fn row_major_strides(dims: &[u64]) -> Vec<usize> {
+pub(crate) fn row_major_strides(dims: &[u64]) -> Vec<usize> {
     let n = dims.len();
     let mut strides = vec![1usize; n];
     if n == 0 {
@@ -934,7 +1091,7 @@ fn row_major_strides(dims: &[u64]) -> Vec<usize> {
 /// Convert a flat (row-major) index back to per-dimension coordinates.
 ///
 /// Uses the pre-computed `strides` vector (same convention as `row_major_strides`).
-fn flat_to_coords(mut flat: usize, strides: &[usize], ndims: usize) -> Vec<u64> {
+pub(crate) fn flat_to_coords(mut flat: usize, strides: &[usize], ndims: usize) -> Vec<u64> {
     let mut coords = vec![0u64; ndims];
     for d in 0..ndims {
         if let Some(q) = flat.checked_div(strides[d]) {
@@ -1144,8 +1301,11 @@ mod tests {
             &file,
             &chunk_dims,
             &dataset_dims,
-            1, // elem_size
             &ranges,
+            SliceElemConfig {
+                elem_size: 1,
+                fill_value: None,
+            },
             no_filter,
         )
         .expect("assemble_chunks_slice failed");
@@ -1177,8 +1337,11 @@ mod tests {
             &file,
             &[4], // chunk_dims
             &[8], // dataset_dims
-            1,    // elem_size
             &ranges,
+            SliceElemConfig {
+                elem_size: 1,
+                fill_value: None,
+            },
             no_filter,
         )
         .expect("assemble_chunks_slice 1d failed");
@@ -1193,8 +1356,19 @@ mod tests {
         // Explicit binding avoids single_range_in_vec_init lint.
         let r: std::ops::Range<u64> = 3..3;
         let ranges = [r];
-        let result = assemble_chunks_slice(&[], &file, &[4], &[8], 1, &ranges, no_filter)
-            .expect("empty range failed");
+        let result = assemble_chunks_slice(
+            &[],
+            &file,
+            &[4],
+            &[8],
+            &ranges,
+            SliceElemConfig {
+                elem_size: 1,
+                fill_value: None,
+            },
+            no_filter,
+        )
+        .expect("empty range failed");
         assert!(result.is_empty());
     }
 
@@ -1488,5 +1662,69 @@ mod tests {
         assert_eq!(&seq[4..8], &[4u8, 5, 6, 7]);
         assert_eq!(&seq[8..12], &[8u8, 9, 10, 11]);
         assert_eq!(&seq[12..16], &[12u8, 13, 14, 15]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fill value regression tests
+    // -----------------------------------------------------------------------
+
+    /// Sparse chunk is filled with the declared fill value instead of zero.
+    #[test]
+    fn test_assemble_slice_fill_value_sparse_chunk() {
+        // 8-element u8 dataset, chunk size 4.
+        // Only chunk at offset 4 is present ([40, 41, 42, 43]).
+        // Chunk at offset 0 is absent (sparse).
+        // Fill value = 0xFF.
+        let mut file = vec![0u8; 64];
+        let c1 = make_chunk(0, vec![4], &[40_u8, 41, 42, 43], &mut file);
+
+        let fill: [u8; 1] = [0xFF];
+        let r: std::ops::Range<u64> = 0..8;
+        let ranges = [r];
+
+        let result = assemble_chunks_slice(
+            &[c1],
+            &file,
+            &[4u64], // chunk_dims
+            &[8u64], // dataset_dims
+            &ranges,
+            SliceElemConfig {
+                elem_size: 1,
+                fill_value: Some(&fill),
+            },
+            no_filter,
+        )
+        .expect("fill value slice failed");
+
+        // Elements 0..3 should be 0xFF (fill, sparse chunk).
+        assert_eq!(&result[0..4], &[0xFF, 0xFF, 0xFF, 0xFF], "sparse fill");
+        // Elements 4..7 from the present chunk.
+        assert_eq!(&result[4..8], &[40, 41, 42, 43], "present chunk");
+    }
+
+    /// `assemble_chunks_with_fill` initialises output buffer with fill value.
+    #[test]
+    fn test_assemble_with_fill_init() {
+        // 6-element dataset, only first 2 elements covered by a chunk.
+        // Fill = 0xAB. Chunk at offset 0: [10, 20].
+        let mut file = vec![0u8; 64];
+        let c0 = make_chunk(0, vec![0], &[10_u8, 20], &mut file);
+
+        let fill: [u8; 1] = [0xAB];
+        let result = assemble_chunks_with_fill(
+            &[c0],
+            &file,
+            &[2u64], // chunk_dims
+            &[6u64], // dataset_dims
+            1,
+            Some(&fill),
+            no_filter,
+        )
+        .expect("assemble_with_fill failed");
+
+        // First 2 bytes from the chunk.
+        assert_eq!(&result[0..2], &[10, 20]);
+        // Remaining 4 bytes: no chunks present, so fill = 0xAB.
+        assert_eq!(&result[2..], &[0xAB, 0xAB, 0xAB, 0xAB]);
     }
 }

@@ -1,15 +1,23 @@
 use crate::superblock::read_u64_le;
 use oxih5_core::OxiH5Error;
 
-/// Parsed local heap: holds the NUL-terminated name strings for group entries.
-pub struct LocalHeap {
-    /// Raw bytes of the heap data segment.
-    pub data: Vec<u8>,
+/// Parsed local heap: borrows the NUL-terminated name strings directly from
+/// the file bytes — no copy of the data segment is made.
+///
+/// The lifetime `'a` is tied to the `file_data` slice from which this heap was
+/// parsed.  `name_at` returns `&'a str` slices that live as long as the
+/// original file bytes, so callers that only need to compare or display names
+/// pay no allocation at all.
+pub struct LocalHeap<'a> {
+    /// Slice of `file_data` covering the heap data segment only.
+    pub data: &'a [u8],
 }
 
-impl LocalHeap {
+impl<'a> LocalHeap<'a> {
     /// Return the NUL-terminated name string at `offset` bytes into the data segment.
-    pub fn name_at(&self, offset: usize) -> Result<&str, OxiH5Error> {
+    ///
+    /// The returned `&str` borrows from the original `file_data` — no allocation.
+    pub fn name_at(&self, offset: usize) -> Result<&'a str, OxiH5Error> {
         if offset >= self.data.len() {
             return Err(OxiH5Error::Format(format!(
                 "heap name_at: offset {offset} >= data segment length {}",
@@ -32,6 +40,9 @@ impl LocalHeap {
 
 /// Parse a local heap from `file_data` at the given absolute address.
 ///
+/// Returns a [`LocalHeap`] that borrows the data segment directly from
+/// `file_data` — the data segment bytes are **not** copied.
+///
 /// Local heap layout:
 /// ```text
 /// Offset  Size  Field
@@ -42,7 +53,7 @@ impl LocalHeap {
 /// 16       8     Free list head offset (u64 LE, offset into data segment)
 /// 24       8     Data segment address (u64 LE, absolute file offset)
 /// ```
-pub fn parse(file_data: &[u8], heap_address: u64) -> Result<LocalHeap, OxiH5Error> {
+pub fn parse(file_data: &[u8], heap_address: u64) -> Result<LocalHeap<'_>, OxiH5Error> {
     let off = usize::try_from(heap_address).map_err(|_| {
         OxiH5Error::Corrupted(format!(
             "heap address {heap_address} exceeds addressable range"
@@ -102,6 +113,7 @@ pub fn parse(file_data: &[u8], heap_address: u64) -> Result<LocalHeap, OxiH5Erro
         )));
     }
 
-    let data = file_data[data_segment_address..data_segment_end].to_vec();
+    // Borrow the data segment directly — no copy (T7 optimization).
+    let data = &file_data[data_segment_address..data_segment_end];
     Ok(LocalHeap { data })
 }

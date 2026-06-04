@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use crate::btree_v2::parse_name_index;
 use crate::context::ParseContext;
@@ -18,7 +17,8 @@ pub fn list_datasets(
     let local_heap = heap::parse(file_data, heap_address)?;
     let tree = btree::parse(file_data, btree_address)?;
 
-    let mut names = Vec::new();
+    // T6: pre-size with a reasonable hint (8 entries per leaf is typical).
+    let mut names = Vec::with_capacity(tree.leaf_addresses.len() * 8);
     for leaf_addr in &tree.leaf_addresses {
         let entries = snod::parse(file_data, *leaf_addr)?;
         for entry in entries {
@@ -101,9 +101,8 @@ pub fn list_new_style_links(
     let heap_links: Vec<ParsedLink> = if let Some(info) = link_info {
         match (info.fractal_heap_address, info.name_index_address) {
             (Some(fh_addr), Some(ni_addr)) => {
-                // Clone file bytes into an Arc so FractalHeap can own them.
-                let fh =
-                    FractalHeap::parse(Arc::new(file_data.to_vec()), fh_addr, ctx.size_of_offsets)?;
+                // T8: pass a borrow directly — no Arc or to_vec() copy.
+                let fh = FractalHeap::parse(file_data, fh_addr, ctx.size_of_offsets)?;
                 let hil = fh.heap_id_len();
                 let raw_ids = parse_name_index(file_data, ni_addr, hil)?;
 

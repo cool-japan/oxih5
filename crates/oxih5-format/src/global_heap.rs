@@ -1,5 +1,45 @@
 use oxih5_core::OxiH5Error;
 
+/// Software decode of an IEEE 754 half-precision float (binary16) to f32.
+/// Exported for use by `values.rs` to avoid a circular dependency on oxih5-core.
+pub fn f16_to_f32_pub(bits: u16) -> f32 {
+    oxih5_core::f16_to_f32(bits)
+}
+
+/// Build a minimal in-memory GCOL collection for unit tests.
+///
+/// Only compiled in test configurations; exposed as `pub` so sibling modules'
+/// `#[cfg(test)]` blocks can call it without duplicating the builder.
+#[cfg(test)]
+pub fn build_gcol_for_test(objects: &[(u16, &[u8])]) -> Vec<u8> {
+    build_gcol_bytes(objects)
+}
+
+/// Internal GCOL builder used by tests.
+#[cfg(test)]
+fn build_gcol_bytes(objects: &[(u16, &[u8])]) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(b"GCOL");
+    data.push(1); // version
+    data.extend_from_slice(&[0u8; 3]); // reserved
+    let size_pos = data.len();
+    data.extend_from_slice(&[0u8; 8]);
+
+    for (idx, obj_data) in objects {
+        data.extend_from_slice(&idx.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes()); // ref_count
+        data.extend_from_slice(&[0u8; 4]); // reserved
+        data.extend_from_slice(&(obj_data.len() as u64).to_le_bytes());
+        data.extend_from_slice(obj_data);
+        let pad = (8 - (data.len() % 8)) % 8;
+        data.extend(std::iter::repeat(0u8).take(pad));
+    }
+    data.extend_from_slice(&[0u8; 16]); // NIL terminator
+    let total = data.len() as u64;
+    data[size_pos..size_pos + 8].copy_from_slice(&total.to_le_bytes());
+    data
+}
+
 /// Global heap collection — stores variable-length data referenced by VLen datatypes.
 pub struct GlobalHeap {
     /// Map from heap object index to object data.
@@ -142,33 +182,7 @@ mod tests {
     use super::*;
 
     fn build_gcol(objects: &[(u16, &[u8])]) -> Vec<u8> {
-        // Build a minimal GCOL collection in memory for testing
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GCOL");
-        data.push(1); // version
-        data.extend_from_slice(&[0u8; 3]); // reserved
-                                           // placeholder for collection size (will fill in at end)
-        let size_pos = data.len();
-        data.extend_from_slice(&[0u8; 8]);
-
-        for (idx, obj_data) in objects {
-            data.extend_from_slice(&idx.to_le_bytes());
-            data.extend_from_slice(&1u16.to_le_bytes()); // ref_count
-            data.extend_from_slice(&[0u8; 4]); // reserved
-            data.extend_from_slice(&(obj_data.len() as u64).to_le_bytes());
-            data.extend_from_slice(obj_data);
-            // pad to 8-byte alignment
-            let pad = (8 - (data.len() % 8)) % 8;
-            data.extend(std::iter::repeat(0u8).take(pad));
-        }
-
-        // NIL terminator
-        data.extend_from_slice(&[0u8; 16]);
-
-        // Fill in collection size
-        let total = data.len() as u64;
-        data[size_pos..size_pos + 8].copy_from_slice(&total.to_le_bytes());
-        data
+        build_gcol_bytes(objects)
     }
 
     #[test]

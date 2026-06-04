@@ -1728,3 +1728,138 @@ fn test_opaque_dataset_dtype() {
         &[0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]
     );
 }
+
+// ===========================================================================
+// Lazy chunk loading integration tests (deliverable 1).
+//
+// For each chunked fixture, verify that File::dataset_slice returns the same
+// bytes as full_read.slice() for interior, edge, full-range, and empty slices.
+// ===========================================================================
+
+fn check_1d_slice_correctness(fixture_bytes: &[u8], tag: &str, ds_name: &str) {
+    let path = write_tmp(tag, fixture_bytes);
+    let f = oxih5::open(&path).expect("open fixture");
+    cleanup(path);
+
+    let full = f.dataset(ds_name).expect("full dataset");
+    let n = full.shape[0];
+    let es = full.data.len() / n.max(1);
+    assert!(n >= 4, "fixture must have >= 4 elements for slice test");
+
+    // Interior slice [2..5].
+    let path2 = write_tmp(&format!("{tag}_sl"), fixture_bytes);
+    let f2 = oxih5::open(&path2).expect("open for slice");
+    #[allow(clippy::single_range_in_vec_init)]
+    let sl = f2.dataset_slice(ds_name, &[2..5]).expect("interior slice");
+    cleanup(path2);
+    assert_eq!(sl.shape, vec![3], "interior shape");
+    assert_eq!(&sl.data, &full.data[2 * es..5 * es], "interior data");
+
+    // Edge slice [0..1].
+    let path3 = write_tmp(&format!("{tag}_edge"), fixture_bytes);
+    let f3 = oxih5::open(&path3).expect("open for edge slice");
+    #[allow(clippy::single_range_in_vec_init)]
+    let sl_edge = f3.dataset_slice(ds_name, &[0..1]).expect("edge slice");
+    cleanup(path3);
+    assert_eq!(sl_edge.shape, vec![1], "edge shape");
+    assert_eq!(&sl_edge.data, &full.data[..es], "edge data");
+
+    // Full-range slice [0..n].
+    let path4 = write_tmp(&format!("{tag}_full"), fixture_bytes);
+    let f4 = oxih5::open(&path4).expect("open for full slice");
+    let full_range: std::ops::Range<usize> = 0..n;
+    let sl_full = f4
+        .dataset_slice(ds_name, &[full_range])
+        .expect("full-range slice");
+    cleanup(path4);
+    assert_eq!(sl_full.data, full.data, "full-range data");
+
+    // Empty slice [3..3].
+    let path5 = write_tmp(&format!("{tag}_empty"), fixture_bytes);
+    let f5 = oxih5::open(&path5).expect("open for empty slice");
+    #[allow(clippy::single_range_in_vec_init)]
+    let sl_empty = f5.dataset_slice(ds_name, &[3..3]).expect("empty slice");
+    cleanup(path5);
+    assert!(
+        sl_empty.data.is_empty(),
+        "empty slice should return no data"
+    );
+}
+
+#[test]
+fn test_lazy_slice_chunked_gzip_f4_1d() {
+    check_1d_slice_correctness(CHUNKED_GZIP_F4_1D, "lazy_gzip_f4_1d", "data");
+}
+
+#[test]
+fn test_lazy_slice_chunked_fletcher_f8_1d() {
+    check_1d_slice_correctness(CHUNKED_FLETCHER_F8_1D, "lazy_fletcher_f8_1d", "data");
+}
+
+#[test]
+fn test_lazy_slice_chunked_i4_1d() {
+    check_1d_slice_correctness(CHUNKED_I4_1D, "lazy_i4_1d", "data");
+}
+
+#[test]
+fn test_lazy_slice_chunked_gzip_shuffle_i4_2d() {
+    let path = write_tmp("lazy_gzip_i4_2d", CHUNKED_GZIP_SHUFFLE_I4_2D);
+    let f = oxih5::open(&path).expect("open 2d fixture");
+    cleanup(path);
+
+    let full = f.dataset("data").expect("full 2d");
+    assert_eq!(full.shape.len(), 2, "expected 2-D fixture");
+    let rows = full.shape[0];
+    let cols = full.shape[1];
+    let es = 4usize; // i32 = 4 bytes
+    assert!(rows >= 4 && cols >= 4, "fixture too small");
+
+    // Interior sub-block [1..3, 1..4].
+    let r = [1..3, 1..4];
+    let path2 = write_tmp("lazy_gzip_i4_2d_sl", CHUNKED_GZIP_SHUFFLE_I4_2D);
+    let f2 = oxih5::open(&path2).expect("open2");
+    let sl = f2.dataset_slice("data", &r).expect("2d slice");
+    cleanup(path2);
+    let reference = full.slice(&r).expect("reference 2d slice");
+    assert_eq!(sl.shape, reference.shape, "2d slice shape mismatch");
+    assert_eq!(sl.data, reference.data, "2d slice data mismatch");
+
+    // Full-range 2-D.
+    let r_full = [0..rows, 0..cols];
+    let path3 = write_tmp("lazy_gzip_i4_2d_full", CHUNKED_GZIP_SHUFFLE_I4_2D);
+    let f3 = oxih5::open(&path3).expect("open3");
+    let sl_full = f3.dataset_slice("data", &r_full).expect("full 2d slice");
+    cleanup(path3);
+    assert_eq!(sl_full.data, full.data, "full 2d data mismatch");
+
+    // 2-D empty slice.
+    let r_empty = [2..2, 1..4];
+    let path4 = write_tmp("lazy_gzip_i4_2d_empty", CHUNKED_GZIP_SHUFFLE_I4_2D);
+    let f4 = oxih5::open(&path4).expect("open4");
+    let sl_empty = f4.dataset_slice("data", &r_empty).expect("empty 2d slice");
+    cleanup(path4);
+    assert!(
+        sl_empty.data.is_empty(),
+        "empty 2d slice should have no data"
+    );
+    let _ = es;
+}
+
+#[test]
+fn test_lazy_slice_chunked_gzip_f8_2d_partial() {
+    let path = write_tmp("lazy_gzip_f8_2d_partial", CHUNKED_GZIP_F8_2D_PARTIAL);
+    let f = oxih5::open(&path).expect("open partial fixture");
+    cleanup(path);
+
+    let full = f.dataset("data").expect("full partial");
+    let rows = full.shape[0];
+    let cols = full.shape[1];
+    let r = [0..rows, 0..cols];
+    let path2 = write_tmp("lazy_gzip_f8_2d_partial_full", CHUNKED_GZIP_F8_2D_PARTIAL);
+    let f2 = oxih5::open(&path2).expect("open2");
+    let sl_full = f2
+        .dataset_slice("data", &r)
+        .expect("full-range partial slice");
+    cleanup(path2);
+    assert_eq!(sl_full.data, full.data, "full-range partial data mismatch");
+}

@@ -94,10 +94,29 @@ Functional low-level HDF5 parser: superblock v0, object header v1 with continuat
   - **Done:** multi_attr fixture exercises OH v1 with continuation message (0x0010); fixed NIL-as-terminator bug in header.rs (NIL now skipped per HDF5 spec) — 2026-05-25
 
 ## Performance
-- [ ] Profile parse overhead for large files (>1GB) with many groups/datasets
+- [x] Profile parse overhead for large files (>1GB) with many groups/datasets (2026-06-02)
+  - **Done:** T7 (LocalHeap borrows &'a [u8] — no segment copy), T8 (FractalHeap takes &[u8] — no Arc::new(to_vec()) per group), T6 (Vec::with_capacity pre-sizing). traverse_bench.rs added (heap_parse_name_at, snod_parse, group_traverse_btree over 8/32/64/128 entries). All 179 oxih5-format + 96 oxih5 tests pass; zero new warnings; bench compiles.
+  - **Files:** `oxih5-format/src/heap.rs`, `oxih5-format/src/fractal_heap.rs`, `oxih5-format/src/group.rs`, `oxih5/src/lib.rs`, `oxih5-format/tests/fuzz_parsers.rs`, `oxih5-format/Cargo.toml`, `oxih5-format/benches/traverse_bench.rs`
 - [x] Benchmark contiguous vs chunked read paths
 - [x] Consider memory-mapped I/O (`mmap`) as alternative to `read_to_vec` for large files — implemented at the facade layer (`oxih5::open_mmap`, `FileData::Mapped`, `memmap2`; see oxih5/src/lib.rs).
-- [ ] Lazy chunk loading: only decompress chunks needed for requested slice
+- [x] Lazy chunk loading: only decompress chunks needed for requested slice (planned 2026-06-02)
+  - **Goal:** `File::dataset_slice`/`Group::dataset_slice` decompress only chunks overlapping the requested slice. Full strided hyperslab support underneath. Sparse chunks honor declared fill value. Multi-dim Fixed-Array datasets read correctly.
+  - **Design:** New `hyperslab.rs` module with `DimSelection`/`Hyperslab` + `scatter_chunk_hyperslab`. Wire-up: new internal `read_dataset_slice_from_messages` that calls `chunked::read_chunked_slice` for chunked layouts, falls back to full-read+slice for contiguous/compact. Fill value: `message::parse_fill_value` (msg 0x0005), optional fill param to `read_chunked_slice`. FA-grid fix: `compute_grid_dims` uses `ceil(dataset_dims[d]/chunk_dims[d])` with true dataset dims.
+  - **Files:** create `oxih5-format/src/hyperslab.rs`; edit `oxih5-format/src/lib.rs`, `chunked.rs`, `fa_index.rs`, `message.rs`, `oxih5/src/lib.rs`, `oxih5/tests/read_contig.rs`
+  - **Tests:** Hyperslab unit tests (3-D crossing chunk borders, strided, block>1, edge chunks, sparse fill). Integration: `dataset_slice == full.slice` for all chunked fixtures. Failing-first regressions for FA-grid and non-zero fill.
+  - **Risk:** chunked.rs 1492 lines — run rslines 50, splitrs if needed. Fill param changes two signatures but is facade-internal. FA fixture hand-built from fa_index.rs test helpers if h5py unavailable.
+- [x] Fix chunk fill value: honor HDF5 fill value message (0x0005) for sparse chunks (planned 2026-06-02)
+  - **Goal:** Sparse/missing chunks and output buffers use the dataset's declared fill value instead of literal zero.
+  - **Design:** `message::parse_fill_value` for msg type 0x0005. Tile fill bytes for output init and sparse-chunk regions in `read_chunked_slice`/`read_chunked`. `None` → zero-fill preserved.
+  - **Files:** `oxih5-format/src/message.rs`, `oxih5-format/src/chunked.rs`, `oxih5/src/lib.rs`
+  - **Tests:** Failing-first: a sparse chunked dataset with non-zero fill; assert correct fill after fix.
+  - **Risk:** Changes two function signatures (confined to format internals + facade internals, no public API break).
+- [x] Fix Fixed-Array chunk index grid approximation (planned 2026-06-02)
+  - **Goal:** `fa_index::compute_grid_dims` uses the true chunk grid `ceil(dataset_dims[d]/chunk_dims[d])` instead of `n^(1/ndims)` approximation that mis-places chunks in non-cube multi-dim datasets.
+  - **Design:** Thread `dataset_dims` into `compute_grid_dims`; compute `grid[d] = (dataset_dims[d]+chunk_dims[d]-1)/chunk_dims[d]`. Fix call site in `parse_fixed_array_v4`.
+  - **Files:** `oxih5-format/src/fa_index.rs`, call sites in `chunked.rs`
+  - **Tests:** Failing-first: 2-D FA fixture (hand-built bytes if needed) with non-cube grid; assert correct element placement after fix.
+  - **Risk:** Low — the fix is the correct formula; existing tests plus the new regression guard correctness.
 
 ## Integration
 - [x] Ensure all parsed types (Dtype, Dataspace, Layout) map cleanly to oxih5-core types

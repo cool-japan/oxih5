@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use oxih5_core::OxiH5Error;
 
 // ---------------------------------------------------------------------------
@@ -14,10 +12,14 @@ use oxih5_core::OxiH5Error;
 ///
 /// Only "managed" (type-0) heap IDs are supported; huge and tiny objects
 /// return `NotImplemented`.
+///
+/// The lifetime `'a` is tied to the `file_data` slice from which this heap was
+/// parsed.  No copy of the file bytes is made (T8 optimization: eliminates the
+/// previous `Arc::new(file_data.to_vec())` per new-style group traversal).
 #[derive(Debug)]
-pub struct FractalHeap {
-    /// Shared reference to the raw file bytes.
-    file_data: Arc<Vec<u8>>,
+pub struct FractalHeap<'a> {
+    /// Borrow of the raw file bytes — no allocation on construction.
+    file_data: &'a [u8],
     /// Byte offset of the "FRHP" header within `file_data`.
     header_address: u64,
     /// Number of bytes in every heap ID (2..=255).
@@ -49,7 +51,7 @@ pub struct FractalHeap {
     size_of_offsets: u8,
 }
 
-impl FractalHeap {
+impl<'a> FractalHeap<'a> {
     // -----------------------------------------------------------------------
     // Construction
     // -----------------------------------------------------------------------
@@ -59,8 +61,11 @@ impl FractalHeap {
     /// `size_of_offsets` is the file-level `soo` field from the superblock (typically 8).
     /// It is needed to decode the "Block Offset" field inside FHDB and FHIB nodes
     /// which is stored in `soo` bytes regardless of `max_heap_size_bits`.
+    ///
+    /// `file_data` is borrowed for the lifetime of the returned `FractalHeap`.
+    /// No copy of the file bytes is made.
     pub fn parse(
-        file_data: Arc<Vec<u8>>,
+        file_data: &'a [u8],
         header_address: u64,
         size_of_offsets: u8,
     ) -> Result<Self, OxiH5Error> {
@@ -74,7 +79,7 @@ impl FractalHeap {
                 "FractalHeap: header address {header_address} too large"
             ))
         })?;
-        let d = file_data.as_slice();
+        let d = file_data;
 
         // Signature "FRHP"
         let sig = d
@@ -330,7 +335,7 @@ impl FractalHeap {
         object_size: usize,
     ) -> Result<Vec<u8>, OxiH5Error> {
         let base = block_address as usize;
-        let d = self.file_data.as_slice();
+        let d = self.file_data;
 
         // Signature "FHDB"
         let sig = d.get(base..base + 4).ok_or_else(|| {
@@ -387,7 +392,7 @@ impl FractalHeap {
     ) -> Result<Vec<u8>, OxiH5Error> {
         let soo: usize = self.size_of_offsets as usize;
         let base = block_address as usize;
-        let d = self.file_data.as_slice();
+        let d = self.file_data;
 
         // Validate signature.
         let sig = d
@@ -588,8 +593,8 @@ mod tests {
 
     #[test]
     fn test_bad_signature() {
-        let data = Arc::new(vec![0u8; 256]);
-        assert!(FractalHeap::parse(data, 0, 8).is_err());
+        let data = vec![0u8; 256];
+        assert!(FractalHeap::parse(&data, 0, 8).is_err());
     }
 
     #[test]
@@ -597,7 +602,7 @@ mod tests {
         let mut data = vec![0u8; 256];
         data[0..4].copy_from_slice(b"FRHP");
         data[4] = 1; // non-zero version
-        let result = FractalHeap::parse(Arc::new(data), 0, 8);
+        let result = FractalHeap::parse(&data, 0, 8);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("version"));
     }
@@ -608,14 +613,14 @@ mod tests {
         data[0..4].copy_from_slice(b"FRHP");
         data[4] = 0;
         data[6] = 1; // io_filter_len != 0
-        let result = FractalHeap::parse(Arc::new(data), 0, 8);
+        let result = FractalHeap::parse(&data, 0, 8);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_header_fields() {
         let raw = make_minimal_frhp(7, 256, 4, 512, 65536, 32, 0, u64::MAX, 0);
-        let heap = FractalHeap::parse(Arc::new(raw), 0, 8).expect("should parse");
+        let heap = FractalHeap::parse(&raw, 0, 8).expect("should parse");
         assert_eq!(heap.heap_id_len(), 7);
         assert_eq!(heap.table_width(), 4);
         assert_eq!(heap.starting_block_size, 512);
@@ -628,7 +633,7 @@ mod tests {
     fn test_empty_heap_returns_not_found() {
         // Root address == UNDEF → heap is empty.
         let raw = make_minimal_frhp(7, 256, 4, 512, 65536, 32, 0, u64::MAX, 0);
-        let heap = FractalHeap::parse(Arc::new(raw), 0, 8).unwrap();
+        let heap = FractalHeap::parse(&raw, 0, 8).unwrap();
         assert!(heap.read_object(0, 4).is_err());
     }
 
@@ -638,7 +643,7 @@ mod tests {
         // max_managed_obj_size = 255 → bits_needed = 8 → length_size = 1 byte
         // heap_id_len = 4 (1 type byte + 2 offset + 1 length)
         let raw = make_minimal_frhp(4, 255, 4, 512, 65536, 16, 0, u64::MAX, 0);
-        let heap = FractalHeap::parse(Arc::new(raw), 0, 8).unwrap();
+        let heap = FractalHeap::parse(&raw, 0, 8).unwrap();
 
         // Heap ID: type=0, offset=0x0102 (LE), length=42
         let id = [0x00u8, 0x02, 0x01, 0x2a];
@@ -650,7 +655,7 @@ mod tests {
     #[test]
     fn test_parse_heap_id_non_managed_rejected() {
         let raw = make_minimal_frhp(7, 256, 4, 512, 65536, 32, 0, u64::MAX, 0);
-        let heap = FractalHeap::parse(Arc::new(raw), 0, 8).unwrap();
+        let heap = FractalHeap::parse(&raw, 0, 8).unwrap();
         // Type bits = 1 → huge
         let id = [0x01u8, 0, 0, 0, 0, 0, 0];
         assert!(heap.parse_heap_id(&id).is_err());
@@ -687,7 +692,7 @@ mod tests {
         let obj_pos = fhdb_base + heap_offset_of_obj as usize;
         file[obj_pos..obj_pos + 8].copy_from_slice(b"DEADBEEF");
 
-        let heap = FractalHeap::parse(Arc::new(file), 0, 8).unwrap();
+        let heap = FractalHeap::parse(&file, 0, 8).unwrap();
         // heap_offset_of_obj = 21 → object at fhdb_base + 21
         let obj = heap.read_object(heap_offset_of_obj, 8).unwrap();
         assert_eq!(&obj, b"DEADBEEF");
@@ -697,7 +702,7 @@ mod tests {
     fn test_num_direct_rows() {
         // starting=512, max_direct=65536 → rows: 512,512,1024,2048,4096,8192,16384,32768,65536 = 9 rows
         let raw = make_minimal_frhp(7, 256, 4, 512, 65536, 32, 0, u64::MAX, 0);
-        let heap = FractalHeap::parse(Arc::new(raw), 0, 8).unwrap();
+        let heap = FractalHeap::parse(&raw, 0, 8).unwrap();
         let ndr = heap.num_direct_rows();
         // Row 0:512, row 1:512, row 2:1024, row 3:2048, row 4:4096,
         // row 5:8192, row 6:16384, row 7:32768, row 8:65536 (=max) → 9 rows
@@ -707,7 +712,7 @@ mod tests {
     #[test]
     fn test_block_size_for_row() {
         let raw = make_minimal_frhp(7, 256, 4, 512, 65536, 32, 0, u64::MAX, 0);
-        let heap = FractalHeap::parse(Arc::new(raw), 0, 8).unwrap();
+        let heap = FractalHeap::parse(&raw, 0, 8).unwrap();
         assert_eq!(heap.block_size_for_row(0), 512);
         assert_eq!(heap.block_size_for_row(1), 512);
         assert_eq!(heap.block_size_for_row(2), 1024);
@@ -721,7 +726,7 @@ mod tests {
         // Row 1 covers: 2*512=1024 → cumulative 2048
         // Row 2 covers: 2*1024=2048 → cumulative 4096
         let raw = make_minimal_frhp(7, 256, 2, 512, 65536, 16, 0, u64::MAX, 0);
-        let heap = FractalHeap::parse(Arc::new(raw), 0, 8).unwrap();
+        let heap = FractalHeap::parse(&raw, 0, 8).unwrap();
         // block_size 1024 → needs 1 row (cumulative after row 0 = 1024 >= 1024)
         assert_eq!(heap.compute_indirect_nrows(1024), 1);
         // block_size 2048 → needs 2 rows (cumulative after row 1 = 2048 >= 2048)
@@ -807,7 +812,7 @@ mod tests {
         assert!(obj_pos + 4 <= buf.len(), "buffer too small");
         buf[obj_pos..obj_pos + 4].copy_from_slice(&obj);
 
-        let heap = FractalHeap::parse(Arc::new(buf), 0, 8).expect("parse FRHP");
+        let heap = FractalHeap::parse(&buf, 0, 8).expect("parse FRHP");
 
         // Call read_from_indirect_block directly with 2 rows.
         let result = heap
