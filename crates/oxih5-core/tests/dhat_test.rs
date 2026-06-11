@@ -28,6 +28,7 @@ fn lazy_iter_allocates_less_than_eager() {
             order: ByteOrder::Little,
         },
         attributes: vec![],
+        max_dims: None,
     };
 
     // ---------------------------------------------------------------

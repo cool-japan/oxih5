@@ -374,6 +374,12 @@ pub struct Dataset {
     pub shape: Vec<usize>,
     pub dtype: Dtype,
     pub attributes: Vec<Attribute>,
+    /// Maximum dimensions from the HDF5 simple dataspace, if present.
+    ///
+    /// A value of `u64::MAX` (`H5S_UNLIMITED`) on an axis indicates that
+    /// axis is extendable without bound.  `None` means the dataspace message
+    /// did not carry max-dims information (older or compact files).
+    pub max_dims: Option<Vec<u64>>,
 }
 
 impl Dataset {
@@ -385,6 +391,38 @@ impl Dataset {
     /// Find a single attribute by name.
     pub fn attr(&self, name: &str) -> Option<&Attribute> {
         self.attributes.iter().find(|a| a.name == name)
+    }
+
+    /// Return the maximum dimensions as a slice, if present.
+    ///
+    /// Returns `None` when the HDF5 dataspace message did not carry max-dims
+    /// (e.g. compact/old-style files without the max-dims flag).
+    pub fn max_dims(&self) -> Option<&[u64]> {
+        self.max_dims.as_deref()
+    }
+
+    /// Return `true` if any axis has `H5S_UNLIMITED` maximum dimensions.
+    ///
+    /// An unlimited axis has `max_dims[i] == u64::MAX`.
+    /// Returns `false` when `max_dims` is absent.
+    pub fn is_unlimited(&self) -> bool {
+        self.max_dims
+            .as_ref()
+            .is_some_and(|md| md.contains(&u64::MAX))
+    }
+
+    /// Return the indices of axes that are unlimited (`H5S_UNLIMITED`).
+    ///
+    /// Returns an empty `Vec` when no axis is unlimited or when `max_dims`
+    /// is absent.
+    pub fn unlimited_axes(&self) -> Vec<usize> {
+        self.max_dims.as_ref().map_or_else(Vec::new, |md| {
+            md.iter()
+                .enumerate()
+                .filter(|(_, &d)| d == u64::MAX)
+                .map(|(i, _)| i)
+                .collect()
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -436,6 +474,7 @@ impl Dataset {
                 shape: out_shape,
                 dtype: self.dtype.clone(),
                 attributes: self.attributes.clone(),
+                max_dims: self.max_dims.clone(),
             });
         }
 
@@ -482,6 +521,7 @@ impl Dataset {
             shape: out_shape,
             dtype: self.dtype.clone(),
             attributes: self.attributes.clone(),
+            max_dims: self.max_dims.clone(),
         })
     }
 
@@ -508,6 +548,7 @@ impl Dataset {
             shape: new_shape.to_vec(),
             dtype: self.dtype.clone(),
             attributes: self.attributes.clone(),
+            max_dims: self.max_dims.clone(),
         })
     }
 }
@@ -672,6 +713,7 @@ mod tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         }
     }
 
@@ -686,6 +728,7 @@ mod tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         }
     }
 
@@ -707,6 +750,7 @@ mod tests {
                 order: ByteOrder::Big,
             },
             attributes: vec![],
+            max_dims: None,
         };
         let v = ds.as_f32().unwrap();
         assert_eq!(v, vec![1.0_f32, 2.0]);
@@ -732,6 +776,7 @@ mod tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         assert_eq!(ds.len(), 1);
         assert!(!ds.is_empty());
@@ -748,6 +793,7 @@ mod tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         assert_eq!(ds.len(), 6);
     }
@@ -802,6 +848,7 @@ mod tests {
                 order: ByteOrder::Big,
             },
             attributes: vec![],
+            max_dims: None,
         };
         let v = ds.as_f16().unwrap();
         assert!((v[0] - 1.0_f32).abs() < 1e-6);
@@ -823,6 +870,7 @@ mod tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         assert_eq!(ds.as_u16().unwrap(), vec![100_u16, 200_u16]);
 
@@ -835,6 +883,7 @@ mod tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         assert_eq!(ds.as_i8().unwrap(), vec![127_i8, -128_i8]);
     }
@@ -851,6 +900,7 @@ mod tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         let ranges = [std::ops::Range { start: 2, end: 5 }];
         let sliced = ds.slice(&ranges).unwrap();
@@ -870,6 +920,7 @@ mod tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         let ranges = [
             std::ops::Range { start: 1, end: 3 },
@@ -891,6 +942,7 @@ mod tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         let ranges = [std::ops::Range { start: 0, end: 10 }];
         assert!(ds.slice(&ranges).is_err());
@@ -907,6 +959,7 @@ mod tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         let ranges = [std::ops::Range { start: 2, end: 2 }];
         let empty = ds.slice(&ranges).unwrap();
@@ -925,6 +978,7 @@ mod tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         let reshaped = ds.reshape(&[2, 6]).unwrap();
         assert_eq!(reshaped.shape, vec![2, 6]);
@@ -978,6 +1032,80 @@ mod tests {
         };
         assert_eq!(attr_s.as_str_fixed(), Some("hello".into()));
     }
+
+    // -----------------------------------------------------------------------
+    // A1 — Dataset::max_dims / is_unlimited / unlimited_axes unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_unlimited_true_when_any_axis_is_max() {
+        let ds = Dataset {
+            data: vec![0u8; 8],
+            shape: vec![2],
+            dtype: Dtype::Int {
+                size: 4,
+                signed: false,
+                order: ByteOrder::Little,
+            },
+            attributes: vec![],
+            max_dims: Some(vec![u64::MAX, 10]),
+        };
+        assert!(ds.is_unlimited(), "expected is_unlimited() == true");
+        assert_eq!(ds.unlimited_axes(), vec![0usize]);
+        assert_eq!(ds.max_dims(), Some([u64::MAX, 10].as_slice()));
+    }
+
+    #[test]
+    fn test_is_unlimited_false_when_no_unlimited_axis() {
+        let ds = Dataset {
+            data: vec![0u8; 8],
+            shape: vec![2, 5],
+            dtype: Dtype::Int {
+                size: 4,
+                signed: false,
+                order: ByteOrder::Little,
+            },
+            attributes: vec![],
+            max_dims: Some(vec![100, 200]),
+        };
+        assert!(!ds.is_unlimited(), "fixed max_dims should not be unlimited");
+        assert!(ds.unlimited_axes().is_empty());
+    }
+
+    #[test]
+    fn test_is_unlimited_false_when_no_max_dims() {
+        let ds = Dataset {
+            data: vec![0u8; 4],
+            shape: vec![1],
+            dtype: Dtype::Int {
+                size: 4,
+                signed: false,
+                order: ByteOrder::Little,
+            },
+            attributes: vec![],
+            max_dims: None,
+        };
+        assert!(!ds.is_unlimited());
+        assert!(ds.unlimited_axes().is_empty());
+        assert!(ds.max_dims().is_none());
+    }
+
+    #[test]
+    fn test_unlimited_axes_multiple() {
+        // Both axes unlimited
+        let ds = Dataset {
+            data: vec![0u8; 4],
+            shape: vec![1, 1],
+            dtype: Dtype::Int {
+                size: 4,
+                signed: false,
+                order: ByteOrder::Little,
+            },
+            attributes: vec![],
+            max_dims: Some(vec![u64::MAX, u64::MAX]),
+        };
+        assert_eq!(ds.unlimited_axes(), vec![0usize, 1usize]);
+    }
 }
 
 #[cfg(feature = "ndarray")]
@@ -995,6 +1123,7 @@ mod ndarray_tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         let arr = ds.to_array_f32().unwrap();
         assert_eq!(arr.shape(), &[2]);
@@ -1014,6 +1143,7 @@ mod ndarray_tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         let arr = ds.to_array_i32().unwrap();
         assert_eq!(arr.shape(), &[2, 3]);
@@ -1033,6 +1163,7 @@ mod ndarray_tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         let arr = ds.to_array_u8().expect("to_array_u8");
         assert_eq!(arr.shape(), &[2, 3]);
@@ -1052,6 +1183,7 @@ mod ndarray_tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         let arr = ds.to_array_u16().expect("to_array_u16");
         assert_eq!(arr.shape(), &[2, 3]);
@@ -1071,6 +1203,7 @@ mod ndarray_tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         let arr = ds.to_array_u32().expect("to_array_u32");
         assert_eq!(arr.shape(), &[2, 3]);
@@ -1090,6 +1223,7 @@ mod ndarray_tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         let arr = ds.to_array_u64().expect("to_array_u64");
         assert_eq!(arr.shape(), &[2, 3]);
@@ -1109,6 +1243,7 @@ mod ndarray_tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         let arr = ds.to_array_i8().expect("to_array_i8");
         assert_eq!(arr.shape(), &[2, 3]);
@@ -1128,6 +1263,7 @@ mod ndarray_tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         let arr = ds.to_array_i16().expect("to_array_i16");
         assert_eq!(arr.shape(), &[2, 3]);
@@ -1147,6 +1283,7 @@ mod ndarray_tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         let arr = ds.to_array_i64().expect("to_array_i64");
         assert_eq!(arr.shape(), &[2, 3]);
@@ -1165,6 +1302,7 @@ mod ndarray_tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         let arr = ds.to_array_f16().expect("to_array_f16");
         assert_eq!(arr.shape(), &[2]);
@@ -1182,6 +1320,7 @@ mod ndarray_tests {
                 order: ByteOrder::Little,
             },
             attributes: vec![],
+            max_dims: None,
         };
         assert!(ds.to_array_u8().is_err());
     }

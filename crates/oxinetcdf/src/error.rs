@@ -41,4 +41,14 @@ pub enum NcError {
     VariableNotFound(String),
     #[error("not supported in this release: {0}")]
     Unsupported(String),
+    /// Returned when group traversal detects a cycle (the same group path has
+    /// already been visited in the current traversal chain).
+    #[error("cycle detected in HDF5 group hierarchy")]
+    CycleDetected,
+    /// Returned when group recursion exceeds `MAX_GROUP_DEPTH`.
+    #[error("group hierarchy exceeds maximum depth")]
+    MaxDepthExceeded,
+    /// Generic read error (e.g. dtype mismatch when reading variable data).
+    #[error("read error: {0}")]
+    ReadError(String),
 }

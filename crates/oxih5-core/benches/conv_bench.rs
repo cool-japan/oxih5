@@ -13,6 +13,7 @@ fn make_f32_dataset(n: usize) -> Dataset {
             order: ByteOrder::Little,
         },
         attributes: vec![],
+        max_dims: None,
     }
 }
 

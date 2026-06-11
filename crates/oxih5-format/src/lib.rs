@@ -12,6 +12,7 @@ pub mod fa_index;
 pub mod filters;
 pub mod fractal_heap;
 pub mod global_heap;
+pub mod global_heap_writer;
 pub mod group;
 pub mod header;
 pub mod heap;
@@ -24,4 +25,5 @@ pub mod values;
 
 pub use chunked::ChunkIndexCache;
 pub use chunked_hyperslab::{gather_hyperslab_contiguous, read_chunked_hyperslab};
+pub use global_heap_writer::{GlobalHeapRef, GlobalHeapWriter};
 pub use hyperslab::{DimSelection, Hyperslab};

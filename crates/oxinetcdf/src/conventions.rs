@@ -8,7 +8,6 @@ pub(crate) const RESERVED_ATTRS: &[&str] = &[
     "REFERENCE_LIST",
     "_Netcdf4Dimid",
     "_Netcdf4Coordinates",
-    "_nc3_strict",
     "DIMENSION_LABELS",
 ];
 

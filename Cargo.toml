@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.80"
 authors = ["COOLJAPAN OU (Team Kitasan)"]
@@ -17,18 +17,18 @@ repository = "https://github.com/cool-japan/oxih5"
 description = "OxiH5 is the COOLJAPAN Pure-Rust HDF5 reader (no libhdf5 FFI)."
 
 [workspace.dependencies]
-oxih5-core     = { path = "crates/oxih5-core",   version = "0.1.1" }
-oxih5-format   = { path = "crates/oxih5-format", version = "0.1.1" }
-oxih5          = { path = "crates/oxih5",         version = "0.1.1" }
-oxinetcdf      = { path = "crates/oxinetcdf",     version = "0.1.1" }
+oxih5-core     = { path = "crates/oxih5-core",   version = "0.1.2" }
+oxih5-format   = { path = "crates/oxih5-format", version = "0.1.2" }
+oxih5          = { path = "crates/oxih5",         version = "0.1.2" }
+oxinetcdf      = { path = "crates/oxinetcdf",     version = "0.1.2" }
 thiserror      = { version = "2" }
 # COOLJAPAN Pure-Rust DEFLATE/zlib — used for the HDF5 gzip/deflate filter (id 1).
 # Never flate2 / miniz_oxide / zlib-ng (Pure Rust + COOLJAPAN policy).
-oxiarc-deflate = { version = "0.3.2" }
+oxiarc-deflate = { version = "0.3.3" }
 # COOLJAPAN Pure-Rust SZIP/AEC — used for the HDF5 szip filter (id 4), behind the `szip` feature.
 # Not yet published on crates.io, so we reference the sibling checkout via a relative path
 # (absolute paths are forbidden by policy; relative ../<sibling>/ is the sanctioned escape hatch).
-oxiarc-szip    = "0.3.2"
+oxiarc-szip    = "0.3.3"
 memmap2        = { version = "0.9" }
 criterion      = { version = "0.8", features = ["html_reports"] }
 rayon          = { version = "1" }

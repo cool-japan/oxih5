@@ -13,6 +13,8 @@ keywords = ["netcdf", "netcdf4", "pure-rust", "cooljapan"]
 [features]
 default = []
 ndarray = ["oxih5/ndarray", "oxih5-core/ndarray"]
+# Gate tests that require real .nc fixture files or external CLI tools (ncgen/ncdump).
+e2e = []
 
 [dependencies]
 oxih5       = { workspace = true }

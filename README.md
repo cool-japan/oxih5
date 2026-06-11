@@ -9,9 +9,9 @@ provides a minimal write path for flat contiguous datasets.
 
 ---
 
-## Release: 0.1.1 (2026-06-04)
+## Release: 0.1.2 (2026-06-10)
 
-345 unit + integration tests; all pass.  Full workspace
+459 unit + integration tests; all pass.  Full workspace
 (~11.7 k SLOC of Rust across four crates).
 
 ---
@@ -23,6 +23,7 @@ provides a minimal write path for flat contiguous datasets.
 | `oxih5-core` | Public types: `Dataset`, `Dtype`, `ByteOrder`, `OxiH5Error`, `Attribute`, `FilterPipeline`, `Link`, `Group` |
 | `oxih5-format` | Low-level binary parsers: superblock, headers, messages, heap, B-tree v1/v2, SNOD, fractal heap, EA/FA index, filters, global heap, chunked assembly |
 | `oxih5` | User-facing facade: `open()`, `open_mmap()`, `read_dataset()`, `File`, `Group`, `FileWriter` |
+| `oxinetcdf` | Pure-Rust NetCDF-4 conventions reader/writer atop OxiH5: `NcFile`, `NcGroup`, `NcVariable`, `NcDimension`, `NcFileWriter` |
 
 ---
 
@@ -58,7 +59,7 @@ message.rs          — decode all standard message types
 
 ---
 
-## What Works (v0.1.1)
+## What Works (v0.1.2)
 
 ### Superblock
 
@@ -123,9 +124,18 @@ Enable the `parallel` feature for concurrent chunk decompression via Rayon.
 
 ### Write support
 
-`FileWriter` — creates valid flat HDF5 files (single group, contiguous
-datasets) readable by h5py and libhdf5.  Supported dtypes for writing:
-float32, float64, int32, uint8.
+`FileWriter` — creates valid HDF5 files readable by h5py and libhdf5.
+Supported dtypes: float32, float64, int32, uint8.  v0.1.2 additions:
+- Multi-group HDF5 files (`create_group`, `write_group_dataset_f64/i32`)
+- Unlimited / chunked datasets (`create_dataset_unlimited`)
+- Root group string attributes (`write_root_str_attr`)
+- Variable-length string datasets backed by GlobalHeap (`create_vlen_string_dataset`)
+
+`NcFileWriter` (in `oxinetcdf`) — creates NetCDF-4-compliant HDF5 files with
+full DIMENSION_SCALE / DIMENSION_LIST / `_Netcdf4Dimid` convention encoding.
+Supports `def_dim`, `def_dim_unlimited`, `def_var`, `put_var_f64/i32`,
+`put_vara_f64/i32` (unlimited append), `def_var_strings/put_var_strings`,
+`put_att_str`, and `set_classic_mode`.
 
 ### Memory-mapped I/O
 
@@ -190,6 +200,8 @@ FileWriter::new("output.h5")?
 | M3 | DONE | Superblock v2/v3, object header v2, strings, compound types, attributes, new-style groups |
 | M4 | DONE | mmap, lazy chunk reads, fuzz corpus, parallel decompression |
 | M5 | DONE | Write support (FileWriter), full datatype coverage, nbit/scaleoffset filters |
+| M6 | DONE | NetCDF-4 read conventions (oxinetcdf), hyperslab, AttrView, vlen/compound decode |
+| M7 | DONE (0.1.2) | NcFileWriter, unlimited dims, sub-groups, GlobalHeap writer, CF conventions, fill masks, deep group hierarchy |
 
 ---
 

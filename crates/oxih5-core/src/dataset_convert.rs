@@ -39,20 +39,15 @@ pub fn f16_to_f32(bits: u16) -> f32 {
 
 impl Dataset {
     /// Returns the byte size of a single element for fixed-width dtypes.
+    ///
+    /// Delegates to [`Dtype::size`] which handles all fixed-width types
+    /// (Int, Float, Bitfield, Opaque, fixed-length String, Reference, Enum,
+    /// Array, and Compound).  Variable-length types (VarLen, vlen String)
+    /// return `NotImplemented`.
     pub(crate) fn dtype_size(&self) -> Result<usize, OxiH5Error> {
-        match &self.dtype {
-            Dtype::Int { size, .. }
-            | Dtype::Float { size, .. }
-            | Dtype::Bitfield { size, .. }
-            | Dtype::Opaque { size, .. } => Ok(*size),
-            Dtype::String {
-                fixed_len: Some(n), ..
-            } => Ok(*n),
-            _ => Err(OxiH5Error::NotImplemented(format!(
-                "dtype_size for {:?}",
-                self.dtype
-            ))),
-        }
+        self.dtype
+            .size()
+            .ok_or_else(|| OxiH5Error::NotImplemented(format!("dtype_size for {:?}", self.dtype)))
     }
 
     pub fn as_f32(&self) -> Result<Vec<f32>, OxiH5Error> {

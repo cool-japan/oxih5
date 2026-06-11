@@ -1597,6 +1597,7 @@ fn test_enum_dataset_raw_values() {
                 shape: ds.shape.clone(),
                 dtype: *base.clone(),
                 attributes: ds.attributes.clone(),
+                max_dims: ds.max_dims.clone(),
             };
             let vals = raw_ds.as_i32().expect("as_i32 on enum base");
             assert_eq!(vals, vec![0, 1, 2, 0, 1]);

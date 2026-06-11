@@ -7,6 +7,37 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.2] - 2026-06-10
+
+### Added
+
+- **`oxinetcdf` — deep group hierarchy**: `NcGroup.children: Vec<NcGroup>`; `resolve_group_deep` with `MAX_GROUP_DEPTH=64` and cycle detection via visited-path set; 4 new unit tests.
+- **`oxinetcdf` — cross-group shared dimensions**: two-phase scan — `collect_global_dims` (Phase 1) walks all groups and builds an addr→`GlobalDim` registry; `resolve_dim_list` (Phase 2) resolves refs via local cache → global registry → lazy `attrs_of` → phony; `NcAxis` gains `group_path` and `is_unlimited` fields.
+- **`Dataset::max_dims` / `is_unlimited` / `unlimited_axes`**: `DataspaceInfo::max_dims` reads the HDF5 max-dims block; 8 new tests; all 350 tests pass.
+- **`File::attrs_of(addr)`**: metadata-only attribute accessor (avoids loading variable data); 2 new unit tests.
+- **`NcType` enum** in `oxinetcdf::types`: `From<&Dtype>` covers all 11 Dtype variants; `NcVariable::nc_type()` convenience method; 12 unit tests.
+- **NC_STRING variable support**: `NcVariable::read_strings(nc)` delegates to `File::dataset_strings`; `NcAttribute::new_with_view` eagerly decodes vlen strings; `NcFile::h5()` public accessor.
+- **`_FillValue`-aware masked reads**: `apply_fill_mask<T>`, `apply_fill_mask_f32/f64` (bit-exact NaN safe); `NcVariable::read_f64_masked` (NaN for fill), `read_i64_masked` (Option for fill); 5 unit tests.
+- **CF conventions**: `NcGroup::coordinates_of/bounds_of/grid_mapping_of`; `cf.rs` module with `parse_cf_name_list/cf_group_prefix/cf_var_name`; supports CF-1.7 `group:var` form; 9 unit tests in `cf.rs` + 7 in `model.rs`.
+- **`NcFileWriter`** (NetCDF-4 writing): `def_dim/def_var/put_var_f64/put_var_i32/put_att_str/close`; 7 round-trip tests. Backed by `FileWriter` attribute-writing infrastructure: `write_string_attr`, `write_f64_attr`, `write_i64_attr`, `write_i32_attr`, `write_obj_ref_list_attr`.
+- **Sub-group creation**: `FileWriter::create_group` + `write_group_dataset_f64/i32` + `write_group_string_attr`; SNOD cache_type=1 scratch-pad; round-trip tests `w0b_create_group_and_dataset_roundtrip` + `w0b_group_groups_listing`.
+- **Unlimited/chunked dataset layout**: `FileWriter::create_dataset_unlimited`; B-tree v1 type-1 single-chunk node; chunked layout v3 with `max_dim[0]=u64::MAX`; 1-D and 2-D round-trip tests.
+- **Root group string attributes**: `FileWriter::write_root_str_attr`; dynamic OH size via `compute_root_oh_size`; 2 round-trip tests.
+- **Unlimited-dimension append in `NcFileWriter`**: `def_dim_unlimited` + `put_vara_f64/i32`; rewrite-on-append strategy; 2 round-trip tests.
+- **NETCDF4_CLASSIC strict-mode**: `NcFileWriter::set_classic_mode`; writes `_nc3_strict = ""` on root group; 2 tests.
+- **`GlobalHeapWriter`** (`oxih5-format`): GCOL serialiser; `FileWriter::create_vlen_string_dataset`; `NcFileWriter::def_var_strings` + `put_var_strings`; 12 new tests.
+- **`FileWriter` write module refactored** into sub-modules: `write/mod.rs`, `write/chunked.rs`, `write/format.rs`, `write/messages.rs`.
+- **`oxih5-format` — region reference handling**: `decode_region_refs` added to `values.rs`.
+
+### Changed
+
+- `oxih5-core/src/dataset_convert.rs`: region reference decode path reworked for correctness.
+- `oxinetcdf` resolver refactored into `resolver.rs` (extracted from `file.rs`); `file.rs` substantially slimmed.
+- SNOD capacity increased from 8 to 64 entries to support groups with more datasets.
+- `oxiarc-szip` bumped to `0.3.3` (registry dependency, no path override).
+
+---
+
 ## [0.1.1] - 2026-06-04
 
 ### Added
@@ -190,5 +221,6 @@ message.rs          — decode all standard message types
 
 ---
 
+[0.1.2]: https://github.com/cool-japan/oxih5/releases/tag/v0.1.2
 [0.1.1]: https://github.com/cool-japan/oxih5/releases/tag/v0.1.1
 [0.1.0]: https://github.com/cool-japan/oxih5/releases/tag/v0.1.0

@@ -17,9 +17,14 @@ use oxih5_core::{Attribute, Dataspace, Dtype, FilterInfo, FilterPipeline, OxiH5E
 // Dataspace (message type 0x0001)
 // ---------------------------------------------------------------------------
 
-/// Parsed dataspace: shape dimensions (one entry per dimension).
+/// Parsed dataspace: shape dimensions and optional maximum dimensions.
 pub struct DataspaceInfo {
     pub dims: Vec<u64>,
+    /// Maximum dimensions, present when the dataspace flags bit 0 is set.
+    ///
+    /// A value of `u64::MAX` (`0xFFFF_FFFF_FFFF_FFFF`) signals that the
+    /// corresponding axis is unlimited (`H5S_UNLIMITED`).
+    pub max_dims: Option<Vec<u64>>,
 }
 
 /// Parse a dataspace message v1 or v2 body.
@@ -81,12 +86,30 @@ pub fn parse_dataspace(body: &[u8]) -> Result<DataspaceInfo, OxiH5Error> {
         )));
     }
 
+    let flags = body[2];
+
     let mut dims = Vec::with_capacity(dimensionality);
     for i in 0..dimensionality {
         dims.push(read_u64_le(body, dims_offset + i * 8)?);
     }
 
-    Ok(DataspaceInfo { dims })
+    let max_dims = if flags & 0x01 != 0 {
+        let max_offset = dims_offset + dimensionality * 8;
+        let max_required = max_offset + dimensionality * 8;
+        if body.len() < max_required {
+            None
+        } else {
+            let mut md = Vec::with_capacity(dimensionality);
+            for i in 0..dimensionality {
+                md.push(read_u64_le(body, max_offset + i * 8)?);
+            }
+            Some(md)
+        }
+    } else {
+        None
+    };
+
+    Ok(DataspaceInfo { dims, max_dims })
 }
 
 /// Parse a dataspace message body into the richer `Dataspace` core type.

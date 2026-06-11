@@ -1,8 +1,8 @@
 # OxiH5 Project TODO
 
-## Status — 0.1.1 (2026-06-04)
+## Status — 0.1.2 (Released 2026-06-10)
 
-Functional read/write HDF5 library (~11.7 k SLOC Rust, 345 tests, all pass).
+Functional read/write HDF5 library (~11.7 k SLOC Rust, 459 tests, all pass).
 Supports superblock v0/v2/v3, object header v1/v2 (+continuation), B-tree
 v1/v2, local heap, SNOD, fractal heap (FRHP+FHDB+FHIB), extensible/fixed array
 chunk indices, all 11 datatype classes, dataspace v1/v2, attributes (0x000C
@@ -145,23 +145,69 @@ groups, 2-D partial-edge chunks.  Write support via `FileWriter`.
   - **Risk:** resolver E2E unverified in envs without netCDF4 (accepted, documented).
 
   #### oxinetcdf — deferred follow-ups (post-Slice-1)
-  - [ ] Deep group hierarchy: recursively resolve subgroups into `NcGroup` trees
-  - [ ] Cross-group shared dimensions: DIMENSION_LIST refs across group boundaries
-  - [ ] Dataset `max_dims` exposure on `oxih5::Dataset` for exact `is_unlimited` detection
-  - [ ] Attrs-only metadata accessor on oxih5 (`File::attrs_of`) to avoid loading variable data during resolution
-  - [ ] User-defined types: enum, vlen, opaque, compound variables
-  - [ ] NC_STRING variable data decode (vlen UTF-8) via oxih5 vlen dataset path (depends on A1 dataset path)
-  - [ ] `_FillValue`-aware masked reads (apply fill value → `Option`/NaN)
-  - [ ] CF conventions: `coordinates`, `bounds`, `grid_mapping` semantic linking
-  - [ ] NetCDF-4 writing: `NcFileWriter` emitting DIMENSION_SCALE/CLASS/NAME/_Netcdf4Dimid/DIMENSION_LIST/REFERENCE_LIST
-  - [ ] Unlimited-dimension append (oxih5 `FileWriter` extension needed)
-  - [ ] NETCDF4_CLASSIC strict-mode validation (`_nc3_strict`)
+  - [x] Deep group hierarchy: recursively resolve subgroups into `NcGroup` trees
+        (done 2026-06-10: `resolver.rs` `resolve_group_deep` with MAX_GROUP_DEPTH=64, cycle
+        detection via visited-path set, `NcGroup.children: Vec<NcGroup>`; 4 new unit tests)
+  - [x] Cross-group shared dimensions: DIMENSION_LIST refs across group boundaries
+        (done 2026-06-10: two-phase scan — `collect_global_dims` (Phase 1) walks all groups and
+        builds addr→`GlobalDim` registry via new `File::header_addr_of`; `resolve_dim_list` (Phase 2)
+        resolves refs via local cache → global registry → lazy `attrs_of` → phony; `NcAxis` gains
+        `group_path` + `is_unlimited` fields)
+  - [x] Dataset `max_dims` exposure on `oxih5::Dataset` for exact `is_unlimited` detection
+        (done 2026-06-10: `DataspaceInfo::max_dims`, `Dataset::max_dims/is_unlimited/unlimited_axes`;
+        8 new tests; parse_dataspace updated to read flags+max-dims block; all 350 tests pass)
+  - [x] Attrs-only metadata accessor on oxih5 (`File::attrs_of`) to avoid loading variable data during resolution
+        (done 2026-06-10: `File::attrs_of(addr: u64)` delegates to existing
+        `read_attributes_from_header`; returns `NotFound` for `u64::MAX`; 2 new unit tests)
+  - [x] User-defined types: enum, vlen, opaque, compound variables
+        (done 2026-06-10: `NcType` enum in `types.rs`; `From<&Dtype>` covers all 11 Dtype variants;
+        `NcVariable::nc_type()` convenience method; 12 unit tests in types.rs)
+  - [x] NC_STRING variable data decode (vlen UTF-8) via oxih5 vlen dataset path
+        (done 2026-06-10: `NcVariable::read_strings(nc)` delegates to `File::dataset_strings`;
+        `NcAttribute::new_with_view` eagerly decodes vlen strings at open time so `as_text()` works;
+        `NcFile::h5()` public accessor added)
+  - [x] `_FillValue`-aware masked reads (apply fill value → `Option`/NaN)
+        (done 2026-06-10: `apply_fill_mask<T>`, `apply_fill_mask_f32/f64` (bit-exact NaN safe);
+        `NcVariable::read_f64_masked` (NaN for fill), `read_i64_masked` (Option for fill);
+        priority: `_FillValue` attr first; 5 unit tests)
+  - [x] CF conventions: `coordinates`, `bounds`, `grid_mapping` semantic linking
+        (done 2026-06-10: `NcGroup::coordinates_of/bounds_of/grid_mapping_of`; `cf.rs` module with
+        `parse_cf_name_list/cf_group_prefix/cf_var_name` helpers; supports CF-1.7 `group:var` form;
+        9 unit tests in cf.rs + 7 in model.rs)
+  - [x] NetCDF-4 writing: `NcFileWriter` emitting DIMENSION_SCALE/CLASS/NAME/_Netcdf4Dimid/DIMENSION_LIST
+        (done 2026-06-10: W0a attribute writing on `FileWriter` — `write_string_attr`, `write_f64_attr`,
+        `write_i64_attr`, `write_i32_attr`, `write_obj_ref_list_attr`; SNOD capacity increased to 64;
+        C9 `NcFileWriter` with `def_dim/def_var/put_var_f64/put_var_i32/put_att_str/close`; 7 round-trip
+        tests; 420 total tests, zero warnings; all changes uncommitted in working tree)
+  - [x] Sub-group creation: `FileWriter::create_group` + `write_group_dataset_f64/i32` + `write_group_string_attr`
+        (done 2026-06-10: W0b — SNOD cache_type=1 scratch-pad for group OH/B-tree/heap; group SNOD 1288 bytes;
+        round-trip tests `w0b_create_group_and_dataset_roundtrip` + `w0b_group_groups_listing`)
+  - [x] Unlimited/chunked dataset layout: `FileWriter::create_dataset_unlimited`
+        (done 2026-06-10: W0c — B-tree v1 type-1 single-chunk node; chunked layout v3 with max_dim[0]=u64::MAX;
+        1-D and 2-D round-trip tests `w0c_unlimited_dataset_roundtrip` + `w0c_2d_unlimited_roundtrip`)
+  - [x] Root group string attributes: `FileWriter::write_root_str_attr`
+        (done 2026-06-10: C11 infrastructure — dynamic OH size via `compute_root_oh_size`; round-trip tests
+        `root_str_attr_roundtrip` + `root_str_attr_does_not_break_dataset_reads`)
+  - [x] Unlimited-dimension append in `NcFileWriter`: `def_dim_unlimited` + `put_vara_f64/i32`
+        (done 2026-06-10: C10 — rewrite-on-append strategy; `var_trailing_stride` helper; unlimited coord vars
+        use `create_dataset_unlimited`; tests `c10_unlimited_dim_append_roundtrip` + `c10_unlimited_2d_append_roundtrip`)
+  - [x] NETCDF4_CLASSIC strict-mode: `NcFileWriter::set_classic_mode`
+        (done 2026-06-10: C11 — writes `_nc3_strict = ""` on root group; removed from reserved-attr filter so
+        it appears in `NcGroup::attrs`; tests `c11_classic_mode_nc3_strict_attribute` + `c11_non_classic_no_nc3_strict`)
+  - [x] GlobalHeap (GCOL) writer + NC_STRING variable support
+        (done 2026-06-10: W0d — `GlobalHeapWriter` in `oxih5-format/src/global_heap_writer.rs` (GCOL
+        serialiser; re-exported from `oxih5_format::GlobalHeapWriter`); `ElemType::VlenStr` + `DatasetDesc::vlen_strings`
+        + `DatasetDesc::data_len()` in write/mod.rs; GCOL appended at EOF; 16-byte vlen refs in dataset data area;
+        `FileWriter::create_vlen_string_dataset`; `NcFileWriter::def_var_strings` + `put_var_strings` + NcType::String
+        arm in build_bytes; 12 new tests (`w0d_gcol_round_trip`, `w0d_gcol_empty_string`,
+        `w0d_gcol_with_coexisting_numeric_dataset`, 6 GlobalHeapWriter unit tests,
+        `nc_string_variable_round_trip`, `nc_string_var_with_empty_strings`); 440 total tests, zero warnings)
 
 ### Publish prerequisites
 - [x] oxiarc-szip must be published to crates.io before oxih5-format can be
       published (it is an optional dependency in the `szip` feature)
   - **UNBLOCKED (2026-06-03): oxiarc-szip is now published on crates.io (v0.3.2)**
   - Workspace Cargo.toml updated to registry dep `oxiarc-szip = "0.3.2"` (no path dep needed).
-- [ ] Publish oxih5-core → oxih5-format → oxih5 to crates.io
+- [ ] Publish oxih5-core → oxih5-format → oxih5 → oxinetcdf to crates.io
   - **BLOCKED: requires explicit cargo publish approval from User per COOLJAPAN policy**
-- Publish order: oxih5-core → oxih5-format → oxih5
+- Publish order: oxih5-core → oxih5-format → oxih5 → oxinetcdf

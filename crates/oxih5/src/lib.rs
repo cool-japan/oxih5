@@ -522,6 +522,32 @@ impl File {
             .collect())
     }
 
+    /// Read only the attributes from the object header at `addr`.
+    ///
+    /// Does NOT read dataspace, layout, or data — lightweight for metadata-only
+    /// access.  Intended for use by callers (e.g. `oxinetcdf`) that already
+    /// know the header address from an object reference or prior navigation and
+    /// need only attribute metadata without the cost of loading dataset data.
+    ///
+    /// Returns `OxiH5Error::NotFound` for `u64::MAX` (undefined reference).
+    pub fn attrs_of(&self, addr: u64) -> Result<Vec<Attribute>, OxiH5Error> {
+        if addr == u64::MAX {
+            return Err(OxiH5Error::NotFound("undefined object reference".into()));
+        }
+        read_attributes_from_header(&self.data, addr)
+    }
+
+    /// Returns the object-header address for the dataset at `path`.
+    ///
+    /// This is the raw HDF5 file byte-offset of the object header, providing a
+    /// stable, cross-group identifier for an object.  Useful as a map key in
+    /// dimension-scale resolution (e.g. `oxinetcdf`'s DIMENSION_LIST address map).
+    ///
+    /// Returns [`OxiH5Error::NotFound`] if `path` does not exist.
+    pub fn header_addr_of(&self, path: &str) -> Result<u64, OxiH5Error> {
+        self.resolve_dataset_header_addr(path)
+    }
+
     /// Internal helper: resolve the object header address for the dataset at `path`.
     fn resolve_dataset_header_addr(&self, path: &str) -> Result<u64, OxiH5Error> {
         let sb = superblock::parse(&self.data)?;
@@ -644,6 +670,104 @@ impl Group {
         )
     }
 
+    /// Navigate to a named sub-group within this group (one level only).
+    ///
+    /// Returns a `Group` handle for the child with the given name.
+    /// Supports hard links and soft links.  For external links that point to a
+    /// group in another file, the external file is opened and the target group
+    /// is returned.
+    pub fn group(&self, name: &str) -> Result<Group, OxiH5Error> {
+        if self.new_style {
+            let sb = superblock::parse(&self.file_data)?;
+            let ctx = oxih5_format::context::ParseContext::new(
+                sb.size_of_offsets,
+                sb.size_of_lengths,
+                sb.base_address,
+            );
+            let links =
+                group::list_new_style_links(&self.file_data, self.object_header_address, &ctx)?;
+            for pl in &links {
+                if pl.name == name {
+                    match &pl.link {
+                        oxih5_core::Link::Hard { address } => {
+                            let child_msgs = header::parse_messages(&self.file_data, *address)?;
+                            let (btree_address, heap_address, new_style) =
+                                if let Some((bt, hp)) = find_symbol_table_addresses(&child_msgs) {
+                                    (bt, hp, false)
+                                } else {
+                                    (0, 0, true)
+                                };
+                            return Ok(Group {
+                                name: name.to_string(),
+                                object_header_address: *address,
+                                btree_address,
+                                heap_address,
+                                new_style,
+                                file_data: self.file_data.clone(),
+                                source_dir: self.source_dir.clone(),
+                                chunk_cache: self.chunk_cache.clone(),
+                            });
+                        }
+                        oxih5_core::Link::Soft { path } => {
+                            let mut visited = std::collections::HashSet::new();
+                            let addr = resolve_soft_link_to_header(
+                                &self.file_data,
+                                sb.root_object_header_address,
+                                path,
+                                &mut visited,
+                            )?;
+                            let child_msgs = header::parse_messages(&self.file_data, addr)?;
+                            let (btree_address, heap_address, new_style) =
+                                if let Some((bt, hp)) = find_symbol_table_addresses(&child_msgs) {
+                                    (bt, hp, false)
+                                } else {
+                                    (0, 0, true)
+                                };
+                            return Ok(Group {
+                                name: name.to_string(),
+                                object_header_address: addr,
+                                btree_address,
+                                heap_address,
+                                new_style,
+                                file_data: self.file_data.clone(),
+                                source_dir: self.source_dir.clone(),
+                                chunk_cache: self.chunk_cache.clone(),
+                            });
+                        }
+                        oxih5_core::Link::External {
+                            file: ext_file,
+                            path: ext_path,
+                        } => {
+                            return resolve_external_link_group(
+                                ext_file,
+                                ext_path,
+                                &self.source_dir,
+                            );
+                        }
+                    }
+                }
+            }
+            return Err(OxiH5Error::NotFound(name.to_string()));
+        }
+
+        // Old-style group: find child via B-tree + SNOD.
+        let entry_addr =
+            group::find_dataset(&self.file_data, self.btree_address, self.heap_address, name)?;
+        let msgs = header::parse_messages(&self.file_data, entry_addr)?;
+        let (btree_address, heap_address) = find_symbol_table_addresses(&msgs)
+            .ok_or_else(|| OxiH5Error::NotFound(format!("'{}' is not a group", name)))?;
+        Ok(Group {
+            name: name.to_string(),
+            object_header_address: entry_addr,
+            btree_address,
+            heap_address,
+            new_style: false,
+            file_data: self.file_data.clone(),
+            source_dir: self.source_dir.clone(),
+            chunk_cache: self.chunk_cache.clone(),
+        })
+    }
+
     /// Read a sub-region of a dataset by name within this group using lazy chunk loading.
     ///
     /// `ranges` specifies one `Range<usize>` per dimension.
@@ -763,14 +887,36 @@ impl Group {
         let links = group::list_new_style_links(&self.file_data, self.object_header_address, &ctx)?;
         let mut names = Vec::new();
         for pl in &links {
-            if let oxih5_core::Link::Hard { address } = &pl.link {
-                // Determine whether this hard link points to a group or a dataset.
-                let is_group = group::is_new_style_group(&self.file_data, *address)
-                    || header::parse_messages(&self.file_data, *address)
-                        .map(|msgs| msgs.iter().any(|m| m.msg_type == 0x0011))
-                        .unwrap_or(false);
-                if is_group == want_groups {
-                    names.push(pl.name.clone());
+            match &pl.link {
+                oxih5_core::Link::Hard { address } => {
+                    // Determine whether this hard link points to a group or a dataset.
+                    let is_group = group::is_new_style_group(&self.file_data, *address)
+                        || header::parse_messages(&self.file_data, *address)
+                            .map(|msgs| msgs.iter().any(|m| m.msg_type == 0x0011))
+                            .unwrap_or(false);
+                    if is_group == want_groups {
+                        names.push(pl.name.clone());
+                    }
+                }
+                oxih5_core::Link::Soft { path } => {
+                    // Resolve the soft link and check whether it points to a group.
+                    let root_addr = sb.root_object_header_address;
+                    let mut visited = std::collections::HashSet::new();
+                    if let Ok(addr) =
+                        resolve_soft_link_to_header(&self.file_data, root_addr, path, &mut visited)
+                    {
+                        let is_group = group::is_new_style_group(&self.file_data, addr)
+                            || header::parse_messages(&self.file_data, addr)
+                                .map(|msgs| msgs.iter().any(|m| m.msg_type == 0x0011))
+                                .unwrap_or(false);
+                        if is_group == want_groups {
+                            names.push(pl.name.clone());
+                        }
+                    }
+                    // Unresolvable soft links are silently skipped.
+                }
+                oxih5_core::Link::External { .. } => {
+                    // External links are currently excluded from listings.
                 }
             }
         }
@@ -822,6 +968,7 @@ fn navigate_to_group(
 /// returning its object header address.
 ///
 /// Scans Link messages (0x0006) in the parent's object header.
+/// Soft links are followed by walking from the file root with a cycle guard.
 fn find_new_style_child(
     file_data: &[u8],
     parent_header_addr: u64,
@@ -839,10 +986,13 @@ fn find_new_style_child(
             match &parsed_link.link {
                 oxih5_core::Link::Hard { address } => return Ok(*address),
                 oxih5_core::Link::Soft { path } => {
-                    return Err(OxiH5Error::NotImplemented(format!(
-                        "soft link '{}' → '{}' not followed",
-                        name, path
-                    )));
+                    let mut visited = std::collections::HashSet::new();
+                    return resolve_soft_link_to_header(
+                        file_data,
+                        sb.root_object_header_address,
+                        path,
+                        &mut visited,
+                    );
                 }
                 oxih5_core::Link::External { file, .. } => {
                     return Err(OxiH5Error::NotImplemented(format!(
@@ -854,6 +1004,91 @@ fn find_new_style_child(
         }
     }
     Err(OxiH5Error::NotFound(name.to_string()))
+}
+
+/// Resolve a soft-link target path to an object header address, starting from
+/// `current_header_addr` (the root).
+///
+/// `visited` is a cycle guard: if `target_path` is already in the set the link
+/// chain is cyclic and we return an error rather than looping infinitely.
+fn resolve_soft_link_to_header(
+    file_data: &[u8],
+    root_header_addr: u64,
+    target_path: &str,
+    visited: &mut std::collections::HashSet<String>,
+) -> Result<u64, OxiH5Error> {
+    if !visited.insert(target_path.to_string()) {
+        return Err(OxiH5Error::Format(format!(
+            "soft link cycle detected at path '{target_path}'"
+        )));
+    }
+
+    // Navigate from root, following each segment.
+    let normalized = target_path.trim_start_matches('/');
+    let parts: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+
+    // Empty path → root itself.
+    if parts.is_empty() {
+        return Ok(root_header_addr);
+    }
+
+    let sb = superblock::parse(file_data)?;
+    let ctx = oxih5_format::context::ParseContext::new(
+        sb.size_of_offsets,
+        sb.size_of_lengths,
+        sb.base_address,
+    );
+
+    let mut current_header = root_header_addr;
+    for (idx, segment) in parts.iter().enumerate() {
+        let is_last = idx == parts.len() - 1;
+        let links = group::list_new_style_links(file_data, current_header, &ctx)?;
+        let mut found = false;
+        for pl in &links {
+            if pl.name == *segment {
+                match &pl.link {
+                    oxih5_core::Link::Hard { address } => {
+                        current_header = *address;
+                        found = true;
+                        break;
+                    }
+                    oxih5_core::Link::Soft { path } => {
+                        if is_last {
+                            // Recurse into nested soft link with cycle guard.
+                            return resolve_soft_link_to_header(
+                                file_data,
+                                root_header_addr,
+                                path,
+                                visited,
+                            );
+                        }
+                        // Mid-path soft link: resolve it then continue.
+                        let addr = resolve_soft_link_to_header(
+                            file_data,
+                            root_header_addr,
+                            path,
+                            visited,
+                        )?;
+                        current_header = addr;
+                        found = true;
+                        break;
+                    }
+                    oxih5_core::Link::External { .. } => {
+                        return Err(OxiH5Error::NotImplemented(
+                            "soft link targeting external link not supported".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        if !found {
+            return Err(OxiH5Error::NotFound(format!(
+                "soft link target '{target_path}': segment '{segment}' not found"
+            )));
+        }
+    }
+
+    Ok(current_header)
 }
 
 /// Resolve a dataset name within a new-style group, handling both hard links
@@ -884,10 +1119,17 @@ fn resolve_new_style_dataset(
                     return read_dataset_from_object_header(file_data, *address, name, cache);
                 }
                 oxih5_core::Link::Soft { path } => {
-                    return Err(OxiH5Error::NotImplemented(format!(
-                        "soft link '{}' → '{}' not followed",
-                        name, path
-                    )));
+                    // Follow the soft link to its target header address, then
+                    // read the dataset from there.
+                    let sb = superblock::parse(file_data)?;
+                    let mut visited = std::collections::HashSet::new();
+                    let target_addr = resolve_soft_link_to_header(
+                        file_data,
+                        sb.root_object_header_address,
+                        path,
+                        &mut visited,
+                    )?;
+                    return read_dataset_from_object_header(file_data, target_addr, name, cache);
                 }
                 oxih5_core::Link::External {
                     file: ext_file,
@@ -911,11 +1153,7 @@ fn resolve_external_link(
     ext_path: &str,
     source_dir: &std::path::Path,
 ) -> Result<Dataset, OxiH5Error> {
-    let resolved = if std::path::Path::new(ext_file).is_absolute() {
-        std::path::PathBuf::from(ext_file)
-    } else {
-        source_dir.join(ext_file)
-    };
+    let resolved = resolve_external_path(ext_file, source_dir);
 
     let ext = open(&resolved).map_err(|e| {
         OxiH5Error::NotFound(format!(
@@ -932,6 +1170,42 @@ fn resolve_external_link(
             resolved.display()
         ))
     })
+}
+
+/// Open an external HDF5 file and navigate to the group at `ext_path`.
+///
+/// Returns the group handle from the external file.
+fn resolve_external_link_group(
+    ext_file: &str,
+    ext_path: &str,
+    source_dir: &std::path::Path,
+) -> Result<Group, OxiH5Error> {
+    let resolved = resolve_external_path(ext_file, source_dir);
+
+    let ext = open(&resolved).map_err(|e| {
+        OxiH5Error::NotFound(format!(
+            "external link target file '{}': {e}",
+            resolved.display()
+        ))
+    })?;
+
+    let target = ext_path.trim_start_matches('/');
+    ext.group(if target.is_empty() { "/" } else { target })
+        .map_err(|e| {
+            OxiH5Error::NotFound(format!(
+                "external link {}::{ext_path}: {e}",
+                resolved.display()
+            ))
+        })
+}
+
+/// Resolve an external-link filename to an absolute `PathBuf`.
+fn resolve_external_path(ext_file: &str, source_dir: &std::path::Path) -> std::path::PathBuf {
+    if std::path::Path::new(ext_file).is_absolute() {
+        std::path::PathBuf::from(ext_file)
+    } else {
+        source_dir.join(ext_file)
+    }
 }
 
 /// Lazy slice reader for `File::dataset_slice`: resolves the path, extracts
@@ -1139,6 +1413,7 @@ fn hyperslab_dataset_at_header(
                     shape: out_shape,
                     dtype: dtp.dtype,
                     attributes,
+                    max_dims: dsp.max_dims.clone(),
                 });
             }
         }
@@ -1169,6 +1444,7 @@ fn hyperslab_dataset_at_header(
         shape: out_shape,
         dtype: full_ds.dtype,
         attributes: full_ds.attributes,
+        max_dims: full_ds.max_dims,
     })
 }
 
@@ -1310,6 +1586,7 @@ fn slice_dataset_at_header(
                     shape: out_shape,
                     dtype: dtp.dtype,
                     attributes,
+                    max_dims: dsp.max_dims.clone(),
                 });
             }
         }
@@ -1408,6 +1685,7 @@ fn read_dataset_from_object_header(
         shape,
         dtype: dtp.dtype,
         attributes,
+        max_dims: dsp.max_dims.clone(),
     })
 }
 
@@ -1508,6 +1786,7 @@ fn read_dataset_from_group(
         shape,
         dtype: dtp.dtype,
         attributes,
+        max_dims: dsp.max_dims.clone(),
     })
 }
 
@@ -1528,4 +1807,142 @@ fn read_attributes_from_header(
         }
     }
     Ok(attrs)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // A1 — integration: DataspaceInfo max_dims parsing + Dataset::is_unlimited
+    // -----------------------------------------------------------------------
+
+    /// Verify that `parse_dataspace` extracts `max_dims` correctly.
+    #[test]
+    fn test_parse_dataspace_with_max_dims() {
+        use oxih5_format::message::parse_dataspace;
+
+        // Build a v1 dataspace body with flags=0x01 (max-dims present)
+        // dims: [10, 20], max_dims: [u64::MAX, 50]
+        let mut body = vec![0u8; 8 + 8 * 2 + 8 * 2]; // header + dims + max_dims
+        body[0] = 1; // version
+        body[1] = 2; // dimensionality
+        body[2] = 0x01; // flags: max-dims present
+                        // body[3..8] reserved
+                        // dims
+        body[8..16].copy_from_slice(&10u64.to_le_bytes());
+        body[16..24].copy_from_slice(&20u64.to_le_bytes());
+        // max_dims
+        body[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+        body[32..40].copy_from_slice(&50u64.to_le_bytes());
+
+        let dsp = parse_dataspace(&body).expect("parse_dataspace failed");
+        assert_eq!(dsp.dims, vec![10u64, 20u64]);
+        assert_eq!(dsp.max_dims, Some(vec![u64::MAX, 50u64]));
+    }
+
+    /// Verify that `parse_dataspace` with flags=0x00 produces `max_dims: None`.
+    #[test]
+    fn test_parse_dataspace_without_max_dims() {
+        use oxih5_format::message::parse_dataspace;
+
+        let mut body = vec![0u8; 8 + 8]; // v1 header + 1 dim
+        body[0] = 1; // version
+        body[1] = 1; // dimensionality
+        body[2] = 0x00; // flags: no max-dims
+        body[8..16].copy_from_slice(&42u64.to_le_bytes());
+
+        let dsp = parse_dataspace(&body).expect("parse_dataspace failed");
+        assert_eq!(dsp.dims, vec![42u64]);
+        assert!(dsp.max_dims.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // A2 — File::attrs_of: unit tests using in-crate write infrastructure
+    // -----------------------------------------------------------------------
+
+    /// Verify that `attrs_of(addr)` returns empty attrs for a dataset that
+    /// has no attributes.
+    #[test]
+    fn test_attrs_of_returns_empty_when_no_attrs() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("oxih5_test_attrs_of_empty.h5");
+
+        crate::write::FileWriter::new()
+            .write_dataset_f32("mydata", &[1.0f32, 2.0, 3.0], &[3])
+            .expect("write_dataset_f32")
+            .build(&tmp)
+            .expect("build");
+
+        let file = File::open(&tmp).expect("open");
+        let _ = std::fs::remove_file(&tmp);
+
+        // Resolve the header address using the private helper (accessible in
+        // crate-internal tests).
+        let addr = file
+            .resolve_dataset_header_addr("mydata")
+            .expect("resolve header addr");
+
+        let attrs = file.attrs_of(addr).expect("attrs_of");
+        assert!(
+            attrs.is_empty(),
+            "no attrs were written; expected empty, got {:?}",
+            attrs.iter().map(|a| &a.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// Verify that `attrs_of(u64::MAX)` returns NotFound.
+    #[test]
+    fn test_attrs_of_undefined_ref_returns_not_found() {
+        let file = File::open_from_bytes(&[0x89u8, 0x48, 0x44, 0x46, 0x0d, 0x0a, 0x1a, 0x0a])
+            .unwrap_or_else(|_| File::open_from_bytes(&[0u8; 64]).unwrap());
+        // Even without a valid file, the addr check happens before any parsing.
+        let result = file.attrs_of(u64::MAX);
+        assert!(
+            matches!(result, Err(OxiH5Error::NotFound(_))),
+            "expected NotFound for u64::MAX, got {:?}",
+            result
+        );
+    }
+
+    // Existing tests below.
+
+    /// Test that `resolve_soft_link_to_header` correctly returns an error
+    /// when the same path appears twice (cycle detection).
+    #[test]
+    fn test_soft_link_cycle_detection() {
+        // We test the cycle-guard directly without a real HDF5 file.
+        // Create a dummy file_data that will fail to parse (no superblock) so
+        // that after inserting the path into `visited` the second call for the
+        // *same* path returns an error immediately.
+        let file_data = vec![0u8; 64];
+        let mut visited = std::collections::HashSet::new();
+        visited.insert("/cyclic".to_string()); // Pre-insert the path to simulate a cycle.
+
+        let result = resolve_soft_link_to_header(&file_data, 0, "/cyclic", &mut visited);
+        assert!(result.is_err(), "expected cycle-detection error, got Ok");
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("cycle"),
+            "error message should mention 'cycle', got: {err_str}"
+        );
+    }
+
+    /// Test that `resolve_soft_link_to_header` returns the root address when
+    /// the target path is empty.
+    #[test]
+    fn test_soft_link_empty_path_returns_root() {
+        // With an empty target path, the function should return the root header address.
+        // We do not need a valid file for this path since we return before parsing.
+        let file_data = vec![0u8; 64];
+        let mut visited = std::collections::HashSet::new();
+        let root_addr = 42u64;
+        let result = resolve_soft_link_to_header(&file_data, root_addr, "", &mut visited);
+        // Empty path → returns root_addr immediately.
+        assert_eq!(result.unwrap(), root_addr);
+    }
 }

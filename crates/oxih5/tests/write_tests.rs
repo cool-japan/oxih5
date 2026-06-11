@@ -167,12 +167,12 @@ fn test_write_read_2d_f64() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 8: capacity limit — 9th dataset must fail
+// Test 8: capacity limit — 65th dataset must fail (SNOD_CAPACITY = 64)
 // ---------------------------------------------------------------------------
 #[test]
 fn test_write_capacity_exceeded() {
     let mut writer = FileWriter::new();
-    for i in 0..8usize {
+    for i in 0..64usize {
         writer
             .write_dataset_f32(&format!("d{i}"), &[1.0f32], &[1])
             .unwrap();
@@ -181,7 +181,7 @@ fn test_write_capacity_exceeded() {
         writer
             .write_dataset_f32("overflow", &[1.0f32], &[1])
             .is_err(),
-        "9th dataset should return an error"
+        "65th dataset should return an error"
     );
 }
 

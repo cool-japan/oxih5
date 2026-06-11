@@ -61,6 +61,13 @@ pub enum Value {
     /// Object reference — absolute byte address of the target object header.
     /// `u64::MAX` means undefined / null reference.
     ObjectRef(u64),
+    /// Region reference — points to a dataset and a selection within it.
+    RegionRef {
+        /// Absolute byte address of the referenced dataset's object header.
+        dataset_addr: u64,
+        /// The data-space selection encoded in the region reference.
+        selection: RegionSelection,
+    },
     /// Sequence of values (vlen array or array datatype).
     Sequence(Vec<Value>),
     /// Named fields of a compound element.
@@ -69,6 +76,19 @@ pub enum Value {
     Enum(i64),
     /// Bitfield (raw bit pattern).
     Bitfield(u64),
+}
+
+// ---------------------------------------------------------------------------
+// Region reference selection types
+// ---------------------------------------------------------------------------
+
+/// A data-space selection encoded in an HDF5 region reference.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RegionSelection {
+    /// Point list: each inner `Vec<u64>` is one point (one index per dimension).
+    Points(Vec<Vec<u64>>),
+    /// Hyperslab: each tuple is `(start, count)` per dimension.
+    Hyperslab(Vec<(u64, u64)>),
 }
 
 // ---------------------------------------------------------------------------
@@ -201,12 +221,17 @@ pub fn decode_vlen_sequences(
         )));
     }
 
-    let base_size = base_dtype.size().ok_or_else(|| {
-        OxiH5Error::NotImplemented("vlen sequence with variable-length base type".into())
-    })?;
-
     let mut out = Vec::with_capacity(n_elems);
     let mut heap_cache: HashMap<u64, GlobalHeap> = HashMap::new();
+
+    // For vlen-of-vlen (and other variable-length base types), each element in
+    // the heap object is itself a 16-byte vlen reference.  We detect this by
+    // checking whether the base dtype has a fixed size; if not we use 16 bytes
+    // per element (the on-disk vlen reference footprint).
+    let base_size_opt = base_dtype.size();
+    let is_vlen_base = base_size_opt.is_none();
+    // For vlen bases, each nested element is stored as a 16-byte heap reference.
+    let elem_footprint = base_size_opt.unwrap_or(16);
 
     for i in 0..n_elems {
         let ref_bytes = &data[i * 16..(i + 1) * 16];
@@ -220,10 +245,10 @@ pub fn decode_vlen_sequences(
         let seq_len = seq_len as usize;
         let raw = heap_object_bytes(file_data, heap_addr, obj_idx, &mut heap_cache)?.to_vec();
 
-        let needed = seq_len * base_size;
+        let needed = seq_len * elem_footprint;
         if raw.len() < needed {
             return Err(OxiH5Error::Format(format!(
-                "vlen sequence elem {i}: heap object has {} bytes, expected {} ({seq_len} × {base_size})",
+                "vlen sequence elem {i}: heap object has {} bytes, expected {} ({seq_len} × {elem_footprint})",
                 raw.len(),
                 needed
             )));
@@ -231,14 +256,25 @@ pub fn decode_vlen_sequences(
 
         let mut elems = Vec::with_capacity(seq_len);
         for j in 0..seq_len {
-            let elem_bytes = &raw[j * base_size..(j + 1) * base_size];
-            elems.push(decode_one_value(
-                file_data,
-                elem_bytes,
-                base_dtype,
-                &mut heap_cache,
-                0,
-            )?);
+            let elem_bytes = &raw[j * elem_footprint..(j + 1) * elem_footprint];
+            if is_vlen_base {
+                // Nested vlen: decode the 16-byte reference as a vlen element.
+                elems.push(decode_one_value(
+                    file_data,
+                    elem_bytes,
+                    base_dtype,
+                    &mut heap_cache,
+                    1,
+                )?);
+            } else {
+                elems.push(decode_one_value(
+                    file_data,
+                    elem_bytes,
+                    base_dtype,
+                    &mut heap_cache,
+                    0,
+                )?);
+            }
         }
         out.push(Value::Sequence(elems));
     }
@@ -289,12 +325,9 @@ pub fn decode_compound_element(
 ) -> Result<Value, OxiH5Error> {
     let mut decoded = Vec::with_capacity(fields.len());
     for field in fields {
-        let field_size = field.dtype.size().ok_or_else(|| {
-            OxiH5Error::NotImplemented(format!(
-                "compound field '{}': variable-length field size not supported in compound",
-                field.name
-            ))
-        })?;
+        // Variable-length fields in a compound are stored as 16-byte heap
+        // references on disk.  Use 16 as the field size when dtype.size() is None.
+        let field_size = field.dtype.size().unwrap_or(16);
         let field_end = field.offset.checked_add(field_size).ok_or_else(|| {
             OxiH5Error::Format(format!(
                 "compound field '{}': offset+size overflows",
@@ -334,12 +367,8 @@ pub fn decode_compound(
         // Compute from field layout: max(offset + field_size).
         let mut s = 0usize;
         for f in fields {
-            let fsz = f.dtype.size().ok_or_else(|| {
-                OxiH5Error::NotImplemented(format!(
-                    "cannot compute stride: field '{}' is variable-length",
-                    f.name
-                ))
-            })?;
+            // Variable-length fields are stored as 16-byte heap references on disk.
+            let fsz = f.dtype.size().unwrap_or(16);
             s = s.max(f.offset + fsz);
         }
         s
@@ -450,6 +479,26 @@ pub fn decode_one_value(
                         b.try_into()
                             .map_err(|_| OxiH5Error::Format("i64 decode".into()))?,
                     ),
+                    // Odd-size signed integers (3, 5, 6, 7 bytes): pack into u64
+                    // then sign-extend via arithmetic shift.
+                    (sz, bo) if sz > 0 && sz <= 8 => {
+                        let mut raw = 0u64;
+                        match bo {
+                            ByteOrder::Little => {
+                                for (i, &byte) in b.iter().enumerate() {
+                                    raw |= u64::from(byte) << (i * 8);
+                                }
+                            }
+                            ByteOrder::Big => {
+                                for (i, &byte) in b.iter().enumerate() {
+                                    raw |= u64::from(byte) << ((sz - 1 - i) * 8);
+                                }
+                            }
+                        }
+                        let shift = 64u32.saturating_sub((sz as u32) * 8);
+                        // Sign-extend: left shift to place sign bit at bit 63, then arithmetic right shift.
+                        ((raw << shift) as i64) >> shift
+                    }
                     _ => return Err(OxiH5Error::NotImplemented(format!("signed int size {sz}"))),
                 };
                 Ok(Value::Int(v))
@@ -480,6 +529,23 @@ pub fn decode_one_value(
                         b.try_into()
                             .map_err(|_| OxiH5Error::Format("u64 decode".into()))?,
                     ),
+                    // Odd-size unsigned integers (3, 5, 6, 7 bytes): pack into u64.
+                    (sz, bo) if sz > 0 && sz <= 8 => {
+                        let mut raw = 0u64;
+                        match bo {
+                            ByteOrder::Little => {
+                                for (i, &byte) in b.iter().enumerate() {
+                                    raw |= u64::from(byte) << (i * 8);
+                                }
+                            }
+                            ByteOrder::Big => {
+                                for (i, &byte) in b.iter().enumerate() {
+                                    raw |= u64::from(byte) << ((sz - 1 - i) * 8);
+                                }
+                            }
+                        }
+                        raw
+                    }
                     _ => {
                         return Err(OxiH5Error::NotImplemented(format!(
                             "unsigned int size {sz}"
@@ -607,6 +673,23 @@ pub fn decode_one_value(
                     b.try_into()
                         .map_err(|_| OxiH5Error::Format("bitfield u64".into()))?,
                 ),
+                // Odd-size bitfields (3, 5, 6, 7 bytes): pack bytes into u64.
+                (sz, bo) if sz > 0 && sz <= 8 => {
+                    let mut raw = 0u64;
+                    match bo {
+                        ByteOrder::Little => {
+                            for (i, &byte) in b.iter().enumerate() {
+                                raw |= u64::from(byte) << (i * 8);
+                            }
+                        }
+                        ByteOrder::Big => {
+                            for (i, &byte) in b.iter().enumerate() {
+                                raw |= u64::from(byte) << ((sz - 1 - i) * 8);
+                            }
+                        }
+                    }
+                    raw
+                }
                 _ => return Err(OxiH5Error::NotImplemented(format!("bitfield size {sz}"))),
             };
             Ok(Value::Bitfield(v))
@@ -628,7 +711,34 @@ pub fn decode_one_value(
                 );
                 Ok(Value::ObjectRef(addr))
             }
-            RefType::Region => Err(OxiH5Error::NotImplemented("region reference decode".into())),
+            RefType::Region => {
+                // A region reference is 12 bytes on disk:
+                //   bytes [0..8]  — dataset object header address (u64 LE)
+                //   bytes [8..12] — heap reference offset (u32 LE), pointing into global heap
+                //                   where the serialised selection lives.
+                if bytes.len() < 12 {
+                    return Err(OxiH5Error::Format(format!(
+                        "region ref: need 12 bytes, got {}",
+                        bytes.len()
+                    )));
+                }
+                let dataset_addr = u64::from_le_bytes(
+                    bytes[0..8]
+                        .try_into()
+                        .map_err(|_| OxiH5Error::Format("region ref: dataset addr".into()))?,
+                );
+                let heap_offset = u32::from_le_bytes(
+                    bytes[8..12]
+                        .try_into()
+                        .map_err(|_| OxiH5Error::Format("region ref: heap offset".into()))?,
+                ) as u64;
+
+                let selection = parse_region_selection(file_data, heap_offset, heap_cache)?;
+                Ok(Value::RegionRef {
+                    dataset_addr,
+                    selection,
+                })
+            }
         },
 
         // ------------------------------------------------------------------ enum
@@ -650,9 +760,8 @@ pub fn decode_one_value(
 
         // ------------------------------------------------------------------ array
         Dtype::Array { base, dims } => {
-            let base_size = base.size().ok_or_else(|| {
-                OxiH5Error::NotImplemented("array of variable-length base type".into())
-            })?;
+            // Variable-length base types are stored as 16-byte heap references.
+            let base_size = base.size().unwrap_or(16);
             let n_elems: usize = dims.iter().product();
             let needed = n_elems.checked_mul(base_size).ok_or_else(|| {
                 OxiH5Error::Format("array decode: n_elems × base_size overflows".into())
@@ -683,9 +792,9 @@ pub fn decode_one_value(
             if seq_len == 0 {
                 return Ok(Value::Sequence(vec![]));
             }
-            let base_size = base.size().ok_or_else(|| {
-                OxiH5Error::NotImplemented("vlen of variable-length base type".into())
-            })?;
+            // Variable-length base types (vlen-of-vlen) are stored as 16-byte
+            // heap references; use 16 bytes as the element footprint in that case.
+            let base_size = base.size().unwrap_or(16);
             let seq_len = seq_len as usize;
             let raw = heap_object_bytes(file_data, heap_addr, obj_idx, heap_cache)?.to_vec();
             let needed = seq_len * base_size;
@@ -713,6 +822,138 @@ pub fn decode_one_value(
         Dtype::Compound { fields } => {
             decode_compound_element(file_data, bytes, fields, heap_cache, depth + 1)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Region reference helpers
+// ---------------------------------------------------------------------------
+
+/// Parse a region selection from the global heap.
+///
+/// `heap_offset` is a u32 value from bytes 8–11 of the 12-byte region reference,
+/// cast to u64 and used as the absolute collection address.
+///
+/// The selection is stored in the heap collection at that address; the first
+/// object (index 1) contains the serialised selection:
+/// ```text
+///  0  4   version + type (type: 1=point, 2=hyperslab)
+///  4  4   unused/padding
+///  8  4   dimensionality (N)
+/// 12  4   unused
+/// 16  …   type-specific payload
+/// ```
+/// Point list payload: `N * ndim` × u64 point coordinates.
+/// Hyperslab payload:  `2 * N * ndim` × u64 → (start, count) per dim per block.
+fn parse_region_selection(
+    file_data: &[u8],
+    heap_offset: u64,
+    heap_cache: &mut HashMap<u64, GlobalHeap>,
+) -> Result<RegionSelection, OxiH5Error> {
+    let sel_bytes = heap_object_bytes(file_data, heap_offset, 1, heap_cache)?.to_vec();
+
+    if sel_bytes.len() < 16 {
+        return Err(OxiH5Error::Format(format!(
+            "region ref selection: need at least 16 bytes, got {}",
+            sel_bytes.len()
+        )));
+    }
+
+    // Bytes 0–1: version; bytes 2–3: type
+    let sel_type = u16::from_le_bytes(
+        sel_bytes[2..4]
+            .try_into()
+            .map_err(|_| OxiH5Error::Format("region ref: sel_type bytes".into()))?,
+    );
+    let ndim = u32::from_le_bytes(
+        sel_bytes[8..12]
+            .try_into()
+            .map_err(|_| OxiH5Error::Format("region ref: ndim bytes".into()))?,
+    ) as usize;
+
+    let payload = &sel_bytes[16..];
+
+    match sel_type {
+        1 => {
+            // Point list: first u32 = number of points, then ndim u64s per point.
+            if payload.len() < 4 {
+                return Err(OxiH5Error::Format(
+                    "region ref point list: missing count".into(),
+                ));
+            }
+            let n_points = u32::from_le_bytes(
+                payload[0..4]
+                    .try_into()
+                    .map_err(|_| OxiH5Error::Format("region ref: point count bytes".into()))?,
+            ) as usize;
+            let pt_data = &payload[4..];
+            let needed = n_points.saturating_mul(ndim).saturating_mul(8);
+            if pt_data.len() < needed {
+                return Err(OxiH5Error::Format(format!(
+                    "region ref point list: need {needed} bytes for {n_points} points × {ndim} dims, got {}",
+                    pt_data.len()
+                )));
+            }
+            let mut points = Vec::with_capacity(n_points);
+            for p in 0..n_points {
+                let mut coords = Vec::with_capacity(ndim);
+                for d in 0..ndim {
+                    let off = (p * ndim + d) * 8;
+                    let v = u64::from_le_bytes(
+                        pt_data[off..off + 8]
+                            .try_into()
+                            .map_err(|_| OxiH5Error::Format("region ref: point coord".into()))?,
+                    );
+                    coords.push(v);
+                }
+                points.push(coords);
+            }
+            Ok(RegionSelection::Points(points))
+        }
+        2 => {
+            // Hyperslab: n_blocks blocks, each block = start(ndim u64) + count(ndim u64).
+            if payload.len() < 4 {
+                return Err(OxiH5Error::Format(
+                    "region ref hyperslab: missing block count".into(),
+                ));
+            }
+            let n_blocks = u32::from_le_bytes(
+                payload[0..4]
+                    .try_into()
+                    .map_err(|_| OxiH5Error::Format("region ref: block count bytes".into()))?,
+            ) as usize;
+            let hs_data = &payload[4..];
+            let needed = n_blocks
+                .saturating_mul(2)
+                .saturating_mul(ndim)
+                .saturating_mul(8);
+            if hs_data.len() < needed {
+                return Err(OxiH5Error::Format(format!(
+                    "region ref hyperslab: need {needed} bytes, got {}",
+                    hs_data.len()
+                )));
+            }
+            let mut slabs = Vec::with_capacity(n_blocks * ndim);
+            for b in 0..n_blocks {
+                for d in 0..ndim {
+                    let start_off = (b * 2 * ndim + d) * 8;
+                    let count_off = (b * 2 * ndim + ndim + d) * 8;
+                    let start =
+                        u64::from_le_bytes(hs_data[start_off..start_off + 8].try_into().map_err(
+                            |_| OxiH5Error::Format("region ref: hyperslab start".into()),
+                        )?);
+                    let count =
+                        u64::from_le_bytes(hs_data[count_off..count_off + 8].try_into().map_err(
+                            |_| OxiH5Error::Format("region ref: hyperslab count".into()),
+                        )?);
+                    slabs.push((start, count));
+                }
+            }
+            Ok(RegionSelection::Hyperslab(slabs))
+        }
+        other => Err(OxiH5Error::NotImplemented(format!(
+            "region ref: unknown selection type {other}"
+        ))),
     }
 }
 
@@ -1006,5 +1247,312 @@ mod tests {
             "expected depth limit error, got: {:?}",
             result
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Slice 3a: odd-size integer decode
+
+    #[test]
+    fn test_decode_signed_int_3bytes_le_positive() {
+        // 3-byte LE signed int: 0x01_00_00 = 65536
+        let bytes = [0x00u8, 0x00, 0x01];
+        let dtype = Dtype::Int {
+            size: 3,
+            signed: true,
+            order: ByteOrder::Little,
+        };
+        let v = decode_one_value(&[], &bytes, &dtype, &mut HashMap::new(), 0).unwrap();
+        assert_eq!(v, Value::Int(65536));
+    }
+
+    #[test]
+    fn test_decode_signed_int_3bytes_le_negative() {
+        // 3-byte LE signed int: 0xFF_FF_FF = -1
+        let bytes = [0xFF_u8, 0xFF, 0xFF];
+        let dtype = Dtype::Int {
+            size: 3,
+            signed: true,
+            order: ByteOrder::Little,
+        };
+        let v = decode_one_value(&[], &bytes, &dtype, &mut HashMap::new(), 0).unwrap();
+        assert_eq!(v, Value::Int(-1));
+    }
+
+    #[test]
+    fn test_decode_signed_int_5bytes_le() {
+        // 5-byte LE signed int: encode -100 (0xFFFF_FFFF_9C in LE)
+        let val: i64 = -100;
+        let mut bytes = [0u8; 5];
+        let full = val.to_le_bytes();
+        bytes.copy_from_slice(&full[..5]);
+        let dtype = Dtype::Int {
+            size: 5,
+            signed: true,
+            order: ByteOrder::Little,
+        };
+        let v = decode_one_value(&[], &bytes, &dtype, &mut HashMap::new(), 0).unwrap();
+        assert_eq!(v, Value::Int(-100));
+    }
+
+    #[test]
+    fn test_decode_signed_int_6bytes_be() {
+        // 6-byte BE signed int: 1 = 0x000000000001
+        let bytes = [0x00u8, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let dtype = Dtype::Int {
+            size: 6,
+            signed: true,
+            order: ByteOrder::Big,
+        };
+        let v = decode_one_value(&[], &bytes, &dtype, &mut HashMap::new(), 0).unwrap();
+        assert_eq!(v, Value::Int(1));
+    }
+
+    #[test]
+    fn test_decode_signed_int_7bytes_le_negative() {
+        // 7-byte LE signed int: -1 (all 0xFF)
+        let bytes = [0xFF_u8; 7];
+        let dtype = Dtype::Int {
+            size: 7,
+            signed: true,
+            order: ByteOrder::Little,
+        };
+        let v = decode_one_value(&[], &bytes, &dtype, &mut HashMap::new(), 0).unwrap();
+        assert_eq!(v, Value::Int(-1));
+    }
+
+    #[test]
+    fn test_decode_unsigned_int_3bytes_le() {
+        // 3-byte LE unsigned: 0x01_02_03 → 0x030201 = 197121
+        let bytes = [0x01u8, 0x02, 0x03];
+        let dtype = Dtype::Int {
+            size: 3,
+            signed: false,
+            order: ByteOrder::Little,
+        };
+        let v = decode_one_value(&[], &bytes, &dtype, &mut HashMap::new(), 0).unwrap();
+        assert_eq!(v, Value::Uint(0x03_02_01));
+    }
+
+    #[test]
+    fn test_decode_unsigned_int_5bytes_le() {
+        // 5-byte LE unsigned: 0x01_00_00_00_00 = 4294967296
+        let bytes = [0x00u8, 0x00, 0x00, 0x00, 0x01];
+        let dtype = Dtype::Int {
+            size: 5,
+            signed: false,
+            order: ByteOrder::Little,
+        };
+        let v = decode_one_value(&[], &bytes, &dtype, &mut HashMap::new(), 0).unwrap();
+        assert_eq!(v, Value::Uint(4_294_967_296));
+    }
+
+    #[test]
+    fn test_decode_bitfield_3bytes_le() {
+        // 3-byte LE bitfield: 0x01_02_03 → 0x030201
+        let bytes = [0x01u8, 0x02, 0x03];
+        let dtype = Dtype::Bitfield {
+            size: 3,
+            order: ByteOrder::Little,
+        };
+        let v = decode_one_value(&[], &bytes, &dtype, &mut HashMap::new(), 0).unwrap();
+        assert_eq!(v, Value::Bitfield(0x03_02_01));
+    }
+
+    #[test]
+    fn test_decode_bitfield_6bytes_be() {
+        // 6-byte BE bitfield
+        let bytes = [0x00u8, 0x00, 0x00, 0x00, 0x00, 0xFF];
+        let dtype = Dtype::Bitfield {
+            size: 6,
+            order: ByteOrder::Big,
+        };
+        let v = decode_one_value(&[], &bytes, &dtype, &mut HashMap::new(), 0).unwrap();
+        assert_eq!(v, Value::Bitfield(0xFF));
+    }
+
+    // ------------------------------------------------------------------
+    // Slice 3b: vlen-of-vlen
+
+    #[test]
+    fn test_decode_vlen_of_vlen() {
+        // Build inner GCOL: obj 1 = 2 i32 values (LE): [10, 20]
+        let mut inner_data = Vec::new();
+        inner_data.extend_from_slice(&10i32.to_le_bytes());
+        inner_data.extend_from_slice(&20i32.to_le_bytes());
+        let inner_gcol = build_gcol_for_test(&[(1, &inner_data)]);
+
+        // Build outer GCOL at a different offset.
+        // The outer sequence's heap object at index 1 contains one 16-byte vlen ref
+        // pointing into inner_gcol (at offset 0).
+        let mut outer_heap_obj = [0u8; 16];
+        outer_heap_obj[0..4].copy_from_slice(&2u32.to_le_bytes()); // seq_len = 2
+        outer_heap_obj[4..6].copy_from_slice(&1u16.to_le_bytes()); // obj_idx = 1
+                                                                   // heap address = 0 (inner_gcol is placed at offset 0 in file_data)
+
+        // file_data = inner_gcol (at 0) followed by outer_gcol (which we build separately)
+        let inner_len = inner_gcol.len();
+        let outer_gcol = build_gcol_for_test(&[(1, &outer_heap_obj)]);
+
+        let mut file_data = inner_gcol.clone();
+        file_data.extend_from_slice(&outer_gcol);
+
+        // Outer vlen ref: seq_len=1, obj_idx=1, heap_addr = inner_len (outer_gcol start)
+        let mut outer_ref = [0u8; 16];
+        outer_ref[0..4].copy_from_slice(&1u32.to_le_bytes()); // 1 outer element
+        outer_ref[4..6].copy_from_slice(&1u16.to_le_bytes()); // obj_idx=1 in outer_gcol
+        outer_ref[8..16].copy_from_slice(&(inner_len as u64).to_le_bytes()); // outer_gcol addr
+
+        // base_dtype = VarLen<i32> — the outer sequence contains vlen-of-i32 elements
+        let base_dtype = Dtype::VarLen {
+            base: Box::new(Dtype::Int {
+                size: 4,
+                signed: true,
+                order: ByteOrder::Little,
+            }),
+        };
+        let result = decode_vlen_sequences(&file_data, &outer_ref, 1, &base_dtype).unwrap();
+        assert_eq!(result.len(), 1, "expected 1 outer element");
+        // The single outer element is itself a Sequence (the VarLen<i32> decoded from the inner heap).
+        // Since base_dtype is VarLen, each outer element decodes as Value::Sequence.
+        if let Value::Sequence(outer_seq) = &result[0] {
+            // The outer_seq has one element (seq_len=1 in outer_heap_obj), which is
+            // itself a Sequence of 2 i32s.
+            assert_eq!(outer_seq.len(), 1, "expected 1 nested vlen element");
+            if let Value::Sequence(inner) = &outer_seq[0] {
+                assert_eq!(inner.len(), 2, "expected 2 i32 values in inner sequence");
+                assert_eq!(inner[0], Value::Int(10));
+                assert_eq!(inner[1], Value::Int(20));
+            } else {
+                panic!("expected inner Sequence, got {:?}", outer_seq[0]);
+            }
+        } else {
+            panic!("expected Value::Sequence, got {:?}", result[0]);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Slice 3b: compound with vlen field
+
+    #[test]
+    fn test_decode_compound_with_vlen_field() {
+        // Compound: {id: i32 at offset 0, tags: vlen<string> at offset 4}
+        // The vlen field occupies 16 bytes on disk.
+        let gcol = build_gcol_for_test(&[(1, b"hello")]);
+
+        let mut elem = [0u8; 20]; // 4 (i32) + 16 (vlen ref)
+        elem[0..4].copy_from_slice(&42i32.to_le_bytes()); // id = 42
+                                                          // vlen ref for "hello": seq_len=1, obj_idx=1, heap_addr=0
+        elem[4..8].copy_from_slice(&1u32.to_le_bytes()); // seq_len
+        elem[8..10].copy_from_slice(&1u16.to_le_bytes()); // obj_idx
+                                                          // elem[12..20] heap addr = 0 (all zeros)
+
+        let fields = vec![
+            CompoundField {
+                name: "id".into(),
+                offset: 0,
+                dtype: Dtype::Int {
+                    size: 4,
+                    signed: true,
+                    order: ByteOrder::Little,
+                },
+            },
+            CompoundField {
+                name: "tags".into(),
+                offset: 4,
+                dtype: Dtype::String {
+                    fixed_len: None,
+                    charset: Charset::Utf8,
+                },
+            },
+        ];
+
+        let result =
+            decode_compound_element(&gcol, &elem, &fields, &mut HashMap::new(), 0).unwrap();
+        if let Value::Compound(pairs) = result {
+            assert_eq!(pairs[0].1, Value::Int(42));
+            assert_eq!(pairs[1].1, Value::Str("hello".into()));
+        } else {
+            panic!("expected Compound");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Slice 8a: region reference decode
+
+    #[test]
+    fn test_decode_region_ref_points() {
+        // Build a GCOL at offset 0 with one object (index 1): the selection bytes
+        // Selection: type=1 (point), ndim=2, 1 point at (3, 7)
+        let mut sel = [0u8; 40];
+        sel[0] = 1; // version
+                    // sel[1] = 0
+        sel[2..4].copy_from_slice(&1u16.to_le_bytes()); // type = point list
+                                                        // sel[4..8] unused
+        sel[8..12].copy_from_slice(&2u32.to_le_bytes()); // ndim = 2
+                                                         // sel[12..16] unused
+                                                         // payload starts at offset 16
+        sel[16..20].copy_from_slice(&1u32.to_le_bytes()); // n_points = 1
+        sel[20..28].copy_from_slice(&3u64.to_le_bytes()); // point[0][0] = 3
+        sel[28..36].copy_from_slice(&7u64.to_le_bytes()); // point[0][1] = 7
+
+        let gcol = build_gcol_for_test(&[(1, &sel)]);
+
+        // 12-byte region reference: dataset_addr=0x1234, heap_offset pointing to gcol at 0
+        let mut ref_bytes = [0u8; 12];
+        ref_bytes[0..8].copy_from_slice(&0x1234u64.to_le_bytes()); // dataset addr
+        ref_bytes[8..12].copy_from_slice(&0u32.to_le_bytes()); // heap at offset 0
+
+        let dtype = Dtype::Reference {
+            ref_type: RefType::Region,
+        };
+        let v = decode_one_value(&gcol, &ref_bytes, &dtype, &mut HashMap::new(), 0).unwrap();
+
+        if let Value::RegionRef {
+            dataset_addr,
+            selection: RegionSelection::Points(pts),
+        } = v
+        {
+            assert_eq!(dataset_addr, 0x1234);
+            assert_eq!(pts.len(), 1);
+            assert_eq!(pts[0], vec![3u64, 7u64]);
+        } else {
+            panic!("expected RegionRef with Points, got {:?}", v);
+        }
+    }
+
+    #[test]
+    fn test_decode_region_ref_hyperslab() {
+        // Build GCOL with hyperslab selection: type=2, ndim=1, 1 block: start=5, count=10
+        let mut sel = [0u8; 40];
+        sel[0] = 1; // version
+        sel[2..4].copy_from_slice(&2u16.to_le_bytes()); // type = hyperslab
+        sel[8..12].copy_from_slice(&1u32.to_le_bytes()); // ndim = 1
+                                                         // payload at offset 16
+        sel[16..20].copy_from_slice(&1u32.to_le_bytes()); // n_blocks = 1
+        sel[20..28].copy_from_slice(&5u64.to_le_bytes()); // start[0] = 5
+        sel[28..36].copy_from_slice(&10u64.to_le_bytes()); // count[0] = 10
+
+        let gcol = build_gcol_for_test(&[(1, &sel)]);
+
+        let mut ref_bytes = [0u8; 12];
+        ref_bytes[0..8].copy_from_slice(&0xABCD_u64.to_le_bytes());
+        // heap offset = 0
+
+        let dtype = Dtype::Reference {
+            ref_type: RefType::Region,
+        };
+        let v = decode_one_value(&gcol, &ref_bytes, &dtype, &mut HashMap::new(), 0).unwrap();
+
+        if let Value::RegionRef {
+            dataset_addr,
+            selection: RegionSelection::Hyperslab(slabs),
+        } = v
+        {
+            assert_eq!(dataset_addr, 0xABCD);
+            assert_eq!(slabs.len(), 1);
+            assert_eq!(slabs[0], (5u64, 10u64));
+        } else {
+            panic!("expected RegionRef with Hyperslab, got {:?}", v);
+        }
     }
 }
