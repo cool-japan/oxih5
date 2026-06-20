@@ -9,6 +9,7 @@ rust-version.workspace = true
 description = "Pure-Rust NetCDF-4 conventions reader atop OxiH5 (no libnetcdf/libhdf5 FFI)"
 categories = ["parser-implementations", "science"]
 keywords = ["netcdf", "netcdf4", "pure-rust", "cooljapan"]
+readme = "README.md"
 
 [features]
 default = []

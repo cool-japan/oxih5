@@ -9,6 +9,7 @@ rust-version.workspace = true
 description = "OxiH5 — Pure-Rust HDF5 reader (no libhdf5 FFI)"
 categories = ["parser-implementations", "science"]
 keywords = ["hdf5", "h5", "pure-rust", "cooljapan", "oxih5"]
+readme = "README.md"
 
 [features]
 default = []

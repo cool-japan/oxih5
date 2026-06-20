@@ -11,10 +11,10 @@ The headline type is [`Dataset`], a fully-decoded N-dimensional array (raw bytes
 
 ```toml
 [dependencies]
-oxih5-core = "0.1.0"
+oxih5-core = "0.1.3"
 
 # Optional: enable the ndarray bridge (Dataset::to_array_f32 / _f64 / _i32)
-oxih5-core = { version = "0.1.0", features = ["ndarray"] }
+oxih5-core = { version = "0.1.3", features = ["ndarray"] }
 ```
 
 ## Quick Start

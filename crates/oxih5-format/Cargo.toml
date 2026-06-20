@@ -9,6 +9,7 @@ rust-version.workspace = true
 description = "Low-level HDF5 binary format parsers for OxiH5"
 categories = ["parser-implementations", "science"]
 keywords = ["hdf5", "h5", "parser", "cooljapan", "oxih5"]
+readme = "README.md"
 
 [features]
 default = []

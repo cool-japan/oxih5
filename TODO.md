@@ -1,8 +1,8 @@
 # OxiH5 Project TODO
 
-## Status — 0.1.2 (Released 2026-06-10)
+## Status — 0.1.3 (Released 2026-06-19)
 
-Functional read/write HDF5 library (~11.7 k SLOC Rust, 459 tests, all pass).
+Functional read/write HDF5 library (~20.4 k SLOC Rust, 459 tests, all pass).
 Supports superblock v0/v2/v3, object header v1/v2 (+continuation), B-tree
 v1/v2, local heap, SNOD, fractal heap (FRHP+FHDB+FHIB), extensible/fixed array
 chunk indices, all 11 datatype classes, dataspace v1/v2, attributes (0x000C

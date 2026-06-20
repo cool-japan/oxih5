@@ -7,6 +7,16 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.3] - 2026-06-19
+
+### Changed
+
+- Workspace version bumped from 0.1.2 to 0.1.3; internal workspace dependency
+  references for `oxih5-core`, `oxih5-format`, `oxih5`, and `oxinetcdf` updated
+  accordingly. No public API changes.
+
+---
+
 ## [0.1.2] - 2026-06-10
 
 ### Added
@@ -221,6 +231,7 @@ message.rs          — decode all standard message types
 
 ---
 
+[0.1.3]: https://github.com/cool-japan/oxih5/releases/tag/v0.1.3
 [0.1.2]: https://github.com/cool-japan/oxih5/releases/tag/v0.1.2
 [0.1.1]: https://github.com/cool-japan/oxih5/releases/tag/v0.1.1
 [0.1.0]: https://github.com/cool-japan/oxih5/releases/tag/v0.1.0
