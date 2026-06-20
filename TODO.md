@@ -1,6 +1,6 @@
 # OxiH5 Project TODO
 
-## Status — 0.1.3 (Released 2026-06-19)
+## Status — 0.1.4 (Unreleased)
 
 Functional read/write HDF5 library (~20.4 k SLOC Rust, 459 tests, all pass).
 Supports superblock v0/v2/v3, object header v1/v2 (+continuation), B-tree
