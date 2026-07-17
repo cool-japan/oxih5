@@ -354,7 +354,13 @@ pub fn read_chunked(
             .par_iter()
             .map(|rec| -> Result<(Vec<u64>, Vec<u8>), OxiH5Error> {
                 let raw = read_chunk_bytes(file_data, rec)?;
-                let data = apply_filters_to_chunk(raw, rec.filter_mask, Some(pipeline), elem_size)?;
+                let data = apply_filters_to_chunk(
+                    raw,
+                    rec.filter_mask,
+                    Some(pipeline),
+                    elem_size,
+                    Some(real_chunk_dims.iter().product::<u64>() as usize * elem_size),
+                )?;
                 Ok((rec.offsets.clone(), data))
             })
             .collect::<Result<Vec<_>, OxiH5Error>>()?;
@@ -386,7 +392,13 @@ pub fn read_chunked(
             if pipeline.filters.is_empty() {
                 Ok(raw.to_vec())
             } else {
-                filters::apply_pipeline(raw, pipeline, mask, elem_size)
+                filters::apply_pipeline_sized(
+                    raw,
+                    pipeline,
+                    mask,
+                    elem_size,
+                    Some(real_chunk_dims.iter().product::<u64>() as usize * elem_size),
+                )
             }
         },
     )
@@ -562,6 +574,14 @@ pub fn read_chunked_slice(
             }
         }
 
+        // Reject a zero chunk dimension before dividing by it below (see the
+        // non-parallel `assemble_chunks_slice` path for the same guard).
+        if let Some(d) = real_chunk_dims.iter().position(|&c| c == 0) {
+            return Err(OxiH5Error::Format(format!(
+                "read_chunked_slice: chunk dimension {d} is zero"
+            )));
+        }
+
         // Enumerate the chunk-grid cells that overlap the requested ranges.
         let first_ci: Vec<u64> = (0..ndims)
             .map(|d| ranges[d].start / real_chunk_dims[d])
@@ -594,8 +614,13 @@ pub fn read_chunked_slice(
                     let rec_idx = *chunk_map.get(&origin).expect("origin in map");
                     let rec = &chunks_arc[rec_idx];
                     let raw = read_chunk_bytes(file_data, rec)?;
-                    let data =
-                        apply_filters_to_chunk(raw, rec.filter_mask, Some(pipeline), elem_size)?;
+                    let data = apply_filters_to_chunk(
+                        raw,
+                        rec.filter_mask,
+                        Some(pipeline),
+                        elem_size,
+                        Some(real_chunk_dims.iter().product::<u64>() as usize * elem_size),
+                    )?;
                     Ok((offsets, data))
                 },
             )
@@ -645,7 +670,13 @@ pub fn read_chunked_slice(
             if pipeline.filters.is_empty() {
                 Ok(raw.to_vec())
             } else {
-                filters::apply_pipeline(raw, pipeline, mask, elem_size)
+                filters::apply_pipeline_sized(
+                    raw,
+                    pipeline,
+                    mask,
+                    elem_size,
+                    Some(real_chunk_dims.iter().product::<u64>() as usize * elem_size),
+                )
             }
         },
     )
@@ -793,6 +824,16 @@ fn assemble_chunks_slice(
     // Row-major strides for a single chunk (in elements).
     let chunk_strides = row_major_strides(chunk_dims);
     let chunk_volume: u64 = chunk_dims.iter().product();
+
+    // Reject a zero chunk dimension before dividing by it below: a
+    // crafted/corrupted layout message could claim a zero-sized chunk
+    // dimension, which would otherwise panic with a divide-by-zero when
+    // computing the overlapping chunk-grid cell range.
+    if let Some(d) = chunk_dims.iter().position(|&c| c == 0) {
+        return Err(OxiH5Error::Format(format!(
+            "assemble_chunks_slice: chunk dimension {d} is zero"
+        )));
+    }
 
     // For dimension d, the range of chunk indices that overlap `ranges[d]` is:
     //   first_ci[d] = ranges[d].start / chunk_dims[d]
@@ -945,9 +986,12 @@ pub(crate) fn apply_filters_to_chunk(
     filter_mask: u32,
     pipeline: Option<&FilterPipeline>,
     elem_size: usize,
+    expected_out_len: Option<usize>,
 ) -> Result<Vec<u8>, OxiH5Error> {
     match pipeline {
-        Some(p) if !p.filters.is_empty() => filters::apply_pipeline(raw, p, filter_mask, elem_size),
+        Some(p) if !p.filters.is_empty() => {
+            filters::apply_pipeline_sized(raw, p, filter_mask, elem_size, expected_out_len)
+        }
         _ => Ok(raw.to_vec()),
     }
 }
@@ -1372,6 +1416,32 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    /// Regression test: a zero chunk dimension must be rejected with a typed
+    /// error instead of panicking with a divide-by-zero when computing the
+    /// overlapping chunk-grid cell range.
+    #[test]
+    fn test_chunked_slice_zero_chunk_dim_errors() {
+        let file = vec![0u8; 64];
+        let r: std::ops::Range<u64> = 1..3;
+        let ranges = [r];
+        let result = assemble_chunks_slice(
+            &[],
+            &file,
+            &[0], // zero chunk dimension: must be rejected, not divided by
+            &[8],
+            &ranges,
+            SliceElemConfig {
+                elem_size: 1,
+                fill_value: None,
+            },
+            no_filter,
+        );
+        assert!(
+            result.is_err(),
+            "zero chunk dimension must return an error, not panic"
+        );
+    }
+
     #[test]
     fn test_row_major_strides_3d() {
         // Shape [2, 3, 4]: strides should be [12, 4, 1].
@@ -1498,7 +1568,7 @@ mod tests {
     #[test]
     fn test_apply_filters_to_chunk_no_pipeline() {
         let raw = vec![1u8, 2, 3, 4];
-        let result = apply_filters_to_chunk(&raw, 0, None, 1)
+        let result = apply_filters_to_chunk(&raw, 0, None, 1, None)
             .expect("apply_filters_to_chunk with no pipeline failed");
         assert_eq!(result, raw);
     }
@@ -1509,7 +1579,7 @@ mod tests {
         use oxih5_core::FilterPipeline;
         let raw = vec![10u8, 20, 30];
         let pipeline = FilterPipeline { filters: vec![] };
-        let result = apply_filters_to_chunk(&raw, 0, Some(&pipeline), 1)
+        let result = apply_filters_to_chunk(&raw, 0, Some(&pipeline), 1, None)
             .expect("apply_filters_to_chunk with empty pipeline failed");
         assert_eq!(result, raw);
     }
@@ -1634,7 +1704,7 @@ mod tests {
             .par_iter()
             .map(|rec| -> Result<(Vec<u64>, Vec<u8>), OxiH5Error> {
                 let raw = read_chunk_bytes(&file, rec)?;
-                let data = apply_filters_to_chunk(raw, rec.filter_mask, None, elem_size)?;
+                let data = apply_filters_to_chunk(raw, rec.filter_mask, None, elem_size, None)?;
                 Ok((rec.offsets.clone(), data))
             })
             .collect::<Result<Vec<_>, OxiH5Error>>()

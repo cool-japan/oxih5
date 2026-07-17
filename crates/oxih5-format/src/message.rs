@@ -221,10 +221,13 @@ pub enum LayoutInfo {
     ///
     /// The mapping entries are stored in the Global Heap.
     VirtualDataset {
-        /// Address of the global heap collection storing VDS mapping.
+        /// Address of the global heap collection storing the VDS mapping block.
         heap_address: u64,
-        /// Number of VDS mapping entries stored in the global heap.
-        entry_count: u32,
+        /// Global-heap *object index* (within the collection at `heap_address`)
+        /// of the serialized VDS mapping block.  This is the `idx` half of the
+        /// HDF5 global-heap ID (`H5HG_t`), **not** an entry count — the number
+        /// of mapping entries is stored inside the heap block itself.
+        heap_index: u32,
     },
 }
 
@@ -471,10 +474,10 @@ pub fn parse_layout(body: &[u8]) -> Result<LayoutInfo, OxiH5Error> {
                 )));
             }
             let heap_address = read_u64_le(body, 2)?;
-            let entry_count = read_u32_le(body, 10)?;
+            let heap_index = read_u32_le(body, 10)?;
             Ok(LayoutInfo::VirtualDataset {
                 heap_address,
-                entry_count,
+                heap_index,
             })
         }
 

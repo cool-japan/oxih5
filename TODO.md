@@ -1,13 +1,14 @@
 # OxiH5 Project TODO
 
-## Status — 0.1.3 (Released 2026-06-19)
+## Status — 0.1.4 (Unreleased)
 
-Functional read/write HDF5 library (~20.4 k SLOC Rust, 459 tests, all pass).
+Functional read/write HDF5 library (~21.7 k SLOC Rust, 479 tests with
+`--all-features` / 458 with default features, all pass).
 Supports superblock v0/v2/v3, object header v1/v2 (+continuation), B-tree
 v1/v2, local heap, SNOD, fractal heap (FRHP+FHDB+FHIB), extensible/fixed array
 chunk indices, all 11 datatype classes, dataspace v1/v2, attributes (0x000C
 v1/v2/v3), filter pipeline (deflate/shuffle/fletcher32/nbit/scaleoffset), fill
-value, global heap, and **contiguous + compact + chunked** layouts.  New-style
+value, global heap, and **contiguous + compact + chunked + virtual** layouts.  New-style
 groups (libver='latest'): Link Info (0x0002), Link messages (0x0006), fractal
 heap traversal for large groups (>8 links), B-tree v2 type-5 name index.
 Verified against real h5py fixtures including superblock v3, 20-dataset large
@@ -211,3 +212,22 @@ groups, 2-D partial-edge chunks.  Write support via `FileWriter`.
 - [ ] Publish oxih5-core → oxih5-format → oxih5 → oxinetcdf to crates.io
   - **BLOCKED: requires explicit cargo publish approval from User per COOLJAPAN policy**
 - Publish order: oxih5-core → oxih5-format → oxih5 → oxinetcdf
+
+
+---
+
+<!-- production-readiness-backlog 2026-07-16 -->
+## Production-Readiness Backlog — 2026-07-16
+
+_Consolidated from static audit + Opus adversarial bug-hunt (48 verified defects across noffi) + baseline nextest/clippy + design investigation. See `../NOFFI_PRODUCTION_BACKLOG.md` for the full cross-project list and severity/model legend. Confirmed bugs and H1–H4 shipped in 0.1.4 (see checkboxes below); H5/H6 remain open._
+
+**Confirmed bugs — Opus-verified:**
+- [x] **S · high** `oxih5-format/src/fa_index.rs:221` — fixed-array "Number of Elements" u64 header used directly as `Vec` capacity → capacity-overflow panic / huge alloc pre-validation. R2/N0 (done 0.1.4: bounded to 16Mi elements (`FA_MAX_ELEMENTS = 1 << 24`) and cross-checked against bytes remaining in the file before use as `Vec::with_capacity`; `test_fa_oversized_element_count_rejected`.)
+- [x] **S · high** `oxih5-format/src/chunked.rs:567` — hyperslab/sliced chunk read divides range by per-dim chunk size without zero-check → divide-by-zero panic on crafted file. R2/N0 (done 0.1.4: zero chunk-dim now returns `OxiH5Error::Format` instead of panicking; `test_chunked_slice_zero_chunk_dim_errors`.)
+**Designed / audit gaps:**
+- [x] **B/easy · H1** workspace.dependencies 0.1.3→0.1.4 drift. (done 0.1.4: all four internal crates pinned to `version = "0.1.4"` in root `Cargo.toml` workspace.dependencies.)
+- [x] **A/hard/Opus · H2** virtual dataset layout. (done 0.1.4: new `oxih5-format/src/vds.rs`, 728 lines — `VdsMapping`/`VdsEntry`/`VdsSelection`, `parse_vds_mapping`/`parse_vds_block`, `selection_element_offsets`; 9 unit tests + 4 integration tests in `tests/vds_tests.rs`.)
+- [x] **A/hard/Opus · H3** variable-length elements in chunked/hyperslab. (done 0.1.4: new `on_disk_elem_footprint` helper accounts for the 16-byte vlen global-heap-reference footprint; incompatible filters now explicitly rejected; `crates/oxih5/tests/vlen_chunked_tests.rs`.)
+- [x] **A/med/Opus · H4** szip RAW mode + FractalHeap I/O filters + soft→external link. (done 0.1.4: public `apply_pipeline_sized` in `filters.rs` for RAW-mode szip; fractal-heap I/O-Filters-Encoded-Length field now read at the correct offset/width; `soft_link_through_external_link` integration test in `crates/oxih5/tests/vds_tests.rs`.)
+- [ ] **B/med · H5** write-path unwrap reduction (232 non-test, up from 225) + panic!17 triage (overlaps confirmed bugs).
+- [ ] **B/easy · H6** preventive split lib.rs(1934, was 1948)/chunked.rs(1800, was 1730); examples/doctests. Both still under the 2000-line policy threshold — lib.rs actually shrank slightly (links.rs extracted per CHANGELOG) but remains the closer of the two to the cap; chunked.rs grew from the H3 vlen work above.

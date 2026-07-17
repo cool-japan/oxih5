@@ -7,6 +7,37 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.4] - 2026-07-17
+
+### Added
+
+- **Virtual Dataset (VDS) reading**: datasets with HDF5 layout class 3 ("virtual") now resolve end-to-end instead of always failing with `NotImplemented`. New `oxih5_format::vds` module — `VdsMapping` / `VdsEntry` / `VdsSelection` (`None`/`All`/`Hyperslab`), `parse_vds_mapping` / `parse_vds_block` (decodes the global-heap mapping block: version 0 and version-1 filename-deduplicated encodings, hyperslab selection versions 1 and 3), `selection_element_offsets`. `oxih5::File` opens each source dataset referenced by a mapping (same file, or an external file resolved relative to the containing file's directory) and scatters the selected regions into the virtual dataset's buffer. 9 new unit tests in `vds.rs` plus 4 new integration tests in `tests/vds_tests.rs`.
+- **Chunked variable-length dataset reads**: chunked datasets of `Dtype::VarLen` or variable-length string elements can now be read in full and via `dataset_slice`/hyperslab selections; every chunked vlen dataset previously failed with "variable-length element size not supported". A new `on_disk_elem_footprint` helper accounts for the fixed 16-byte global-heap-reference footprint of vlen elements, and filters that are meaningless on vlen data (shuffle, fletcher32, nbit, scaleoffset) are now explicitly rejected. 2 new integration tests in `tests/vlen_chunked_tests.rs`, including a hyperslab selection that straddles a chunk boundary.
+- **`File::dataset_vlen_sequences(path)`**: new public method decoding a variable-length *sequence* dataset (datatype class 9) into `Vec<oxih5_format::values::Value>`; works for both contiguous and chunked layouts.
+- **szip RAW-mode chunk decoding**: new public `oxih5_format::filters::apply_pipeline_sized` accepts the caller's known decoded chunk size, letting the szip filter (id 4) decode "RAW" streams that carry no HDF5 framing header — previously RAW-mode szip chunks always failed with `UnsupportedFilter`; `apply_pipeline` is now a thin length-agnostic wrapper around it. New `szip` Cargo feature on the `oxih5` crate (`szip = ["oxih5-format/szip"]`) exposes this at the top level. 2 new unit tests.
+- **Fractal-heap I/O-filtered root direct blocks**: fractal heaps whose root direct block is stored filtered on disk (e.g. deflate/shuffle) can now be decoded. The heap header's I/O-Filters-Encoded-Length field is now read at its correct offset and width (previously read as the wrong single byte, so a filtered root block was never detected and any I/O-filtered heap was rejected outright); indirect-block roots with filters remain `NotImplemented`. New roundtrip test `test_io_filter_root_block_roundtrip`.
+- **Soft link → external link chains**: a soft link whose target is itself an external link (e.g. `/soft` → `/ext` → `other.h5:/payload`) now resolves through `File::dataset` instead of failing with `NotImplemented`. Covered by the new `soft_link_through_external_link` integration test.
+- Expanded top-level `oxih5` crate documentation with two runnable doctests (write/read round-trip; hyperslab slice read).
+- 20 new tests this release; all 486 tests pass (`cargo test --workspace --all-features`).
+
+### Changed
+
+- **`oxih5_format::message::LayoutInfo::VirtualDataset`** (breaking): the `entry_count: u32` field is renamed to `heap_index: u32` and reinterpreted as the global-heap *object index* of the serialized VDS mapping block — the old field never actually held an entry count (the count lives inside the heap block itself), which is why VDS layouts could not be resolved before this release. Code matching this enum variant must update the field name.
+- `oxiarc-deflate` updated from `0.3.3` to `0.3.6`; `oxiarc-szip` updated from `0.3.3` to `0.3.6` (workspace dependencies).
+- Link-resolution helpers (soft-link and external-link navigation) extracted from `oxih5/src/lib.rs` into a new internal `links.rs` module to keep individual source files under the project's 2000-line limit; no behavior change beyond the new soft→external resolution above.
+
+### Fixed
+
+- **On-disk vlen (global-heap) reference layout**: `oxih5_format::values::parse_vlen_ref` decoded the 16-byte vlen reference with the wrong byte layout (object index read as `u16` from bytes 4–6, heap address from bytes 8–16, bytes 6–8 treated as reserved padding). The correct HDF5 encoding (matching libhdf5/h5py) is `length(4) + heap_address(8) + object_index(4)`; the bug silently misdecoded vlen string/sequence data in real HDF5 files whenever the referenced global-heap collection had a nonzero address — existing unit tests only ever exercised heap address 0, which masked it. The writer's counterpart (`write_vlen_ref` in `oxih5/src/write/mod.rs`) is corrected to match, so files written by `FileWriter` are now byte-layout-compatible with other HDF5 implementations; `GlobalHeapWriter`'s module docs updated accordingly.
+- `FileWriter::write_dataset_f32/f64/i32/i64/u8` now validate that the supplied data length matches `shape.iter().product() × element_size`, returning `OxiH5Error::Format` on mismatch instead of risking a corrupt on-disk file or a later out-of-bounds panic during `build()`. New test `test_write_shape_data_mismatch_rejected`.
+
+### Security
+
+- A crafted/corrupted chunked-dataset layout claiming a zero chunk dimension no longer panics with a divide-by-zero when computing overlapping chunk-grid cells; `read_chunked_slice` and `assemble_chunks_slice` now return a typed `OxiH5Error::Format` instead. New regression test `test_chunked_slice_zero_chunk_dim_errors`.
+- A crafted/corrupted Fixed Array header claiming an implausible "Number of Elements" count (e.g. `u64::MAX`) is now rejected — bounded to 16Mi (`1 << 24`) elements and cross-checked against the bytes actually remaining in the file — before being used as a `Vec::with_capacity` argument, which would otherwise panic (capacity overflow) or attempt a huge allocation. New test `test_fa_oversized_element_count_rejected`.
+
+---
+
 ## [0.1.3] - 2026-06-19
 
 ### Changed
@@ -231,6 +262,7 @@ message.rs          — decode all standard message types
 
 ---
 
+[0.1.4]: https://github.com/cool-japan/oxih5/releases/tag/v0.1.4
 [0.1.3]: https://github.com/cool-japan/oxih5/releases/tag/v0.1.3
 [0.1.2]: https://github.com/cool-japan/oxih5/releases/tag/v0.1.2
 [0.1.1]: https://github.com/cool-japan/oxih5/releases/tag/v0.1.1

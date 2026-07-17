@@ -234,6 +234,32 @@ fn test_write_slash_in_name_rejected() {
 }
 
 // ---------------------------------------------------------------------------
+// Validation — data length must match declared shape (H5 write-path robustness).
+// A mismatch must return a typed error, not silently corrupt the file or panic.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_write_shape_data_mismatch_rejected() {
+    let mut writer = FileWriter::new();
+    // 2 data elements but shape declares 5.
+    let too_few = writer.write_dataset_f64("bad", &[1.0, 2.0], &[5]);
+    assert!(
+        too_few.is_err(),
+        "data shorter than shape should be rejected"
+    );
+
+    // 6 data elements but shape declares [2, 2] = 4.
+    let too_many = writer.write_dataset_i32("bad2", &[1, 2, 3, 4, 5, 6], &[2, 2]);
+    assert!(
+        too_many.is_err(),
+        "data longer than shape should be rejected"
+    );
+
+    // Matching length still succeeds.
+    let ok = writer.write_dataset_f64("good", &[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+    assert!(ok.is_ok(), "matching data/shape should be accepted");
+}
+
+// ---------------------------------------------------------------------------
 // Test 12: validation — duplicate name
 // ---------------------------------------------------------------------------
 #[test]

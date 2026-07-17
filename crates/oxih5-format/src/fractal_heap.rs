@@ -1,4 +1,16 @@
-use oxih5_core::OxiH5Error;
+use oxih5_core::{FilterPipeline, OxiH5Error};
+
+/// Optional I/O-filter descriptor for a fractal heap whose *root direct block*
+/// is stored filtered (e.g. deflate-compressed) on disk.
+#[derive(Debug, Clone)]
+struct FhIoFilter {
+    /// On-disk (compressed) size of the filtered root direct block, in bytes.
+    filtered_root_size: u64,
+    /// I/O filter mask indicating which filters were skipped for the root block.
+    filter_mask: u32,
+    /// The filter pipeline to invert when reading the root direct block.
+    pipeline: FilterPipeline,
+}
 
 // ---------------------------------------------------------------------------
 // Fractal Heap reader
@@ -49,6 +61,8 @@ pub struct FractalHeap<'a> {
     /// The FHDB and FHIB "Block Offset" field is encoded as this many bytes
     /// (empirically: soo, not `ceil(max_heap_size_bits/8)`).
     size_of_offsets: u8,
+    /// Present when the root direct block is stored filtered (I/O filters).
+    io_filter: Option<FhIoFilter>,
 }
 
 impl<'a> FractalHeap<'a> {
@@ -107,15 +121,10 @@ impl<'a> FractalHeap<'a> {
             .get(base + 5)
             .ok_or_else(|| OxiH5Error::Format("FractalHeap: missing heap_id_len".into()))?;
 
-        // Byte 6: I/O filters encoded length
-        let io_filter_len = *d
-            .get(base + 6)
-            .ok_or_else(|| OxiH5Error::Format("FractalHeap: missing io_filter_len".into()))?;
-        if io_filter_len != 0 {
-            return Err(OxiH5Error::NotImplemented(
-                "FractalHeap: I/O filters on the heap are not yet supported".into(),
-            ));
-        }
+        // Bytes 7–8: I/O Filters' Encoded Length (u16 LE).  When non-zero, an
+        // optional filter block follows "Current # Rows" (parsed below).  For the
+        // common unfiltered case this is 0 and the heap is read directly.
+        let io_filter_len = read_u16(d, base + 7)? as usize;
 
         // Byte 7: flags (we read but don't act on them yet)
         let _flags = *d
@@ -164,6 +173,33 @@ impl<'a> FractalHeap<'a> {
         let root_block_address = read_u64(d, base + 132)?;
         let current_rows = read_u16(d, base + 140)?;
 
+        // Optional I/O-filter block: present only when io_filter_len > 0.  It
+        // sits immediately after "Current # Rows" (base + 142) and before the
+        // 4-byte header checksum, so it does NOT shift any of the fixed offsets
+        // read above.
+        //   base+142 .. +150 : Size of Filtered Root Direct Block (Length, sol=8)
+        //   base+150 .. +154 : I/O Filter Mask (u32)
+        //   base+154 .. +154+io_filter_len : Filter Pipeline message
+        let io_filter = if io_filter_len > 0 {
+            let filtered_root_size = read_u64(d, base + 142)?;
+            let filter_mask = read_u32(d, base + 150)?;
+            let pipe_start = base + 154;
+            let pipe_end = pipe_start.checked_add(io_filter_len).ok_or_else(|| {
+                OxiH5Error::Format("FractalHeap: filter pipeline length overflow".into())
+            })?;
+            let pipe_bytes = d.get(pipe_start..pipe_end).ok_or_else(|| {
+                OxiH5Error::Format("FractalHeap: truncated I/O filter pipeline".into())
+            })?;
+            let pipeline = crate::message::parse_filter_pipeline(pipe_bytes)?;
+            Some(FhIoFilter {
+                filtered_root_size,
+                filter_mask,
+                pipeline,
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             file_data,
             header_address,
@@ -177,6 +213,7 @@ impl<'a> FractalHeap<'a> {
             root_indirect_rows,
             current_rows,
             size_of_offsets,
+            io_filter,
         })
     }
 
@@ -271,10 +308,22 @@ impl<'a> FractalHeap<'a> {
         let num_direct_rows = self.num_direct_rows();
 
         if self.current_rows == 0 || self.current_rows <= num_direct_rows {
-            // Root is a single direct block.
+            // Root is a single direct block.  When the heap declares I/O filters,
+            // that root direct block is stored filtered (e.g. deflate) on disk.
+            if let Some(filt) = &self.io_filter {
+                return self.read_from_filtered_root_block(filt, heap_offset, object_size);
+            }
             self.read_from_direct_block(self.root_block_address, heap_offset, object_size)
         } else {
-            // Root is an indirect block.
+            // Root is an indirect block.  Filtered indirect heaps store a
+            // per-block filtered size in each indirect-block entry, which is not
+            // yet decoded.
+            if self.io_filter.is_some() {
+                return Err(OxiH5Error::NotImplemented(
+                    "FractalHeap: I/O filters with an indirect root block are not yet supported"
+                        .into(),
+                ));
+            }
             self.read_from_indirect_block(
                 self.root_block_address,
                 self.current_rows,
@@ -282,6 +331,65 @@ impl<'a> FractalHeap<'a> {
                 object_size,
             )
         }
+    }
+
+    /// Read an object from the *filtered* root direct block.
+    ///
+    /// The on-disk block at `root_block_address` is compressed to
+    /// `filt.filtered_root_size` bytes; inverting the filter pipeline yields the
+    /// full direct block (which begins with the "FHDB" signature), and the
+    /// object is then taken at `heap_offset` within that decompressed buffer.
+    fn read_from_filtered_root_block(
+        &self,
+        filt: &FhIoFilter,
+        heap_offset: u64,
+        object_size: usize,
+    ) -> Result<Vec<u8>, OxiH5Error> {
+        let base = usize::try_from(self.root_block_address).map_err(|_| {
+            OxiH5Error::Corrupted("FractalHeap: root block address out of range".into())
+        })?;
+        let fsize = usize::try_from(filt.filtered_root_size).map_err(|_| {
+            OxiH5Error::Corrupted("FractalHeap: filtered root size out of range".into())
+        })?;
+        let end = base.checked_add(fsize).ok_or_else(|| {
+            OxiH5Error::Format("FractalHeap: filtered block range overflow".into())
+        })?;
+        let compressed = self.file_data.get(base..end).ok_or_else(|| {
+            OxiH5Error::Format("FractalHeap: filtered root direct block out of bounds".into())
+        })?;
+
+        // The decoded direct block has the (unfiltered) root block size.
+        let expected = usize::try_from(self.starting_block_size).map_err(|_| {
+            OxiH5Error::Corrupted("FractalHeap: starting block size out of range".into())
+        })?;
+        let block = crate::filters::apply_pipeline_sized(
+            compressed,
+            &filt.pipeline,
+            filt.filter_mask,
+            1,
+            Some(expected),
+        )?;
+
+        if block.get(0..4) != Some(b"FHDB") {
+            return Err(OxiH5Error::Format(
+                "FractalHeap: decoded filtered root block has no FHDB signature".into(),
+            ));
+        }
+
+        let obj_start = usize::try_from(heap_offset)
+            .map_err(|_| OxiH5Error::Format("FractalHeap: heap_offset out of range".into()))?;
+        let obj_end = obj_start
+            .checked_add(object_size)
+            .ok_or_else(|| OxiH5Error::Format("FractalHeap: object size overflow".into()))?;
+        block
+            .get(obj_start..obj_end)
+            .ok_or_else(|| {
+                OxiH5Error::Format(format!(
+                    "FractalHeap: object [{obj_start}, {obj_end}) out of decoded block ({} bytes)",
+                    block.len()
+                ))
+            })
+            .map(<[u8]>::to_vec)
     }
 
     // -----------------------------------------------------------------------
@@ -577,9 +685,16 @@ mod tests {
         data[0..4].copy_from_slice(b"FRHP");
         data[4] = 0; // version
         data[5] = heap_id_len;
-        data[6] = 0; // io_filter_encoded_len
-        data[7] = 0; // flags
-        data[8..12].copy_from_slice(&max_managed_obj_size.to_le_bytes());
+        // Bytes 5–6: heap ID length (high byte 0); 7–8: I/O filters' encoded
+        // length (0 = unfiltered).  Kept explicitly zero so tests that do not
+        // exercise filters never accidentally trigger filter parsing.
+        data[6] = 0;
+        data[7] = 0;
+        data[8] = 0;
+        // `max_managed_obj_size` is retained by the reader only for debug output
+        // (dead code) and is not read back by any test, so it is not written to
+        // avoid colliding with the I/O-filter-length field above.
+        let _ = max_managed_obj_size;
         // Offsets 12..110 are other heap statistics (zeroed) + 2-byte reserved field at 108
         data[110..112].copy_from_slice(&table_width.to_le_bytes());
         data[112..120].copy_from_slice(&starting_block_size.to_le_bytes());
@@ -607,14 +722,73 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("version"));
     }
 
+    /// Forward HDF5 shuffle: group byte `j` of every `elem_size`-byte element.
+    /// (Inverse of `filters::unshuffle`, used only to build test fixtures.)
+    fn forward_shuffle(data: &[u8], elem_size: usize) -> Vec<u8> {
+        let n = data.len() / elem_size;
+        let mut out = vec![0u8; data.len()];
+        for e in 0..n {
+            for j in 0..elem_size {
+                out[j * n + e] = data[e * elem_size + j];
+            }
+        }
+        out
+    }
+
+    /// Build a version-1 filter pipeline message describing a single shuffle
+    /// filter (id 2) with `elem_size` as its client-data word.
+    fn shuffle_pipeline_msg(elem_size: u32) -> Vec<u8> {
+        let mut m = vec![0u8; 8]; // version(1)+nfilters(1)+reserved(6)
+        m[0] = 1; // version
+        m[1] = 1; // nfilters
+        m.extend_from_slice(&2u16.to_le_bytes()); // filter id = shuffle
+        m.extend_from_slice(&0u16.to_le_bytes()); // name_len
+        m.extend_from_slice(&0u16.to_le_bytes()); // flags
+        m.extend_from_slice(&1u16.to_le_bytes()); // ndata = 1
+        m.extend_from_slice(&elem_size.to_le_bytes()); // client_data[0]
+        m.extend_from_slice(&0u32.to_le_bytes()); // pad to 8-byte boundary (odd ndata)
+        m
+    }
+
     #[test]
-    fn test_io_filter_rejected() {
-        let mut data = vec![0u8; 256];
-        data[0..4].copy_from_slice(b"FRHP");
-        data[4] = 0;
-        data[6] = 1; // io_filter_len != 0
-        let result = FractalHeap::parse(&data, 0, 8);
-        assert!(result.is_err());
+    fn test_io_filter_root_block_roundtrip() {
+        // Build a 32-byte FHDB direct block with an 8-byte object, then store it
+        // shuffle-"filtered" on disk and confirm the heap decodes it back.
+        let block_size = 32usize;
+        let heap_offset_of_obj = 21u64; // first byte past the 21-byte FHDB header
+
+        let mut fhdb = vec![0u8; block_size];
+        fhdb[0..4].copy_from_slice(b"FHDB");
+        fhdb[4] = 0; // version
+                     // heap_header_addr (5..13) = 0, block_offset (13..21) = 0
+        let obj_pos = heap_offset_of_obj as usize;
+        fhdb[obj_pos..obj_pos + 8].copy_from_slice(b"FILTERED");
+
+        // Filter the block on disk with a forward shuffle (elem_size = 2).
+        let filtered = forward_shuffle(&fhdb, 2);
+        assert_eq!(filtered.len(), block_size);
+
+        // Header: starting_block_size = 32 (the decoded block size),
+        // root_block_address = 256, current_rows = 0 (direct root),
+        // max_managed = 0 so the io_filter_len byte at base+8 stays 0.
+        let mut file = make_minimal_frhp(7, 0, 4, block_size as u64, 65536, 8, 0, 256, 0);
+        file.resize(1024, 0);
+
+        // I/O filter block.
+        let pipe = shuffle_pipeline_msg(2);
+        file[7] = pipe.len() as u8; // io_filter_len (low byte); high byte at [8] = 0
+        file[142..150].copy_from_slice(&(filtered.len() as u64).to_le_bytes()); // filtered size
+        file[150..154].copy_from_slice(&0u32.to_le_bytes()); // filter mask
+        file[154..154 + pipe.len()].copy_from_slice(&pipe);
+
+        // Place the filtered (shuffled) block at address 256.
+        file[256..256 + filtered.len()].copy_from_slice(&filtered);
+
+        let heap = FractalHeap::parse(&file, 0, 8).expect("parse filtered heap");
+        let obj = heap
+            .read_object(heap_offset_of_obj, 8)
+            .expect("read object through filter");
+        assert_eq!(&obj, b"FILTERED");
     }
 
     #[test]

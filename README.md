@@ -9,10 +9,10 @@ provides a minimal write path for flat contiguous datasets.
 
 ---
 
-## Release: 0.1.3 (2026-06-19)
+## Release: 0.1.4 (2026-07-17)
 
-459 unit + integration tests; all pass.  Full workspace
-(~20.4 k SLOC of Rust across four crates).
+479 unit + integration tests (`--all-features`; 458 with default features);
+all pass.  Full workspace (~21.7 k SLOC of Rust across four crates).
 
 ---
 
@@ -59,7 +59,7 @@ message.rs          — decode all standard message types
 
 ---
 
-## What Works (v0.1.3)
+## What Works (v0.1.4)
 
 ### Superblock
 
@@ -81,6 +81,8 @@ message.rs          — decode all standard message types
 - Contiguous
 - Compact (inline data)
 - Chunked: B-tree v1, B-tree v2, extensible array, fixed array indices
+- Virtual (VDS): layout class 3 — resolves source-dataset mappings (same-file
+  or external, `None`/`All`/`Hyperslab` selections) into the virtual buffer
 
 ### Filters (chunked)
 
@@ -89,7 +91,7 @@ message.rs          — decode all standard message types
 | Deflate / gzip | 1 | DONE (via `oxiarc-deflate`) |
 | Shuffle | 2 | DONE |
 | Fletcher32 | 3 | DONE |
-| SZIP / AEC | 4 | DONE (via `oxiarc-szip`, `szip` feature) |
+| SZIP / AEC | 4 | DONE (via `oxiarc-szip`, `szip` feature; RAW-mode chunks via `apply_pipeline_sized`) |
 | Nbit | 5 | DONE (integer bit-packing) |
 | Scaleoffset | 6 | DONE (integer precision reduction) |
 
@@ -112,6 +114,13 @@ message.rs          — decode all standard message types
 
 - Message type 0x000C, versions 1, 2, and 3
 - All datatype classes supported in attribute data
+
+### Variable-length data
+
+Chunked vlen and vlen-string datasets now read in full and via hyperslab
+slicing (previously unsupported for chunked layouts).
+`File::dataset_vlen_sequences(path)` decodes vlen *sequence* datasets
+(datatype class 9) for both contiguous and chunked layouts.
 
 ### ndarray bridge
 
@@ -202,6 +211,7 @@ FileWriter::new("output.h5")?
 | M5 | DONE | Write support (FileWriter), full datatype coverage, nbit/scaleoffset filters |
 | M6 | DONE | NetCDF-4 read conventions (oxinetcdf), hyperslab, AttrView, vlen/compound decode |
 | M7 | DONE (0.1.2) | NcFileWriter, unlimited dims, sub-groups, GlobalHeap writer, CF conventions, fill masks, deep group hierarchy |
+| M8 | DONE (0.1.4) | Virtual dataset (VDS) reads, chunked vlen/vlen-string reads, szip RAW-mode decoding, filtered fractal-heap root blocks, soft→external link chains |
 
 ---
 
@@ -229,7 +239,8 @@ cargo +nightly fuzz run fuzz_file_open
 - DEFLATE via `oxiarc-deflate` (COOLJAPAN policy; never flate2/miniz/zlib-ng).
 - SZIP via `oxiarc-szip` (feature-gated; COOLJAPAN policy).
 - HDF5 FFI crates banned workspace-wide via `deny.toml`.
-- No `unwrap()` in production code paths.
+- Working toward zero `unwrap()` in production code paths (232 non-test call
+  sites remain as of 2026-07-17; tracked in TODO.md).
 
 ---
 

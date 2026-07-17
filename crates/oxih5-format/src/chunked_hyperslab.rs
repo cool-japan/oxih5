@@ -200,8 +200,13 @@ pub fn read_chunked_hyperslab(
                 |(origin, rec_idx)| -> Result<(Vec<u64>, Vec<u8>), OxiH5Error> {
                     let rec = &chunks_arc[rec_idx];
                     let raw = read_chunk_bytes(file_data, rec)?;
-                    let data =
-                        apply_filters_to_chunk(raw, rec.filter_mask, Some(pipeline), elem_size)?;
+                    let data = apply_filters_to_chunk(
+                        raw,
+                        rec.filter_mask,
+                        Some(pipeline),
+                        elem_size,
+                        Some(real_chunk_dims.iter().product::<u64>() as usize * elem_size),
+                    )?;
                     Ok((origin, data))
                 },
             )
@@ -254,7 +259,13 @@ pub fn read_chunked_hyperslab(
                 if pipeline.filters.is_empty() {
                     raw.to_vec()
                 } else {
-                    apply_filters_to_chunk(raw, rec.filter_mask, Some(pipeline), elem_size)?
+                    apply_filters_to_chunk(
+                        raw,
+                        rec.filter_mask,
+                        Some(pipeline),
+                        elem_size,
+                        Some(real_chunk_dims.iter().product::<u64>() as usize * elem_size),
+                    )?
                 }
             } else {
                 make_sparse_fill(chunk_volume as usize)

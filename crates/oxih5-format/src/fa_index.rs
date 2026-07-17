@@ -200,6 +200,21 @@ fn parse_fixed_array_inner(
     // -----------------------------------------------------------------------
     let client_id = file_data[db + 5];
 
+    // Validate the element count against a sane bound and against the data
+    // actually remaining in the file *before* reserving capacity for it.  A
+    // crafted/corrupted file can claim an enormous "Number of Elements"
+    // value in the FA header; using it directly as a `Vec::with_capacity`
+    // argument would otherwise cause a capacity-overflow panic (or an
+    // unbounded allocation attempt) before a single element is read.
+    const FA_MAX_ELEMENTS: usize = 1 << 24; // 16Mi elements is already far beyond any realistic fixed array.
+    let remaining = file_data.len().saturating_sub(elem_start);
+    let max_possible_elements = remaining.checked_div(element_size).unwrap_or(0);
+    if n > FA_MAX_ELEMENTS || n > max_possible_elements {
+        return Err(OxiH5Error::Format(format!(
+            "FA: implausible element count {n} (element_size={element_size}, remaining data={remaining} bytes)"
+        )));
+    }
+
     // Pre-compute grid strides for deriving per-chunk N-dim offsets from flat
     // index `i`.  strides[d] = product(grid_dims[d+1..]).
     let grid_dims: Vec<u64> = if !chunk_dims.is_empty() && ndims == chunk_dims.len() {
@@ -528,5 +543,34 @@ mod tests {
         let records = parse_fixed_array(&buf, 0, 2).expect("parse failed");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].offsets, vec![4u64, 8u64]);
+    }
+
+    /// Regression test: an implausibly large "Number of Elements" header
+    /// value (far exceeding both the sane bound and what the (small) file
+    /// buffer could possibly hold) must be rejected with a typed error
+    /// instead of being used directly as a `Vec::with_capacity` argument,
+    /// which would otherwise panic (capacity overflow) or attempt a huge
+    /// allocation.
+    #[test]
+    fn test_fa_oversized_element_count_rejected() {
+        let element_size: u8 = 8;
+        let db_addr: u64 = 64;
+
+        // Small buffer: the data block only has room for a handful of
+        // 8-byte elements, yet the header claims u64::MAX elements.
+        let mut buf = vec![0u8; 128];
+        write_fa_header(&mut buf, 0, element_size, u64::MAX, db_addr);
+
+        let db = db_addr as usize;
+        buf[db..db + 4].copy_from_slice(b"FADB");
+        buf[db + 4] = 0; // version
+        buf[db + 5] = 0; // client_id = 0 (unfiltered)
+        buf[db + 6..db + 14].copy_from_slice(&0u64.to_le_bytes());
+
+        let result = parse_fixed_array(&buf, 0, 1);
+        assert!(
+            result.is_err(),
+            "an implausible element count must be rejected, not used as a Vec capacity"
+        );
     }
 }

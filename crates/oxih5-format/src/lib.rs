@@ -22,6 +22,7 @@ pub mod message;
 pub mod snod;
 pub mod superblock;
 pub mod values;
+pub mod vds;
 
 pub use chunked::ChunkIndexCache;
 pub use chunked_hyperslab::{gather_hyperslab_contiguous, read_chunked_hyperslab};

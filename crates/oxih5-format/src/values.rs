@@ -5,25 +5,16 @@
 //! - Object references (8-byte on-disk addresses → target address)
 //! - Compound-type element decoding (recursively dispatched through `decode_one_value`)
 //!
-//! # On-disk vlen reference layout (HDF5 spec, §III.B.2)
+//! # On-disk vlen reference layout (HDF5 spec, `H5T__vlen_disk_*`)
 //! Each vlen element stored in the dataset/attribute data is a 16-byte global-heap
-//! reference:
+//! reference (with the usual 8-byte offset size):
 //! ```text
 //!  0   4   sequence length (number of elements, u32 LE)
-//!  4   4   reserved / padding (u32 LE)
-//!  8   8   global heap collection address (absolute, u64 LE)
+//!  4   8   global heap collection address (absolute, u64 LE, size_of_offsets)
+//! 12   4   heap object index (u32 LE)
 //! ```
-//! (The object index into the collection is stored as the low 16 bits of a u32 at
-//! offset 4; some implementations use slightly different encodings but the "length +
-//! collection address + object index" triple is universal.)
-//!
-//! The on-disk layout actually used by libhdf5 is:
-//! ```text
-//!  0   4   sequence length (u32 LE)
-//!  4   2   object index (u16 LE)
-//!  6   2   reserved (u16 LE)
-//!  8   8   heap collection address (u64 LE)
-//! ```
+//! This matches the encoding written by libhdf5 / h5py and by this crate's
+//! writer (`write_vlen_ref`).
 //!
 //! # Object references
 //! An object reference is a single u64 (LE) equal to the absolute byte offset of the
@@ -97,12 +88,11 @@ pub enum RegionSelection {
 
 /// Parse a 16-byte on-disk vlen reference into (length, heap_address, object_index).
 ///
-/// Layout:
+/// Layout (standard HDF5 `H5T__vlen_disk_*`, with 8-byte offsets):
 /// ```text
 ///  0   4   sequence length  (u32 LE)
-///  4   2   object index     (u16 LE)
-///  6   2   reserved         (u16 LE, ignored)
-///  8   8   heap address     (u64 LE)
+///  4   8   heap collection address (u64 LE, size_of_offsets)
+/// 12   4   object index     (u32 LE)
 /// ```
 pub fn parse_vlen_ref(bytes: &[u8]) -> Result<(u32, u64, u16), OxiH5Error> {
     if bytes.len() < 16 {
@@ -116,16 +106,19 @@ pub fn parse_vlen_ref(bytes: &[u8]) -> Result<(u32, u64, u16), OxiH5Error> {
             .try_into()
             .map_err(|_| OxiH5Error::Format("vlen ref: length bytes".into()))?,
     );
-    let obj_idx = u16::from_le_bytes(
-        bytes[4..6]
-            .try_into()
-            .map_err(|_| OxiH5Error::Format("vlen ref: index bytes".into()))?,
-    );
     let heap_addr = u64::from_le_bytes(
-        bytes[8..16]
+        bytes[4..12]
             .try_into()
             .map_err(|_| OxiH5Error::Format("vlen ref: heap address bytes".into()))?,
     );
+    let obj_idx_u32 = u32::from_le_bytes(
+        bytes[12..16]
+            .try_into()
+            .map_err(|_| OxiH5Error::Format("vlen ref: index bytes".into()))?,
+    );
+    let obj_idx = u16::try_from(obj_idx_u32).map_err(|_| {
+        OxiH5Error::Format(format!("vlen ref: object index {obj_idx_u32} too large"))
+    })?;
     Ok((seq_len, heap_addr, obj_idx))
 }
 
@@ -997,10 +990,10 @@ mod tests {
         let mut ref_bytes = [0u8; 16];
         // length = 3
         ref_bytes[0..4].copy_from_slice(&3u32.to_le_bytes());
-        // object index = 7
-        ref_bytes[4..6].copy_from_slice(&7u16.to_le_bytes());
         // heap address = 0x1000
-        ref_bytes[8..16].copy_from_slice(&0x1000u64.to_le_bytes());
+        ref_bytes[4..12].copy_from_slice(&0x1000u64.to_le_bytes());
+        // object index = 7
+        ref_bytes[12..16].copy_from_slice(&7u32.to_le_bytes());
 
         let (len, addr, idx) = parse_vlen_ref(&ref_bytes).unwrap();
         assert_eq!(len, 3);
@@ -1024,8 +1017,8 @@ mod tests {
         // Build the vlen-ref buffer: one 16-byte ref pointing to obj 1
         let mut refs = [0u8; 16];
         refs[0..4].copy_from_slice(&1u32.to_le_bytes()); // seq_len = 1 (ignored for strings; we use heap data directly)
-        refs[4..6].copy_from_slice(&1u16.to_le_bytes()); // obj_idx = 1
-        refs[8..16].copy_from_slice(&0u64.to_le_bytes()); // heap at offset 0
+                                                         // refs[4..12] = 0 (heap addr 0)
+        refs[12..16].copy_from_slice(&1u32.to_le_bytes()); // obj_idx = 1
 
         let strings = decode_vlen_strings(&gcol, &refs, 1).unwrap();
         assert_eq!(strings, vec!["hello".to_string()]);
@@ -1050,12 +1043,12 @@ mod tests {
         let mut refs = [0u8; 32];
         // ref 0: obj 1 at offset 0
         refs[0..4].copy_from_slice(&1u32.to_le_bytes());
-        refs[4..6].copy_from_slice(&1u16.to_le_bytes());
-        // refs[8..16] = 0 (heap addr 0)
+        // refs[4..12] = 0 (heap addr 0)
+        refs[12..16].copy_from_slice(&1u32.to_le_bytes());
         // ref 1: obj 2 at offset 0
         refs[16..20].copy_from_slice(&1u32.to_le_bytes());
-        refs[20..22].copy_from_slice(&2u16.to_le_bytes());
-        // refs[24..32] = 0
+        // refs[20..28] = 0 (heap addr 0)
+        refs[28..32].copy_from_slice(&2u32.to_le_bytes());
 
         let strings = decode_vlen_strings(&gcol, &refs, 2).unwrap();
         assert_eq!(strings[0], "alpha");
@@ -1386,8 +1379,8 @@ mod tests {
         // pointing into inner_gcol (at offset 0).
         let mut outer_heap_obj = [0u8; 16];
         outer_heap_obj[0..4].copy_from_slice(&2u32.to_le_bytes()); // seq_len = 2
-        outer_heap_obj[4..6].copy_from_slice(&1u16.to_le_bytes()); // obj_idx = 1
                                                                    // heap address = 0 (inner_gcol is placed at offset 0 in file_data)
+        outer_heap_obj[12..16].copy_from_slice(&1u32.to_le_bytes()); // obj_idx = 1
 
         // file_data = inner_gcol (at 0) followed by outer_gcol (which we build separately)
         let inner_len = inner_gcol.len();
@@ -1399,8 +1392,8 @@ mod tests {
         // Outer vlen ref: seq_len=1, obj_idx=1, heap_addr = inner_len (outer_gcol start)
         let mut outer_ref = [0u8; 16];
         outer_ref[0..4].copy_from_slice(&1u32.to_le_bytes()); // 1 outer element
-        outer_ref[4..6].copy_from_slice(&1u16.to_le_bytes()); // obj_idx=1 in outer_gcol
-        outer_ref[8..16].copy_from_slice(&(inner_len as u64).to_le_bytes()); // outer_gcol addr
+        outer_ref[4..12].copy_from_slice(&(inner_len as u64).to_le_bytes()); // outer_gcol addr
+        outer_ref[12..16].copy_from_slice(&1u32.to_le_bytes()); // obj_idx=1 in outer_gcol
 
         // base_dtype = VarLen<i32> — the outer sequence contains vlen-of-i32 elements
         let base_dtype = Dtype::VarLen {
@@ -1443,8 +1436,8 @@ mod tests {
         elem[0..4].copy_from_slice(&42i32.to_le_bytes()); // id = 42
                                                           // vlen ref for "hello": seq_len=1, obj_idx=1, heap_addr=0
         elem[4..8].copy_from_slice(&1u32.to_le_bytes()); // seq_len
-        elem[8..10].copy_from_slice(&1u16.to_le_bytes()); // obj_idx
-                                                          // elem[12..20] heap addr = 0 (all zeros)
+                                                         // elem[8..16] heap addr = 0 (all zeros)
+        elem[16..20].copy_from_slice(&1u32.to_le_bytes()); // obj_idx
 
         let fields = vec![
             CompoundField {

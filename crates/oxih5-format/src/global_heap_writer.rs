@@ -31,10 +31,9 @@
 //! Each string is stored with a NUL terminator (added by [`GlobalHeapWriter::write_string`]).
 //! The on-disk vlen reference pointing to a heap object has the layout:
 //! ```text
-//! [0–3]:  seq_len (u32 LE) = string_len + 1  (includes NUL)
-//! [4–5]:  obj_idx (u16 LE) = 1-based GCOL index
-//! [6–7]:  reserved         = 0
-//! [8–15]: heap_addr (u64 LE) = absolute address of the GCOL in the file
+//! [0–3]:   seq_len (u32 LE) = string_len + 1  (includes NUL)
+//! [4–11]:  heap_addr (u64 LE) = absolute address of the GCOL in the file
+//! [12–15]: obj_idx (u32 LE) = 1-based GCOL index
 //! ```
 
 /// HDF5 Global Heap Collection writer.

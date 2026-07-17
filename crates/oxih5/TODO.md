@@ -1,7 +1,7 @@
 # oxih5 TODO (facade)
 
 ## Status
-Full read-only facade with hierarchical group navigation. `Arc<Vec<u8>>` shared data, `File::group(path)` / `File::root()` / `Group::datasets()` / `Group::groups()` / `Group::attrs()` / `Group::dataset()`, `Dataset::attrs()` / `Dataset::attr(name)`, `File::info()`, `Debug for File`, `version()`. ~450 SLOC production code.
+Full read/write facade with hierarchical group navigation, a `FileWriter` builder (flat datasets, single-level sub-groups, vlen-string and unlimited-dimension datasets, attributes), and Virtual Dataset (VDS) resolution. `Arc<Vec<u8>>` shared data, `File::group(path)` / `File::root()` / `Group::datasets()` / `Group::groups()` / `Group::attrs()` / `Group::dataset()`, `Dataset::attrs()` / `Dataset::attr(name)`, `File::info()`, `Debug for File`, `version()`. ~3,820 SLOC production code (tokei) across `lib.rs`, `links.rs`, `attr_view.rs`, and `write/*`. 144 unit/integration tests + 3 doctests passing (`--all-features`; 142 unit/integration tests with default features), 0 failures, 0 clippy/rustdoc warnings — 2026-07-17.
 
 ## Core Implementation
 - [x] Implement hierarchical path navigation: `file.dataset("/group1/subgroup/data")` traversing nested groups
@@ -24,6 +24,18 @@ Full read-only facade with hierarchical group navigation. `Arc<Vec<u8>>` shared 
 - [x] Implement write support: `FileWriter` — flat HDF5 file creation, superblock v0 + old-style group + contiguous layout, ≤8 datasets, 5 element types (f32/f64/i32/i64/u8), h5py-verified (done 2026-05-25)
 - [x] Implement `Dataset::to_ndarray<T>()` behind `ndarray` feature returning `ArrayD<T>` (done 2026-05-25)
   - **Result:** Added `ndarray = ["oxih5-core/ndarray"]` feature to crates/oxih5/Cargo.toml; no new lib.rs code needed — Dataset re-export gains to_array_f32/f64/i32() from oxih5-core when feature enabled — 2026-05-25
+- [x] Implement Virtual Dataset (VDS, layout class 3) reading end-to-end instead of returning `NotImplemented`
+  - **Done:** `read_virtual_dataset` in the new `src/links.rs` resolves each VDS mapping entry (same file, or an external file resolved relative to the containing file's directory), reads the selected source region and scatters it into the virtual dataset's buffer. Fixed-size element types only (a vlen-typed VDS still returns `OxiH5Error::NotImplemented`); unmapped regions read as zero (non-zero fill values not yet applied). Covered by `tests/vds_tests.rs` (`vds_simple_full_mapping`, `vds_concat_two_sources`, `vds_main_fixture`) and the rewritten `read_contig.rs::test_vds_resolves_source` (formerly `test_vds_returns_not_implemented`) — 2026-07-17
+- [x] Add `File::dataset_vlen_sequences(path)` decoding a variable-length *sequence* dataset (datatype class 9) into `Vec<oxih5_format::values::Value>`
+  - **Done:** works for both contiguous and chunked layouts by delegating to `oxih5_format::values::decode_vlen_sequences`; returns `OxiH5Error::TypeMismatch` for non-`VarLen` dtypes (vlen *strings* remain on `File::dataset_strings`) — 2026-07-17
+- [x] Resolve a soft link whose target is itself an external link (soft → external chain) when reading a dataset, instead of failing with `NotImplemented`
+  - **Done:** `resolve_soft_link_target` / `SoftTarget` in `src/links.rs`. Link-resolution helpers (soft-link and external-link navigation) were also extracted from `lib.rs` into the new `src/links.rs` (426 lines) to keep `lib.rs` under the 2000-line-per-file policy. Covered by `tests/vds_tests.rs::soft_link_through_external_link` (`/soft` → `/ext` → `other.h5:/payload`). Note: a soft link to an external-file *group* (as opposed to a dataset) still returns `NotImplemented` — only the dataset-read path was fixed — 2026-07-17
+- [x] Fix `write_vlen_ref`'s on-disk byte layout to match real HDF5 (`H5T__vlen_disk_write`): `[seq_len:4][heap_addr:8][obj_idx:4]`, not the previous (incorrect) `[seq_len:4][obj_idx:2][reserved:2][heap_addr:8]`
+  - **Done:** `src/write/mod.rs`; files written by `FileWriter` are now byte-layout-compatible with other HDF5 implementations for vlen references — 2026-07-17
+- [x] Validate that `write_dataset_f32/f64/i32/i64/u8` data length matches `shape.iter().product() × element_size`, returning `OxiH5Error::Format` on mismatch instead of risking a corrupt file or a later out-of-bounds panic
+  - **Done:** validation added to `add_dataset` in `src/write/mod.rs`; `tests/write_tests.rs::test_write_shape_data_mismatch_rejected` — 2026-07-17
+- [x] Add a `szip` feature flag forwarding to `oxih5-format/szip` for szip (compression id 4) chunk decoding, including RAW mode
+  - **Done:** `szip = ["oxih5-format/szip"]` in `crates/oxih5/Cargo.toml`; decoding itself lives in `oxih5-format` (via `oxiarc-szip`), this facade only forwards the feature — 2026-07-17
 
 ## API Improvements
 - [x] Add `File::walk(visitor)` for recursive traversal of the entire file tree
@@ -48,6 +60,14 @@ Full read-only facade with hierarchical group navigation. `Arc<Vec<u8>>` shared 
   - **Done:** read_contig.rs tests 19-24 (chunked uncompressed, gzip 1-D/2-D, gzip+shuffle 2-D, fletcher32, partial edge chunks, group-handle path) against real h5py libver='earliest' fixtures — 2026-05-25
 - [x] Test error handling: missing dataset, corrupt file, truncated file
 - [x] Test that `dataset_names()` returns correct names for files with many datasets
+- [x] Integration test: Virtual Dataset (VDS) resolution — full mapping, two-source concat, pre-existing multi-source fixture, and a soft-link-through-external-link chain
+  - **Done:** `tests/vds_tests.rs` (4 tests: `vds_simple_full_mapping`, `vds_concat_two_sources`, `vds_main_fixture`, `soft_link_through_external_link`); each skips gracefully if its h5py fixture wasn't generated — 2026-07-17
+- [x] Integration test: chunked variable-length-string dataset reads, both full and via a hyperslab selection straddling a chunk boundary
+  - **Done:** `tests/vlen_chunked_tests.rs` (2 tests) against `vlen_str_chunked.h5` (h5py, `chunks=(3,)` over a length-10 dataset) — 2026-07-17
+- [x] Integration test: `write_dataset_*` rejects a data/shape length mismatch instead of writing a corrupt file
+  - **Done:** `tests/write_tests.rs::test_write_shape_data_mismatch_rejected` — 2026-07-17
+- [x] Add runnable crate-level doctests to `src/lib.rs` (`//!` docs): a write/read round-trip and a hyperslab slice read
+  - **Done:** 2 new doctests; `cargo test --all-features` now runs 3 doctests total (incl. the pre-existing `FileWriter` struct-level example) — 2026-07-17
 
 ## Performance
 - [x] Benchmark full-file-read vs mmap for files of various sizes

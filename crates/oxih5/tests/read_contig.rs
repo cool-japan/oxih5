@@ -1102,22 +1102,20 @@ fn test_libver_latest_large_read_dataset() {
 
 // ---------------------------------------------------------------------------
 // Task A: VDS fixture test
-// Opening a VDS file and attempting to read the virtual dataset should return
-// a clear NotImplemented error, not a panic or a corrupted result.
+// Opening a VDS file resolves the virtual dataset through to its source
+// dataset(s) in the sibling source file(s).
 // ---------------------------------------------------------------------------
 #[test]
-fn test_vds_returns_not_implemented() {
+fn test_vds_resolves_source() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vds_main.h5");
     if !path.exists() {
         // VDS fixture not generated — skip gracefully
         return;
     }
     let file = oxih5::open(&path).expect("open VDS file");
-    let result = file.dataset("virtual_data");
-    assert!(
-        matches!(result, Err(oxih5::OxiH5Error::NotImplemented(_))),
-        "expected NotImplemented for VDS, got unexpected result"
-    );
+    let ds = file.dataset("virtual_data").expect("resolve VDS");
+    let values = ds.as_f32().expect("f32 values");
+    assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 }
 
 // ---------------------------------------------------------------------------

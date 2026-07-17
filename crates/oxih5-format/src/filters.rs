@@ -45,6 +45,23 @@ pub fn apply_pipeline(
     filter_mask: u32,
     elem_size: usize,
 ) -> Result<Vec<u8>, OxiH5Error> {
+    apply_pipeline_sized(raw, pipeline, filter_mask, elem_size, None)
+}
+
+/// Apply the inverse filter pipeline, additionally supplying the caller's known
+/// decoded chunk size when available.
+///
+/// The only filter that needs the expected output length is szip in RAW mode
+/// (the bitstream carries no length header, so the sample count cannot be
+/// recovered from the data alone).  All other filters ignore `expected_out_len`.
+/// [`apply_pipeline`] is the length-agnostic wrapper (`expected_out_len = None`).
+pub fn apply_pipeline_sized(
+    raw: &[u8],
+    pipeline: &FilterPipeline,
+    filter_mask: u32,
+    elem_size: usize,
+    expected_out_len: Option<usize>,
+) -> Result<Vec<u8>, OxiH5Error> {
     let mut data = raw.to_vec();
     // Reverse order: the last filter applied on write is undone first on read.
     for (idx, filter) in pipeline.filters.iter().enumerate().rev() {
@@ -52,7 +69,7 @@ pub fn apply_pipeline(
         if idx < 32 && (filter_mask >> idx) & 1 == 1 {
             continue;
         }
-        data = apply_one_inverse(&data, filter, elem_size)?;
+        data = apply_one_inverse(&data, filter, elem_size, expected_out_len)?;
     }
     Ok(data)
 }
@@ -62,6 +79,7 @@ fn apply_one_inverse(
     data: &[u8],
     filter: &FilterInfo,
     elem_size: usize,
+    expected_out_len: Option<usize>,
 ) -> Result<Vec<u8>, OxiH5Error> {
     match filter.id {
         filter_id::DEFLATE => inflate_deflate(data),
@@ -133,10 +151,11 @@ fn apply_one_inverse(
         filter_id::SZIP => {
             #[cfg(feature = "szip")]
             {
-                decode_szip(data.to_vec(), filter)
+                decode_szip(data.to_vec(), filter, expected_out_len)
             }
             #[cfg(not(feature = "szip"))]
             {
+                let _ = expected_out_len;
                 Err(OxiH5Error::UnsupportedFilter(format!(
                     "szip filter (id {}) requires the `szip` Cargo feature",
                     filter.id
@@ -160,7 +179,11 @@ fn apply_one_inverse(
 /// `filter.client_data` in the order specified by H5Zszip.c:
 ///   `[options_mask, bits_per_pixel, pixels_per_block, pixels_per_scanline]`.
 #[cfg(feature = "szip")]
-fn decode_szip(data: Vec<u8>, filter: &FilterInfo) -> Result<Vec<u8>, OxiH5Error> {
+fn decode_szip(
+    data: Vec<u8>,
+    filter: &FilterInfo,
+    expected_out_len: Option<usize>,
+) -> Result<Vec<u8>, OxiH5Error> {
     use oxiarc_szip::{decode as szip_decode, SzipParams};
 
     // HDF5 szip client_data layout (per HDF5 spec H5Zszip.c):
@@ -197,14 +220,46 @@ fn decode_szip(data: Vec<u8>, filter: &FilterInfo) -> Result<Vec<u8>, OxiH5Error
     let msb = (options_mask & SZ_MSB_MASK) != 0;
     let raw_mode = (options_mask & SZ_RAW_MASK) != 0;
 
+    if bits_per_pixel == 0 {
+        return Err(OxiH5Error::Corrupted(
+            "szip filter client_data[1] (bits_per_pixel) is 0 — cannot decode".into(),
+        ));
+    }
+    let bytes_per_sample = (bits_per_pixel as usize).div_ceil(8);
+
     // Parse the HDF5 szip framing: a leading little-endian u32 = uncompressed byte count.
     // Then the raw AEC bitstream follows.
     if raw_mode {
-        // RAW mode: no framing header; the entire `data` is the AEC bitstream.
-        // We cannot know the expected output length without additional context.
-        return Err(OxiH5Error::UnsupportedFilter(
-            "szip RAW mode (no HDF5 framing) not yet supported — dataset uses an unusual szip variant".into(),
-        ));
+        // RAW mode: no 4-byte framing header — the entire `data` is the AEC
+        // bitstream.  The uncompressed length is not stored, so we rely on the
+        // caller supplying the decoded chunk size (product(chunk_dims)*elem_size).
+        let uncompressed_bytes = expected_out_len.ok_or_else(|| {
+            OxiH5Error::UnsupportedFilter(
+                "szip RAW mode (no HDF5 framing) requires a known output length; \
+                 none was supplied by the caller"
+                    .into(),
+            )
+        })?;
+        let samples = uncompressed_bytes / bytes_per_sample;
+        let params = SzipParams {
+            bits_per_pixel,
+            pixels_per_block,
+            samples,
+            reference_sample_interval: pixels_per_scanline,
+            msb,
+            nn_preprocess,
+            rsi_byte_align: false,
+        };
+        let decoded = szip_decode(&data, &params)
+            .map_err(|e| OxiH5Error::Corrupted(format!("szip RAW decode error: {e}")))?;
+        if decoded.len() != uncompressed_bytes {
+            return Err(OxiH5Error::Corrupted(format!(
+                "szip RAW decoded {} bytes but caller expected {}",
+                decoded.len(),
+                uncompressed_bytes
+            )));
+        }
+        return Ok(decoded);
     }
 
     if data.len() < 4 {
@@ -216,13 +271,6 @@ fn decode_szip(data: Vec<u8>, filter: &FilterInfo) -> Result<Vec<u8>, OxiH5Error
     let uncompressed_bytes = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
     let aec_stream = &data[4..];
 
-    if bits_per_pixel == 0 {
-        return Err(OxiH5Error::Corrupted(
-            "szip filter client_data[1] (bits_per_pixel) is 0 — cannot decode".into(),
-        ));
-    }
-
-    let bytes_per_sample = (bits_per_pixel as usize).div_ceil(8);
     let samples = uncompressed_bytes
         .checked_div(bytes_per_sample)
         .unwrap_or(0);
@@ -993,7 +1041,7 @@ mod tests {
 
             // options_mask: SZ_MSB_MASK=0x10 not set (msb=false), SZ_NN_MASK=0x20 not set.
             let filter = make_szip_filter(0, 8, 8, 8);
-            let decoded = decode_szip(hdf5_stream, &filter).expect("decode");
+            let decoded = decode_szip(hdf5_stream, &filter, None).expect("decode");
 
             assert_eq!(decoded.len(), 64);
             assert!(
@@ -1007,13 +1055,13 @@ mod tests {
             let filter = make_szip_filter(0, 8, 8, 8);
 
             // Too short for 4-byte header.
-            let result = decode_szip(vec![0x01, 0x02], &filter);
+            let result = decode_szip(vec![0x01, 0x02], &filter, None);
             assert!(result.is_err(), "short input must return Err");
 
             // 4-byte header claims 1000 bytes but decoded length will differ.
             let mut data = 1000u32.to_le_bytes().to_vec();
             data.push(0);
-            let result = decode_szip(data, &filter);
+            let result = decode_szip(data, &filter, None);
             assert!(result.is_err(), "mismatch must return Err");
         }
 
@@ -1025,8 +1073,71 @@ mod tests {
                 flags: 0,
                 client_data: vec![0, 8], // only 2 entries, need 4
             };
-            let result = decode_szip(vec![0u8; 64], &filter);
+            let result = decode_szip(vec![0u8; 64], &filter, None);
             assert!(result.is_err(), "missing client_data must return Err");
+        }
+
+        /// RAW mode: the AEC bitstream carries no 4-byte length header, so the
+        /// decoder must be told the expected output length by the caller.
+        #[test]
+        fn szip_raw_mode_roundtrip_with_known_length() {
+            use oxiarc_szip::{encode_bytes as szip_encode_bytes, SzipParams};
+
+            // 8 bits-per-pixel data (1 byte per sample), 32 samples.
+            let original: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(3)).collect();
+            let params = SzipParams {
+                bits_per_pixel: 8,
+                pixels_per_block: 8,
+                samples: original.len(),
+                reference_sample_interval: 8,
+                msb: false,
+                nn_preprocess: false,
+                rsi_byte_align: false,
+            };
+            // RAW stream: encoder output with NO 4-byte framing header.
+            let raw_stream = szip_encode_bytes(&original, &params).expect("encode raw");
+
+            const SZ_RAW_MASK: u32 = 0x80;
+            let filter = make_szip_filter(SZ_RAW_MASK, 8, 8, 8);
+
+            // Without a known length, RAW mode cannot decode.
+            let no_len = decode_szip(raw_stream.clone(), &filter, None);
+            assert!(
+                matches!(no_len, Err(OxiH5Error::UnsupportedFilter(_))),
+                "RAW mode without expected length must return UnsupportedFilter"
+            );
+
+            // With the caller-supplied length, the round-trip succeeds.
+            let decoded = decode_szip(raw_stream, &filter, Some(original.len()))
+                .expect("RAW decode with known length");
+            assert_eq!(decoded, original);
+        }
+
+        /// End-to-end through the public pipeline entry point: `apply_pipeline_sized`
+        /// forwards the expected length to the szip RAW decoder.
+        #[test]
+        fn szip_raw_via_apply_pipeline_sized() {
+            use oxiarc_szip::{encode_bytes as szip_encode_bytes, SzipParams};
+
+            let original: Vec<u8> = (0..64u8).collect();
+            let params = SzipParams {
+                bits_per_pixel: 8,
+                pixels_per_block: 8,
+                samples: original.len(),
+                reference_sample_interval: 8,
+                msb: false,
+                nn_preprocess: false,
+                rsi_byte_align: false,
+            };
+            let raw_stream = szip_encode_bytes(&original, &params).expect("encode raw");
+
+            const SZ_RAW_MASK: u32 = 0x80;
+            let pipeline = FilterPipeline {
+                filters: vec![make_szip_filter(SZ_RAW_MASK, 8, 8, 8)],
+            };
+            let out = apply_pipeline_sized(&raw_stream, &pipeline, 0, 1, Some(original.len()))
+                .expect("pipeline szip RAW");
+            assert_eq!(out, original);
         }
     }
 }

@@ -1,7 +1,7 @@
 # oxih5-format TODO
 
 ## Status
-Functional low-level HDF5 parser: superblock v0, object header v1 with continuation, B-tree v1 group traversal, local heap, SNOD symbol table, dataspace v1, datatype (int/float classes), contiguous layout v3, symbol table message. Group listing and dataset lookup work end-to-end. ~400 SLOC production code across 7 modules.
+Mature low-level HDF5 binary-format parser (read path) with a partial writer: superblock v0/v2/v3; object headers v1 (with continuation blocks) and v2 (creation-order tracking); old-style (B-tree v1 + local heap + SNOD) and new-style (fractal heap + Link messages) group traversal; all 11 HDF5 datatype classes; every data layout (compact, contiguous, chunked, virtual/VDS); all four chunk-index varieties (B-tree v1, B-tree v2, Fixed Array, Extensible Array) plus hyperslab slicing; the full read-direction filter pipeline (deflate, shuffle, fletcher32, nbit, scale+offset, and optional szip including RAW mode); and Virtual Dataset (VDS) mapping-block parsing. Group listing and dataset lookup work end-to-end. ~10,600 SLOC production code across 24 modules (`tokei`); 233 tests pass with `--all-features` (227 with default features), 0 failed; zero clippy/rustdoc warnings; zero `todo!()`/`unimplemented!()` in source (remaining gaps return a typed `OxiH5Error::NotImplemented`). Status as of v0.1.4 — 2026-07-17.
 
 ## Core Implementation
 - [x] Implement superblock v2 parsing (different layout: file consistency flags, superblock extension, root group object header addr at different offset) (150-200 SLOC)
@@ -20,14 +20,17 @@ Functional low-level HDF5 parser: superblock v0, object header v1 with continuat
   - **Done:** ea_index.rs — header + index block inline elements + data blocks (EADB) + secondary blocks (EASB) parsed; `parse_secondary_block()` resolves EASB→EADB indirection; paged data blocks not yet implemented — 2026-05-25
 - [x] Implement fixed array index for fixed-size chunked datasets (FA header, data block, page bitmap) (150-200 SLOC)
   - **Done:** fa_index.rs (non-paged data blocks; paged data blocks not yet supported) — 2026-05-25
+  - **Hardened (0.1.4):** the FA header's "Number of Elements" field is now bounded to 16Mi (`FA_MAX_ELEMENTS = 1 << 24`) and cross-checked against the file bytes actually remaining, *before* being used as a `Vec::with_capacity` argument — a crafted/corrupted header claiming an implausible count (e.g. `u64::MAX`) previously risked a capacity-overflow panic or an unbounded allocation attempt; now rejected with a typed `OxiH5Error::Format`. Regression test `test_fa_oversized_element_count_rejected` — 2026-07-17
 - [x] Implement chunked data layout (class 2): read chunk index, assemble chunks into contiguous buffer (200-250 SLOC)
   - **Done:** chunked.rs — 2026-05-25
+  - **Hardened (0.1.4):** a zero chunk dimension (a crafted/corrupted layout message) is now rejected with a typed `OxiH5Error::Format` in both `read_chunked_slice` and `assemble_chunks_slice`, instead of panicking with a divide-by-zero when computing the chunk-grid cell for a requested range. Regression test `test_chunked_slice_zero_chunk_dim_errors` — 2026-07-17
 - [x] Implement compact data layout (class 0): inline data stored in the object header message body (30-40 SLOC)
   - **Done:** message.rs LayoutInfo::Compact variant — 2026-05-25
 - [x] Implement global heap parsing (collection + object access for VL data) (100-150 SLOC)
   - **Done:** global_heap.rs — 2026-05-25
 - [x] Implement fractal heap parsing (v2 B-tree backed heap for large groups) (300-400 SLOC)
   - **Done:** fractal_heap.rs — FRHP header + FHDB direct-block read + FHIB indirect-block traversal (managed heap IDs, multi-level traversal with depth guard); indirect block entries for direct and sub-indirect blocks — 2026-05-25
+  - **Extended (0.1.4):** the heap header's "I/O Filters' Encoded Length" field (bytes 7-8, `u16` LE) is now read at the correct offset/width — it was previously misread as a single byte, which broke parsing of any heap declaring I/O filters. When a fractal heap declares I/O filters and its root is a single *direct* block, `read_object` now decodes that block even though it is stored filtered on disk (e.g. deflate/shuffle), via `filters::apply_pipeline_sized`. Regression test `test_io_filter_root_block_roundtrip`. Indirect-block roots with filters are still `NotImplemented` ("I/O filters with an indirect root block are not yet supported") — 2026-07-17
 - [x] Implement new-style group links (link info message 0x002, link message 0x0006: hard/soft/external) (150-200 SLOC)
   - **Done:** link_msg.rs `parse_link_info()` + `parse_link()` (hard/soft/external); group.rs `list_new_style_links()` + `is_new_style_group()`; facade handles new-style root/nested groups — 2026-05-25
 - [x] Implement filter pipeline message (0x000B): parse filter IDs, flags, client data (80-100 SLOC)
@@ -40,6 +43,7 @@ Functional low-level HDF5 parser: superblock v0, object header v1 with continuat
   - **Done:** filters.rs verify_fletcher32() — 2026-05-25
 - [x] Implement szip decompression filter (if feasible in Pure Rust, else feature-gate) (200-300 SLOC)
   - **Done:** filters.rs `decode_szip()` (feature-gated: `--features szip`); wires `oxiarc-szip` AEC/CCSDS-121 decoder; parses HDF5 szip framing (4-byte LE uncompressed-byte-count header + AEC bitstream); extracts options_mask/bpp/ppb/pps from `client_data`; handles MSB/NN/RAW flags; 3 unit tests (round-trip all-zeros, malformed framing, missing client_data) — 2026-05-30
+  - **Extended (0.1.4):** new `apply_pipeline_sized(raw, pipeline, filter_mask, elem_size, expected_out_len)` accepts a caller-known decoded chunk size, which lets szip **RAW mode** (`options_mask & SZ_RAW (0x80)`, no HDF5 4-byte framing header) decode — previously always `UnsupportedFilter` because a RAW bitstream carries no embedded sample count. `apply_pipeline` is now a thin `expected_out_len = None` wrapper around `apply_pipeline_sized`. Tests: `szip_raw_mode_roundtrip_with_known_length`, `szip_raw_via_apply_pipeline_sized` — 2026-07-17
 - [x] Implement nbit filter (precision reduction) (60-80 SLOC)
   - **Done:** filters.rs `unpack_nbit()` helper + wired into `apply_one_inverse` via `client_data` descriptor (integer class only: client_data[1]==0, extracts sizeof/precision/bit_offset); compound/array/float nbit still returns UnsupportedFilter — 2026-05-25
 - [x] Implement scaleoffset filter (integer/float scaling) (80-100 SLOC)
@@ -60,10 +64,12 @@ Functional low-level HDF5 parser: superblock v0, object header v1 with continuat
   - **Done:** datatype.rs class 10 — v1+v2 — 2026-05-25
 - [x] Implement variable-length datatype parsing (global heap reference sequences) (80-100 SLOC)
   - **Done:** datatype.rs class 9 (sequence + string variants) — 2026-05-25
+  - **Fixed (0.1.4):** `values.rs::parse_vlen_ref` decoded the on-disk vlen-reference *object index* from the wrong byte range (`u16` from bytes 6..8, treating the true index bytes as reserved padding). The correct HDF5 `H5T__vlen_disk_*` layout is `length(4) + heap_address(8) + object_index(4, bytes 12..16)`. This silently misdecoded vlen string/sequence data in real HDF5 files whenever the referenced global-heap collection had a nonzero address (prior tests only ever exercised heap address 0, which happened to mask the bug). Now reads bytes 12..16 as `u32` and narrows to the heap's `u16` index. Regression test `test_parse_vlen_ref_basic` uses heap address `0x1000` / object index `7` — 2026-07-17
 - [x] Implement reference datatype parsing (object reference, region reference) (60-80 SLOC)
   - **Done:** datatype.rs class 7 — 2026-05-25
 - [x] Implement virtual dataset mapping (VDS) parsing for virtual layout (150-200 SLOC)
   - **Done:** VirtualDataset variant added to LayoutInfo; layout v4/class-3 body parsed (heap_address + data_size); NotImplemented error returned in facade; vds_main.h5 fixture + test added — 2026-05-25 (full virtual reading not yet supported)
+  - **Completed (0.1.4):** new `vds.rs` module (728 lines) fully decodes the VDS global-heap mapping block referenced by the layout message: `VdsMapping` / `VdsEntry` / `VdsSelection` (`None` / `All` / `Hyperslab`) types, `parse_vds_mapping` / `parse_vds_block` functions (version 0, and version 1 with source-filename deduplication), hyperslab-selection versions 1 and 3, and `selection_element_offsets` to enumerate the row-major element indices a selection covers. `LayoutInfo::VirtualDataset`'s second field was renamed `entry_count: u32` → `heap_index: u32` (**breaking API change**) — it is the global-heap *object index* of the serialized mapping block, not an entry count (the entry count lives inside the block itself, decoded by `parse_vds_block`). This is what lets the `oxih5` facade resolve virtual datasets end-to-end (same-file and external-file sources, fixed-size element types) instead of always erroring `NotImplemented`; VDS with variable-length elements is still `NotImplemented` at the facade level — 2026-07-17
 - [x] Implement external file link resolution (file + object path) (60-80 SLOC)
   - **Done:** oxih5/src/lib.rs `resolve_new_style_dataset()` + `resolve_external_link()` helper; `source_dir: PathBuf` added to `File` and `Group`; relative and absolute ext-file paths resolved; `parse_link()` in link_msg.rs fixed to handle libhdf5/h5py `libver='earliest'` encoding where link type 64 is stored in the charset byte; 3 integration tests added (root external link, nested group external link, local dataset still works) — 2026-05-25
 

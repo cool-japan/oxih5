@@ -3,7 +3,9 @@
 [![Crates.io](https://img.shields.io/crates/v/oxih5-format.svg)](https://crates.io/crates/oxih5-format)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-`oxih5-format` is the binary-parsing layer of **OxiH5**, the COOLJAPAN Pure-Rust HDF5 reader/writer. It turns raw HDF5 file bytes — exactly as produced by h5py / libhdf5 — into the typed data model from [`oxih5-core`]. Every standard structure of the HDF5 file format is decoded here: the superblock, object headers (v1 and v2), all standard header messages, local/global/fractal heaps, B-tree v1 and v2 nodes, the extensible- and fixed-array chunk indices, the filter pipeline, and full chunked-dataset assembly.
+**233 tests passing** (`cargo test -p oxih5-format --all-features`; 227 with default features) · zero clippy / rustdoc warnings
+
+`oxih5-format` is the binary-parsing layer of **OxiH5**, the COOLJAPAN Pure-Rust HDF5 reader/writer. It turns raw HDF5 file bytes — exactly as produced by h5py / libhdf5 — into the typed data model from [`oxih5-core`]. Every standard structure of the HDF5 file format is decoded here: the superblock, object headers (v1 and v2), all standard header messages, local/global/fractal heaps, B-tree v1 and v2 nodes, the extensible- and fixed-array chunk indices, the filter pipeline, full chunked-dataset assembly, and Virtual Dataset (VDS) mapping-block parsing.
 
 This crate sits between [`oxih5-core`] (the data model) and the [`oxih5`] facade (the file API). It is 100% Pure Rust with `#![forbid(unsafe_code)]`; DEFLATE/zlib decompression is delegated to the COOLJAPAN [`oxiarc-deflate`] crate (never flate2/miniz). It exposes a flat, function-oriented API — there is no `File` handle here; that abstraction lives in `oxih5`. Most users should depend on `oxih5` instead and reach for `oxih5-format` only when building custom HDF5 tooling.
 
@@ -11,10 +13,10 @@ This crate sits between [`oxih5-core`] (the data model) and the [`oxih5`] facade
 
 ```toml
 [dependencies]
-oxih5-format = "0.1.3"
+oxih5-format = "0.1.4"
 
 # Optional: rayon-parallel chunk assembly
-oxih5-format = { version = "0.1.3", features = ["parallel"] }
+oxih5-format = { version = "0.1.4", features = ["parallel"] }
 ```
 
 ## Quick Start
@@ -77,7 +79,7 @@ The crate re-exports [`ChunkIndexCache`] from `chunked` at the crate root; every
 | `fn parse_symbol_table` | Symbol-table message (0x0011) → `SymbolTableInfo` |
 | `fn parse_modification_time` | Object-modification-time message → `u32` |
 
-`LayoutInfo` variants: `Contiguous { data_address, data_size }`, `Compact { data }`, `Chunked { data_address, dimensionality, chunk_dims, index_type }`, `VirtualDataset { heap_address, entry_count }`.
+`LayoutInfo` variants: `Contiguous { data_address, data_size }`, `Compact { data }`, `Chunked { data_address, dimensionality, chunk_dims, index_type }`, `VirtualDataset { heap_address, heap_index }` (`heap_index` is the global-heap *object index* of the serialized VDS mapping block — see `vds` below — not an entry count).
 
 ### `datatype` — datatype class parsing
 
@@ -101,7 +103,7 @@ The crate re-exports [`ChunkIndexCache`] from `chunked` at the crate root; every
 |---------------|-------------|
 | `heap::LocalHeap` | Old-style group name storage; `parse(...)`, `name_at(offset) -> &str` |
 | `global_heap::GlobalHeap` | Variable-length / VLen data; `parse(...)`, `object(index) -> &[u8]` |
-| `fractal_heap::FractalHeap` | New-style group object storage; `parse(...)`, `parse_heap_id`, `read_object`, plus `header_address` / `heap_id_len` / `table_width` / `root_indirect_rows` / `block_size_for_row` accessors |
+| `fractal_heap::FractalHeap` | New-style group object storage; `parse(...)`, `parse_heap_id`, `read_object`, plus `header_address` / `heap_id_len` / `table_width` / `root_indirect_rows` / `block_size_for_row` accessors. Transparently decodes a *filtered* root direct block (e.g. deflate/shuffle) when the heap declares I/O filters; a filtered *indirect*-block root remains `NotImplemented` |
 
 ### B-trees, indices, and SNOD
 
@@ -128,17 +130,44 @@ The crate re-exports [`ChunkIndexCache`] from `chunked` at the crate root; every
 | `fn read_chunked(file_data, layout, pipeline, dataset_dims, elem_size, cache) -> Vec<u8>` | High-level: resolve + read + unfilter + scatter a whole chunked dataset |
 | `fn read_chunked_slice(..., ranges, cache) -> Vec<u8>` | As above, but only the requested N-dimensional sub-region |
 
+### `vds` — virtual dataset (VDS) mapping
+
+| Item | Description |
+|------|-------------|
+| `struct VdsMapping` | `entries: Vec<VdsEntry>` — every mapping entry decoded from a VDS global-heap block |
+| `struct VdsEntry` | `source_file`, `source_dataset`, `source_selection`, `virtual_selection` — one source-region → virtual-region mapping |
+| `enum VdsSelection` | `None`, `All`, `Hyperslab(Hyperslab)` — a decoded dataspace selection |
+| `fn parse_vds_mapping(file_data, heap_address, heap_index, size_of_lengths) -> VdsMapping` | Parse the mapping block stored as global-heap object `heap_index` inside the collection at `heap_address` |
+| `fn parse_vds_block(block, size_of_lengths) -> VdsMapping` | Parse a raw mapping block (version 0, and version 1 with source-filename deduplication) |
+| `fn selection_element_offsets(sel, shape) -> Vec<usize>` | Enumerate the row-major element indices a `VdsSelection` covers within a dataspace of the given `shape` |
+
+Hyperslab selections are decoded for both the classic version-1 encoding (an explicit `start`/`end` block list, folded into a regular hyperslab when the blocks form a strided grid) and the version-3 encoding (`start`/`stride`/`count`/`block` per dimension — what HDF5 ≥ 1.10 writes for VDS). Point selections and irregular multi-block/multi-dimension unions return a typed `NotImplemented` error.
+
 ### `filters` — filter pipeline (inverse / read direction)
 
 | Item | Description |
 |------|-------------|
 | `mod filter_id` | Standard filter ids: `DEFLATE=1`, `SHUFFLE=2`, `FLETCHER32=3`, `SZIP=4`, `NBIT=5`, `SCALEOFFSET=6` |
 | `fn apply_pipeline(raw, pipeline, filter_mask, elem_size) -> Vec<u8>` | Apply the inverse of every active filter in reverse order |
+| `fn apply_pipeline_sized(raw, pipeline, filter_mask, elem_size, expected_out_len) -> Vec<u8>` | As above, additionally passing the caller-known decoded chunk size. Required for szip **RAW mode** (options-mask bit `SZ_RAW`, no HDF5 framing header — the bitstream carries no length). `apply_pipeline` is a thin `expected_out_len = None` wrapper around this |
 | `fn inflate_deflate(data) -> Vec<u8>` | zlib inflate via `oxiarc-deflate` (Pure Rust) |
 | `fn unshuffle(data, elem_size) -> Vec<u8>` | Inverse byte-shuffle |
 | `fn verify_fletcher32(data) -> Vec<u8>` | Verify and strip the Fletcher-32 checksum |
 | `fn unpack_nbit(...)` | Inverse N-bit packing |
 | `fn decode_scaleoffset_int(...)` | Inverse integer scale+offset |
+
+### `values` — typed value decoding
+
+| Item | Description |
+|------|-------------|
+| `enum Value` | A decoded element: `Int`, `Uint`, `Float`, `Str`, `Opaque`, `ObjectRef`, `RegionRef`, `Sequence`, `Compound`, `Enum`, `Bitfield` |
+| `enum RegionSelection` | `Points(Vec<Vec<u64>>)` / `Hyperslab(Vec<(u64, u64)>)` — a decoded region-reference selection |
+| `fn parse_vlen_ref(bytes) -> (u32, u64, u16)` | Decode a 16-byte on-disk vlen reference → `(seq_len, heap_address, object_index)` |
+| `fn decode_vlen_strings(file_data, data, n_elems) -> Vec<String>` | Decode N contiguous vlen-string references via the global heap |
+| `fn decode_vlen_sequences(file_data, data, n_elems, base_dtype) -> Vec<Value>` | Decode N contiguous vlen-of-`base_dtype` sequence references |
+| `fn decode_object_refs(data, n_elems) -> Vec<u64>` | Decode N contiguous 8-byte object references |
+| `fn decode_compound_element` / `decode_compound` / `decode_dataset_compound` | Decode one, or N strided, compound-type element(s) field-by-field |
+| `fn decode_one_value(file_data, bytes, dtype, heap_cache, depth) -> Value` | Dispatch-decode a single value of any `Dtype`, recursing into compound / array / vlen members |
 
 ### `link_msg` — link messages
 

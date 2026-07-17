@@ -16,6 +16,8 @@ default = []
 ndarray  = ["oxih5-core/ndarray"]
 parallel = ["oxih5-format/parallel", "dep:rayon"]
 dhat-heap = ["dep:dhat"]
+# Enable szip (id 4) chunk decoding, including RAW mode. Pure Rust via oxiarc-szip.
+szip = ["oxih5-format/szip"]
 
 [dependencies]
 oxih5-core   = { workspace = true }

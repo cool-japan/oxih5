@@ -1,4 +1,49 @@
 #![deny(unsafe_code)]
+//! # OxiH5 — Pure-Rust HDF5 reader/writer (no libhdf5 FFI)
+//!
+//! Open an HDF5 file with [`open`] and read datasets by path, or build a new
+//! file with [`FileWriter`].
+//!
+//! ## Write then read a dataset
+//!
+//! ```
+//! use oxih5::FileWriter;
+//!
+//! // Write a 2×3 float64 dataset to a temporary file.
+//! let path = std::env::temp_dir().join("oxih5_doctest_readme.h5");
+//! let mut writer = FileWriter::new();
+//! writer.write_dataset_f64("matrix", &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3])?;
+//! writer.build(&path)?;
+//!
+//! // Read it back and decode the values.
+//! let file = oxih5::open(&path)?;
+//! let ds = file.dataset("matrix")?;
+//! assert_eq!(ds.shape, vec![2, 3]);
+//! assert_eq!(ds.as_f64()?, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+//!
+//! # let _ = std::fs::remove_file(&path);
+//! # Ok::<(), oxih5::OxiH5Error>(())
+//! ```
+//!
+//! ## Read a hyperslab (sub-region) of a dataset
+//!
+//! ```
+//! use oxih5::FileWriter;
+//!
+//! let path = std::env::temp_dir().join("oxih5_doctest_slice.h5");
+//! let mut writer = FileWriter::new();
+//! writer.write_dataset_i32("row", &[10, 11, 12, 13, 14], &[5])?;
+//! writer.build(&path)?;
+//!
+//! let file = oxih5::open(&path)?;
+//! // Select elements [1, 4).
+//! let ranges: Vec<std::ops::Range<usize>> = std::iter::once(1..4).collect();
+//! let slice = file.dataset_slice("row", &ranges)?;
+//! assert_eq!(slice.as_i32()?, vec![11, 12, 13]);
+//!
+//! # let _ = std::fs::remove_file(&path);
+//! # Ok::<(), oxih5::OxiH5Error>(())
+//! ```
 
 pub use oxih5_core::{Attribute, ByteOrder, Dataset, Dtype, OxiH5Error};
 pub use oxih5_format::values::Value;
@@ -9,6 +54,12 @@ pub use write::FileWriter;
 
 mod attr_view;
 pub use attr_view::AttrView;
+
+mod links;
+use links::{
+    read_virtual_dataset, resolve_external_link_group, resolve_new_style_dataset,
+    resolve_soft_link_to_header,
+};
 
 use oxih5_format::{btree, group, header, heap, message, snod, superblock, ChunkIndexCache};
 
@@ -232,6 +283,7 @@ impl File {
                 btree,
                 heap,
                 dataset_name,
+                &self.source_dir,
                 Some(&self.chunk_cache),
             )
         } else {
@@ -492,6 +544,7 @@ impl File {
                 &self.data,
                 addr,
                 &format!("@{addr:#x}"),
+                &self.source_dir,
                 Some(&self.chunk_cache),
             )?;
             Ok(ObjectKind::Dataset(ds))
@@ -604,6 +657,27 @@ impl File {
             _ => Err(OxiH5Error::TypeMismatch),
         }
     }
+
+    /// Decode a variable-length sequence dataset (datatype class 9 `VarLen`)
+    /// into one [`oxih5_format::values::Value::Sequence`] per element.
+    ///
+    /// Works for both contiguous and chunked layouts: the chunked read path
+    /// assembles the on-disk 16-byte global-heap references, which are then
+    /// dereferenced here.  Returns [`OxiH5Error::TypeMismatch`] if the dataset
+    /// is not a vlen sequence (vlen *strings* should use [`File::dataset_strings`]).
+    pub fn dataset_vlen_sequences(
+        &self,
+        path: &str,
+    ) -> Result<Vec<oxih5_format::values::Value>, OxiH5Error> {
+        let ds = self.dataset(path)?;
+        match &ds.dtype {
+            Dtype::VarLen { base } => {
+                let n_elems = ds.len();
+                oxih5_format::values::decode_vlen_sequences(&self.data, &ds.data, n_elems, base)
+            }
+            _ => Err(OxiH5Error::TypeMismatch),
+        }
+    }
 }
 
 impl std::fmt::Debug for File {
@@ -666,6 +740,7 @@ impl Group {
             self.btree_address,
             self.heap_address,
             name,
+            &self.source_dir,
             Some(&self.chunk_cache),
         )
     }
@@ -1006,208 +1081,6 @@ fn find_new_style_child(
     Err(OxiH5Error::NotFound(name.to_string()))
 }
 
-/// Resolve a soft-link target path to an object header address, starting from
-/// `current_header_addr` (the root).
-///
-/// `visited` is a cycle guard: if `target_path` is already in the set the link
-/// chain is cyclic and we return an error rather than looping infinitely.
-fn resolve_soft_link_to_header(
-    file_data: &[u8],
-    root_header_addr: u64,
-    target_path: &str,
-    visited: &mut std::collections::HashSet<String>,
-) -> Result<u64, OxiH5Error> {
-    if !visited.insert(target_path.to_string()) {
-        return Err(OxiH5Error::Format(format!(
-            "soft link cycle detected at path '{target_path}'"
-        )));
-    }
-
-    // Navigate from root, following each segment.
-    let normalized = target_path.trim_start_matches('/');
-    let parts: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
-
-    // Empty path → root itself.
-    if parts.is_empty() {
-        return Ok(root_header_addr);
-    }
-
-    let sb = superblock::parse(file_data)?;
-    let ctx = oxih5_format::context::ParseContext::new(
-        sb.size_of_offsets,
-        sb.size_of_lengths,
-        sb.base_address,
-    );
-
-    let mut current_header = root_header_addr;
-    for (idx, segment) in parts.iter().enumerate() {
-        let is_last = idx == parts.len() - 1;
-        let links = group::list_new_style_links(file_data, current_header, &ctx)?;
-        let mut found = false;
-        for pl in &links {
-            if pl.name == *segment {
-                match &pl.link {
-                    oxih5_core::Link::Hard { address } => {
-                        current_header = *address;
-                        found = true;
-                        break;
-                    }
-                    oxih5_core::Link::Soft { path } => {
-                        if is_last {
-                            // Recurse into nested soft link with cycle guard.
-                            return resolve_soft_link_to_header(
-                                file_data,
-                                root_header_addr,
-                                path,
-                                visited,
-                            );
-                        }
-                        // Mid-path soft link: resolve it then continue.
-                        let addr = resolve_soft_link_to_header(
-                            file_data,
-                            root_header_addr,
-                            path,
-                            visited,
-                        )?;
-                        current_header = addr;
-                        found = true;
-                        break;
-                    }
-                    oxih5_core::Link::External { .. } => {
-                        return Err(OxiH5Error::NotImplemented(
-                            "soft link targeting external link not supported".into(),
-                        ));
-                    }
-                }
-            }
-        }
-        if !found {
-            return Err(OxiH5Error::NotFound(format!(
-                "soft link target '{target_path}': segment '{segment}' not found"
-            )));
-        }
-    }
-
-    Ok(current_header)
-}
-
-/// Resolve a dataset name within a new-style group, handling both hard links
-/// and external file links.
-///
-/// For hard links the dataset is read from the local file at the resolved
-/// object header address.  For external links the referenced file is opened
-/// and `File::dataset` is called with the target path stored in the link.
-/// Soft links and group-type external links return `NotImplemented`.
-fn resolve_new_style_dataset(
-    file_data: &[u8],
-    parent_header_addr: u64,
-    name: &str,
-    source_dir: &std::path::Path,
-    cache: Option<&ChunkIndexCache>,
-) -> Result<Dataset, OxiH5Error> {
-    let sb = superblock::parse(file_data)?;
-    let ctx = oxih5_format::context::ParseContext::new(
-        sb.size_of_offsets,
-        sb.size_of_lengths,
-        sb.base_address,
-    );
-    let links = group::list_new_style_links(file_data, parent_header_addr, &ctx)?;
-    for parsed_link in &links {
-        if parsed_link.name == name {
-            match &parsed_link.link {
-                oxih5_core::Link::Hard { address } => {
-                    return read_dataset_from_object_header(file_data, *address, name, cache);
-                }
-                oxih5_core::Link::Soft { path } => {
-                    // Follow the soft link to its target header address, then
-                    // read the dataset from there.
-                    let sb = superblock::parse(file_data)?;
-                    let mut visited = std::collections::HashSet::new();
-                    let target_addr = resolve_soft_link_to_header(
-                        file_data,
-                        sb.root_object_header_address,
-                        path,
-                        &mut visited,
-                    )?;
-                    return read_dataset_from_object_header(file_data, target_addr, name, cache);
-                }
-                oxih5_core::Link::External {
-                    file: ext_file,
-                    path: ext_path,
-                } => {
-                    return resolve_external_link(ext_file, ext_path, source_dir);
-                }
-            }
-        }
-    }
-    Err(OxiH5Error::NotFound(name.to_string()))
-}
-
-/// Open an external HDF5 file and navigate to the dataset at `ext_path`.
-///
-/// `ext_file` is the filename from the external link (may be relative or
-/// absolute).  `source_dir` is the directory of the file that contains the
-/// link, used to resolve relative `ext_file` paths.
-fn resolve_external_link(
-    ext_file: &str,
-    ext_path: &str,
-    source_dir: &std::path::Path,
-) -> Result<Dataset, OxiH5Error> {
-    let resolved = resolve_external_path(ext_file, source_dir);
-
-    let ext = open(&resolved).map_err(|e| {
-        OxiH5Error::NotFound(format!(
-            "external link target file '{}': {e}",
-            resolved.display()
-        ))
-    })?;
-
-    // Navigate to the target path within the external file.
-    let target = ext_path.trim_start_matches('/');
-    ext.dataset(target).map_err(|e| {
-        OxiH5Error::NotFound(format!(
-            "external link {}::{ext_path}: {e}",
-            resolved.display()
-        ))
-    })
-}
-
-/// Open an external HDF5 file and navigate to the group at `ext_path`.
-///
-/// Returns the group handle from the external file.
-fn resolve_external_link_group(
-    ext_file: &str,
-    ext_path: &str,
-    source_dir: &std::path::Path,
-) -> Result<Group, OxiH5Error> {
-    let resolved = resolve_external_path(ext_file, source_dir);
-
-    let ext = open(&resolved).map_err(|e| {
-        OxiH5Error::NotFound(format!(
-            "external link target file '{}': {e}",
-            resolved.display()
-        ))
-    })?;
-
-    let target = ext_path.trim_start_matches('/');
-    ext.group(if target.is_empty() { "/" } else { target })
-        .map_err(|e| {
-            OxiH5Error::NotFound(format!(
-                "external link {}::{ext_path}: {e}",
-                resolved.display()
-            ))
-        })
-}
-
-/// Resolve an external-link filename to an absolute `PathBuf`.
-fn resolve_external_path(ext_file: &str, source_dir: &std::path::Path) -> std::path::PathBuf {
-    if std::path::Path::new(ext_file).is_absolute() {
-        std::path::PathBuf::from(ext_file)
-    } else {
-        source_dir.join(ext_file)
-    }
-}
-
 /// Lazy slice reader for `File::dataset_slice`: resolves the path, extracts
 /// messages, and for chunked layouts calls `read_chunked_slice` directly.
 fn read_dataset_slice_lazy(
@@ -1242,7 +1115,14 @@ fn read_dataset_slice_lazy(
         resolve_new_style_header_address(file_data, current_header, dataset_name, source_dir)?
     };
 
-    slice_dataset_at_header(file_data, header_addr, dataset_name, ranges, Some(cache))
+    slice_dataset_at_header(
+        file_data,
+        header_addr,
+        dataset_name,
+        ranges,
+        source_dir,
+        Some(cache),
+    )
 }
 
 /// Lazy slice reader for `Group::dataset_slice`.
@@ -1263,7 +1143,14 @@ fn read_dataset_slice_lazy_from_group(
     } else {
         group::find_dataset(file_data, btree_address, heap_address, name)?
     };
-    slice_dataset_at_header(file_data, header_addr, name, ranges, Some(cache))
+    slice_dataset_at_header(
+        file_data,
+        header_addr,
+        name,
+        ranges,
+        source_dir,
+        Some(cache),
+    )
 }
 
 /// Hyperslab reader for `File::dataset_hyperslab`.
@@ -1299,7 +1186,14 @@ fn read_dataset_hyperslab_internal(
         resolve_new_style_header_address(file_data, current_header, dataset_name, source_dir)?
     };
 
-    hyperslab_dataset_at_header(file_data, header_addr, dataset_name, selection, Some(cache))
+    hyperslab_dataset_at_header(
+        file_data,
+        header_addr,
+        dataset_name,
+        selection,
+        source_dir,
+        Some(cache),
+    )
 }
 
 /// Hyperslab reader for `Group::dataset_hyperslab`.
@@ -1320,7 +1214,14 @@ fn read_dataset_hyperslab_from_group_internal(
     } else {
         group::find_dataset(file_data, btree_address, heap_address, name)?
     };
-    hyperslab_dataset_at_header(file_data, header_addr, name, selection, Some(cache))
+    hyperslab_dataset_at_header(
+        file_data,
+        header_addr,
+        name,
+        selection,
+        source_dir,
+        Some(cache),
+    )
 }
 
 /// Parse messages at `header_addr` and perform a hyperslab read.
@@ -1333,6 +1234,7 @@ fn hyperslab_dataset_at_header(
     header_addr: u64,
     name: &str,
     selection: &Hyperslab,
+    source_dir: &std::path::Path,
     cache: Option<&ChunkIndexCache>,
 ) -> Result<Dataset, OxiH5Error> {
     let ds_messages = header::parse_messages(file_data, header_addr)?;
@@ -1378,15 +1280,18 @@ fn hyperslab_dataset_at_header(
                 .all(|(r, &dim)| r.end <= dim);
 
             if all_in_bounds {
-                let elem_size = dtp.dtype.size().ok_or_else(|| {
+                let elem_size = on_disk_elem_footprint(&dtp.dtype, 8).ok_or_else(|| {
                     OxiH5Error::NotImplemented(format!(
-                        "chunked dataset '{name}': variable-length element size not supported"
+                        "chunked dataset '{name}': element size not supported"
                     ))
                 })?;
                 let dataset_dims: Vec<u64> = dsp.dims.clone();
                 let pipeline = filter_pipeline
                     .clone()
                     .unwrap_or_else(|| oxih5_core::FilterPipeline { filters: vec![] });
+                if is_vlen_dtype(&dtp.dtype) {
+                    reject_vlen_incompatible_filters(&pipeline, name)?;
+                }
                 let out_shape: Vec<usize> = selection
                     .output_shape()
                     .iter()
@@ -1420,11 +1325,11 @@ fn hyperslab_dataset_at_header(
     }
 
     // Fallback: full read then gather via contiguous sampler.
-    let full_ds = read_dataset_from_object_header(file_data, header_addr, name, cache)?;
+    let full_ds = read_dataset_from_object_header(file_data, header_addr, name, source_dir, cache)?;
     let dataset_dims_u64: Vec<u64> = full_ds.shape.iter().map(|&s| s as u64).collect();
-    let elem_size = full_ds.dtype.size().ok_or_else(|| {
+    let elem_size = on_disk_elem_footprint(&full_ds.dtype, 8).ok_or_else(|| {
         OxiH5Error::NotImplemented(format!(
-            "dataset '{name}': variable-length element size not supported for hyperslab fallback"
+            "dataset '{name}': element size not supported for hyperslab fallback"
         ))
     })?;
 
@@ -1502,11 +1407,13 @@ fn resolve_new_style_header_address(
 ///
 /// For chunked layouts only the overlapping chunks are decompressed.
 /// For other layouts the full data is loaded and then sliced in memory.
+#[allow(clippy::too_many_arguments)]
 fn slice_dataset_at_header(
     file_data: &[u8],
     header_addr: u64,
     name: &str,
     ranges: &[std::ops::Range<usize>],
+    source_dir: &std::path::Path,
     cache: Option<&ChunkIndexCache>,
 ) -> Result<Dataset, OxiH5Error> {
     let ds_messages = header::parse_messages(file_data, header_addr)?;
@@ -1551,15 +1458,18 @@ fn slice_dataset_at_header(
                 .all(|(r, &dim)| r.end <= dim as usize);
 
             if all_in_bounds {
-                let elem_size = dtp.dtype.size().ok_or_else(|| {
+                let elem_size = on_disk_elem_footprint(&dtp.dtype, 8).ok_or_else(|| {
                     OxiH5Error::NotImplemented(format!(
-                        "chunked dataset '{name}': variable-length element size not supported"
+                        "chunked dataset '{name}': element size not supported"
                     ))
                 })?;
                 let dataset_dims: Vec<u64> = dsp.dims.clone();
                 let pipeline = filter_pipeline
                     .clone()
                     .unwrap_or_else(|| oxih5_core::FilterPipeline { filters: vec![] });
+                if is_vlen_dtype(&dtp.dtype) {
+                    reject_vlen_incompatible_filters(&pipeline, name)?;
+                }
                 let ranges_u64: Vec<std::ops::Range<u64>> = ranges
                     .iter()
                     .map(|r| r.start as u64..r.end as u64)
@@ -1593,8 +1503,62 @@ fn slice_dataset_at_header(
     }
 
     // Fallback: full read then in-memory slice.
-    let full_ds = read_dataset_from_object_header(file_data, header_addr, name, cache)?;
+    let full_ds = read_dataset_from_object_header(file_data, header_addr, name, source_dir, cache)?;
     full_ds.slice(ranges)
+}
+
+/// On-disk footprint (in bytes) of a single element of `dtype` when it is
+/// stored inside a chunk or a hyperslab source region.
+///
+/// For fixed-size datatypes this is simply [`Dtype::size`].  For variable-length
+/// datatypes (class 9 `VarLen` and variable-length strings, i.e.
+/// `String { fixed_len: None, .. }`) the on-disk element is a fixed-size
+/// *global-heap reference* — `length (4) + heap collection address
+/// (size_of_offsets) + heap object index (4)` — so its footprint is fixed even
+/// though [`Dtype::size`] returns `None`.  With the standard 8-byte offsets this
+/// is 16 bytes, matching the reference layout decoded by
+/// [`oxih5_format::values::decode_vlen_strings`] /
+/// [`oxih5_format::values::decode_vlen_sequences`].
+fn on_disk_elem_footprint(dtype: &Dtype, size_of_offsets: usize) -> Option<usize> {
+    match dtype {
+        Dtype::VarLen { .. }
+        | Dtype::String {
+            fixed_len: None, ..
+        } => Some(4 + size_of_offsets + 4),
+        other => other.size(),
+    }
+}
+
+/// `true` when `dtype` is a variable-length type stored as a global-heap
+/// reference on disk (vlen sequence or vlen string).
+fn is_vlen_dtype(dtype: &Dtype) -> bool {
+    matches!(
+        dtype,
+        Dtype::VarLen { .. }
+            | Dtype::String {
+                fixed_len: None,
+                ..
+            }
+    )
+}
+
+/// Reject filter pipelines that make no sense combined with variable-length
+/// elements.  Byte-oriented transform filters (shuffle id 2, fletcher32 id 3,
+/// nbit id 5, scaleoffset id 6) operate on fixed-width numeric samples and
+/// cannot be applied to the 16-byte global-heap references that back vlen data.
+fn reject_vlen_incompatible_filters(
+    pipeline: &oxih5_core::FilterPipeline,
+    name: &str,
+) -> Result<(), OxiH5Error> {
+    for f in &pipeline.filters {
+        if matches!(f.id, 2 | 5 | 6) {
+            return Err(OxiH5Error::Format(format!(
+                "dataset '{name}': filter id {} cannot be combined with variable-length elements",
+                f.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Read a dataset directly from its object header address (new-style groups).
@@ -1605,6 +1569,7 @@ fn read_dataset_from_object_header(
     file_data: &[u8],
     header_addr: u64,
     name: &str,
+    source_dir: &std::path::Path,
     cache: Option<&ChunkIndexCache>,
 ) -> Result<Dataset, OxiH5Error> {
     let ds_messages = header::parse_messages(file_data, header_addr)?;
@@ -1652,15 +1617,18 @@ fn read_dataset_from_object_header(
         }
         LayoutInfo::Compact { data } => data.clone(),
         LayoutInfo::Chunked { .. } => {
-            let elem_size = dtp.dtype.size().ok_or_else(|| {
+            let elem_size = on_disk_elem_footprint(&dtp.dtype, 8).ok_or_else(|| {
                 OxiH5Error::NotImplemented(format!(
-                    "chunked dataset '{name}': variable-length element size not supported"
+                    "chunked dataset '{name}': element size not supported"
                 ))
             })?;
             let dataset_dims: Vec<u64> = dsp.dims.clone();
             let pipeline = filter_pipeline
                 .clone()
                 .unwrap_or_else(|| oxih5_core::FilterPipeline { filters: vec![] });
+            if is_vlen_dtype(&dtp.dtype) {
+                reject_vlen_incompatible_filters(&pipeline, name)?;
+            }
             oxih5_format::chunked::read_chunked(
                 file_data,
                 &lay,
@@ -1671,11 +1639,18 @@ fn read_dataset_from_object_header(
                 cache,
             )?
         }
-        LayoutInfo::VirtualDataset { .. } => {
-            return Err(OxiH5Error::NotImplemented(format!(
-                "virtual dataset layout not yet supported for '{name}'"
-            )));
-        }
+        LayoutInfo::VirtualDataset {
+            heap_address,
+            heap_index,
+        } => read_virtual_dataset(
+            file_data,
+            *heap_address,
+            *heap_index,
+            &dsp,
+            &dtp.dtype,
+            source_dir,
+            cache,
+        )?,
     };
 
     let attributes = read_attributes_from_header(file_data, header_addr).unwrap_or_default();
@@ -1696,6 +1671,7 @@ fn read_dataset_from_group(
     btree_address: u64,
     heap_address: u64,
     name: &str,
+    source_dir: &std::path::Path,
     cache: Option<&ChunkIndexCache>,
 ) -> Result<Dataset, OxiH5Error> {
     // Locate the dataset's object header address via B-tree / SNOD.
@@ -1752,15 +1728,18 @@ fn read_dataset_from_group(
         LayoutInfo::Chunked { .. } => {
             // Chunked datasets need the element size to scatter chunks into the
             // output buffer; derive it from the datatype.
-            let elem_size = dtp.dtype.size().ok_or_else(|| {
+            let elem_size = on_disk_elem_footprint(&dtp.dtype, 8).ok_or_else(|| {
                 OxiH5Error::NotImplemented(format!(
-                    "chunked dataset '{name}': variable-length element size not supported"
+                    "chunked dataset '{name}': element size not supported"
                 ))
             })?;
             let dataset_dims: Vec<u64> = dsp.dims.clone();
             let pipeline = filter_pipeline
                 .clone()
                 .unwrap_or_else(|| oxih5_core::FilterPipeline { filters: vec![] });
+            if is_vlen_dtype(&dtp.dtype) {
+                reject_vlen_incompatible_filters(&pipeline, name)?;
+            }
             oxih5_format::chunked::read_chunked(
                 file_data,
                 &lay,
@@ -1771,11 +1750,18 @@ fn read_dataset_from_group(
                 cache,
             )?
         }
-        LayoutInfo::VirtualDataset { .. } => {
-            return Err(OxiH5Error::NotImplemented(format!(
-                "virtual dataset layout not yet supported for '{name}'"
-            )));
-        }
+        LayoutInfo::VirtualDataset {
+            heap_address,
+            heap_index,
+        } => read_virtual_dataset(
+            file_data,
+            *heap_address,
+            *heap_index,
+            &dsp,
+            &dtp.dtype,
+            source_dir,
+            cache,
+        )?,
     };
 
     // Collect any attribute messages from the dataset's object header.

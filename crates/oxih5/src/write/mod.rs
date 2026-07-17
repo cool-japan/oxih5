@@ -47,6 +47,18 @@ pub(crate) enum ElemType {
     VlenStr,
 }
 
+/// On-disk size, in bytes, of a single element of the given [`ElemType`].
+///
+/// For `VlenStr` this is the 16-byte global-heap reference footprint.
+fn elem_type_byte_size(elem_type: ElemType) -> usize {
+    match elem_type {
+        ElemType::F32 | ElemType::I32 => 4,
+        ElemType::F64 | ElemType::I64 => 8,
+        ElemType::U8 => 1,
+        ElemType::VlenStr => 16,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Attribute kinds
 // ---------------------------------------------------------------------------
@@ -1096,6 +1108,26 @@ impl FileWriter {
                 "duplicate dataset name '{name}'"
             )));
         }
+        // Validate that the caller-supplied data length matches the declared
+        // shape, so a mismatched `write_dataset_*(name, data, shape)` fails with
+        // a clear error instead of silently producing a corrupt file (or later
+        // panicking on an out-of-bounds slice during `build`).
+        let byte_size = elem_type_byte_size(elem_type);
+        let n_elems = shape
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+            .ok_or_else(|| {
+                OxiH5Error::Format(format!("dataset '{name}': shape {shape:?} overflows usize"))
+            })?;
+        let expected = n_elems.checked_mul(byte_size).ok_or_else(|| {
+            OxiH5Error::Format(format!("dataset '{name}': byte size overflows usize"))
+        })?;
+        if raw.len() != expected {
+            return Err(OxiH5Error::Format(format!(
+                "dataset '{name}': data length {} does not match shape {shape:?} × {byte_size} bytes = {expected}",
+                raw.len()
+            )));
+        }
         self.datasets.push(DatasetDesc {
             name: name.to_string(),
             raw,
@@ -1157,10 +1189,13 @@ impl FileWriter {
 /// [8–15]: heap_addr (u64 LE) — absolute address of the GCOL in the file
 /// ```
 fn write_vlen_ref(buf: &mut [u8], offset: usize, seq_len: u32, obj_idx: u32, heap_addr: u64) {
+    // Standard HDF5 on-disk vlen reference (H5T__vlen_disk_write):
+    //   [0..4]   sequence length (u32 LE)
+    //   [4..12]  global-heap collection address (u64 LE, size_of_offsets = 8)
+    //   [12..16] global-heap object index (u32 LE)
     buf[offset..offset + 4].copy_from_slice(&seq_len.to_le_bytes());
-    buf[offset + 4..offset + 6].copy_from_slice(&(obj_idx as u16).to_le_bytes());
-    // bytes [6..8] = reserved, already zero in the buffer
-    buf[offset + 8..offset + 16].copy_from_slice(&heap_addr.to_le_bytes());
+    buf[offset + 4..offset + 12].copy_from_slice(&heap_addr.to_le_bytes());
+    buf[offset + 12..offset + 16].copy_from_slice(&obj_idx.to_le_bytes());
 }
 
 // ---------------------------------------------------------------------------
