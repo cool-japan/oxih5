@@ -11,16 +11,16 @@ This crate is the recommended entry point: it wires together [`oxih5-core`] (the
 
 ```toml
 [dependencies]
-oxih5 = "0.1.4"
+oxih5 = "0.2.0"
 
 # With the ndarray bridge (Dataset::to_array_f32 / _f64 / _i32):
-oxih5 = { version = "0.1.4", features = ["ndarray"] }
+oxih5 = { version = "0.2.0", features = ["ndarray"] }
 
 # With rayon-parallel chunk assembly:
-oxih5 = { version = "0.1.4", features = ["parallel"] }
+oxih5 = { version = "0.2.0", features = ["parallel"] }
 
 # With szip (compression id 4) chunk decoding:
-oxih5 = { version = "0.1.4", features = ["szip"] }
+oxih5 = { version = "0.2.0", features = ["szip"] }
 ```
 
 ## Quick Start
@@ -112,6 +112,7 @@ Returns the crate version (`env!("CARGO_PKG_VERSION")`).
 | `contains(path)` | Whether a dataset or group exists at `path` → `bool` |
 | `walk(visitor)` | Pre-order traversal; `visitor(full_path, is_group)` |
 | `info()` | File-level metadata → [`FileInfo`] |
+| `superblock_extension()` | Parse the file's superblock-extension messages (B-tree 'K' Values, Shared Message Table, File Space Info, Driver Info) → `Option<SuperblockExtension>`; only superblock v2/v3 files can have one |
 
 ### `FileInfo`
 
@@ -119,10 +120,11 @@ Returned by `File::info()`.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `superblock_version` | `u8` | Superblock version (currently always 0) |
+| `superblock_version` | `u8` | Actual on-disk superblock version, as parsed: `0`, `1`, `2`, or `3` |
 | `file_size` | `u64` | Byte size of the file as loaded |
 | `offset_size` | `u8` | Superblock `size_of_offsets` (typically 8) |
 | `length_size` | `u8` | Superblock `size_of_lengths` (typically 8) |
+| `superblock_extension_address` | `Option<u64>` | Address of the superblock extension object header, if the file has one; only versions 2/3 can carry one, so this is always `None` for v0/v1 |
 
 ## `Group` — group navigation handle
 
@@ -165,13 +167,15 @@ Adding a duplicate/invalid name or exceeding capacity returns `OxiH5Error::Forma
 
 ## Re-exported types
 
-The data-model types from [`oxih5-core`] are re-exported at the crate root (alongside [`Value`] from [`oxih5-format`]), so most programs need only `use oxih5::...`:
+The data-model types from [`oxih5-core`] are re-exported at the crate root (alongside [`Value`], `SuperblockExtension`, and `BtreeKValues` from [`oxih5-format`]), so most programs need only `use oxih5::...`:
 
 - `Dataset` — fully-decoded N-dimensional array with typed accessors (`as_f32`, `iter_i64`, `slice`, `reshape`, …)
 - `Dtype` — HDF5 datatype enum
 - `ByteOrder` — `Little` / `Big`
 - `Attribute` — named attribute on a dataset or group
 - `Value` — dynamically-typed decoded element (`Int`, `Uint`, `Float`, `Str`, `Sequence`, …) returned by `File::dataset_vlen_sequences`
+- `SuperblockExtension` — decoded superblock-extension messages returned by `File::superblock_extension()` (`btree_k`, `shared_message_table_address`, `file_space_info_present`, `file_space_strategy`, `driver_info_present`)
+- `BtreeKValues` — decoded "B-tree 'K' Values" message (`indexed_storage_internal_k`, `group_internal_k`, `group_leaf_k`), surfaced via `SuperblockExtension::btree_k`
 - `OxiH5Error` — the crate-wide error enum
 
 ## Feature Flags
@@ -185,7 +189,7 @@ The data-model types from [`oxih5-core`] are re-exported at the crate root (alon
 
 ## What is supported
 
-- **Read:** superblock v0/v2/v3; object headers v1/v2; old- and new-style groups; hierarchical paths; hard / soft / external links (including a soft link chained to an external link); contiguous, compact, chunked, and virtual-dataset (VDS) layouts; B-tree v1/v2, fixed-array and extensible-array chunk indices; deflate / shuffle / fletcher32 / nbit / scaleoffset filters, plus szip behind the `szip` feature; all 11 datatype classes, including chunked variable-length strings and sequences; dataset and group attributes; sub-region slicing.
+- **Read:** superblock v0/v1/v2/v3 (v2/v3 superblock-extension messages — B-tree 'K' Values, Shared Message Table, File Space Info, Driver Info — available via `File::superblock_extension()`); object headers v1/v2; old- and new-style groups; hierarchical paths; hard / soft / external links (including a soft link chained to an external link); contiguous, compact, chunked, and virtual-dataset (VDS) layouts; B-tree v1/v2, fixed-array and extensible-array chunk indices; deflate / shuffle / fletcher32 / nbit / scaleoffset filters, plus szip behind the `szip` feature; all 11 datatype classes, including chunked variable-length strings and sequences; dataset and group attributes; sub-region slicing.
 - **Write:** contiguous, uncompressed datasets (`f32`, `f64`, `i32`, `i64`, `u8`), variable-length string datasets, single-chunk unlimited-dimension datasets, single-level sub-groups, and attributes — see `FileWriter` below for exact limits.
 - **Not yet implemented:** a virtual dataset with variable-length elements returns `OxiH5Error::NotImplemented` (fixed-size element types are supported); unmapped virtual-dataset regions always read as zero (non-zero fill values are not applied yet); a soft link returns `OxiH5Error::NotImplemented` only if it targets an external-file *group* (an external-file *dataset* target — a soft → external chain — is resolved).
 

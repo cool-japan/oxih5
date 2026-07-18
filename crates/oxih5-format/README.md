@@ -3,9 +3,9 @@
 [![Crates.io](https://img.shields.io/crates/v/oxih5-format.svg)](https://crates.io/crates/oxih5-format)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**233 tests passing** (`cargo test -p oxih5-format --all-features`; 227 with default features) · zero clippy / rustdoc warnings
+**247 tests passing** (`cargo test -p oxih5-format --all-features`; 241 with default features) · zero clippy / rustdoc warnings
 
-`oxih5-format` is the binary-parsing layer of **OxiH5**, the COOLJAPAN Pure-Rust HDF5 reader/writer. It turns raw HDF5 file bytes — exactly as produced by h5py / libhdf5 — into the typed data model from [`oxih5-core`]. Every standard structure of the HDF5 file format is decoded here: the superblock, object headers (v1 and v2), all standard header messages, local/global/fractal heaps, B-tree v1 and v2 nodes, the extensible- and fixed-array chunk indices, the filter pipeline, full chunked-dataset assembly, and Virtual Dataset (VDS) mapping-block parsing.
+`oxih5-format` is the binary-parsing layer of **OxiH5**, the COOLJAPAN Pure-Rust HDF5 reader/writer. It turns raw HDF5 file bytes — exactly as produced by h5py / libhdf5 — into the typed data model from [`oxih5-core`]. Every standard structure of the HDF5 file format is decoded here: the superblock (versions 0, 1, 2, and 3, including the v2/v3 superblock extension), object headers (v1 and v2), all standard header messages, local/global/fractal heaps, B-tree v1 and v2 nodes, the extensible- and fixed-array chunk indices, the filter pipeline, full chunked-dataset assembly, and Virtual Dataset (VDS) mapping-block parsing.
 
 This crate sits between [`oxih5-core`] (the data model) and the [`oxih5`] facade (the file API). It is 100% Pure Rust with `#![forbid(unsafe_code)]`; DEFLATE/zlib decompression is delegated to the COOLJAPAN [`oxiarc-deflate`] crate (never flate2/miniz). It exposes a flat, function-oriented API — there is no `File` handle here; that abstraction lives in `oxih5`. Most users should depend on `oxih5` instead and reach for `oxih5-format` only when building custom HDF5 tooling.
 
@@ -13,10 +13,10 @@ This crate sits between [`oxih5-core`] (the data model) and the [`oxih5`] facade
 
 ```toml
 [dependencies]
-oxih5-format = "0.1.4"
+oxih5-format = "0.2.0"
 
 # Optional: rayon-parallel chunk assembly
-oxih5-format = { version = "0.1.4", features = ["parallel"] }
+oxih5-format = { version = "0.2.0", features = ["parallel"] }
 ```
 
 ## Quick Start
@@ -50,8 +50,11 @@ The crate re-exports [`ChunkIndexCache`] from `chunked` at the crate root; every
 
 | Item | Description |
 |------|-------------|
-| `struct Superblock` | `size_of_offsets`, `size_of_lengths`, `base_address`, `root_object_header_address` |
-| `fn parse(data) -> Superblock` | Parse v0 / v2 / v3 superblocks from the file start |
+| `struct Superblock` | `version`, `size_of_offsets`, `size_of_lengths`, `base_address`, `root_object_header_address`, `superblock_extension_address` |
+| `fn parse(data) -> Superblock` | Parse v0 / v1 / v2 / v3 superblocks from the file start. v1 is the "transitional" layout: identical to v0 except 4 extra bytes (Indexed Storage Internal Node K + Reserved) are inserted after the File Consistency Flags, shifting the Base Address and Root Group Symbol Table Entry by +4 |
+| `struct SuperblockExtension` | `btree_k`, `shared_message_table_address`, `file_space_info_present`, `file_space_strategy`, `driver_info_present` — the subset of a v2/v3 superblock extension's messages that oxih5-format currently interprets |
+| `struct BtreeKValues` | `indexed_storage_internal_k`, `group_internal_k`, `group_leaf_k` — decoded "B-tree 'K' Values" message (0x0013) |
+| `fn read_superblock_extension(data) -> Option<SuperblockExtension>` | Parse the superblock, then — if a v2/v3 extension is present — decode its B-tree 'K' Values (0x0013), Shared Message Table (0x000F), File Space Info (0x0018), and Driver Info (0x0014) messages. Returns `None` for v0/v1 files and for v2/v3 files whose extension address is the "undefined address" sentinel |
 | `fn read_u16_le` / `read_u32_le` / `read_u64_le` | Bounds-checked little-endian integer readers |
 
 ### `header` — object headers
@@ -59,7 +62,7 @@ The crate re-exports [`ChunkIndexCache`] from `chunked` at the crate root; every
 | Item | Description |
 |------|-------------|
 | `struct Message` | `msg_type: u16`, `data: Vec<u8>` (body bytes preserved verbatim) |
-| `fn parse_messages(file_data, offset) -> Vec<Message>` | Decode a v1 or v2 object header (handles continuation blocks) |
+| `fn parse_messages(file_data, offset) -> Vec<Message>` | Decode a v1 or v2 object header (handles continuation blocks, including a v2 object that tracks creation order and spills messages into an OCHK continuation block) |
 
 ### `message` — header-message decoders
 

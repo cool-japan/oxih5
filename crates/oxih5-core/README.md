@@ -3,18 +3,20 @@
 [![Crates.io](https://img.shields.io/crates/v/oxih5-core.svg)](https://crates.io/crates/oxih5-core)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
+**30 tests passing** (`cargo test -p oxih5-core --all-features`) · zero clippy / rustdoc warnings
+
 `oxih5-core` defines the shared, parser-agnostic data model for **OxiH5**, the COOLJAPAN Pure-Rust HDF5 reader/writer. It contains the in-memory representations of an HDF5 file's contents — datatypes, datasets, attributes, groups, links, filter pipelines — plus the crate-wide [`OxiH5Error`] error enum. It deliberately contains **no binary-parsing logic**: the on-disk format readers live in `oxih5-format`, and the user-facing file API lives in the `oxih5` facade.
 
-The headline type is [`Dataset`], a fully-decoded N-dimensional array (raw bytes + shape + [`Dtype`] + attributes) with a large family of zero-copy typed accessors (`as_f32`, `iter_i64`, …), `slice`, `reshape`, and an optional `ndarray` bridge. This crate is 100% Pure Rust and sets `#![forbid(unsafe_code)]` — its only required dependency is `thiserror`.
+The headline type is [`Dataset`], a fully-decoded N-dimensional array (raw bytes + shape + [`Dtype`] + attributes + optional max-dims) with a large family of zero-copy typed accessors (`as_f32`, `iter_i64`, …), `slice`, `reshape`, unlimited-dimension introspection, and an optional `ndarray` bridge. This crate is 100% Pure Rust and sets `#![forbid(unsafe_code)]` — its only required dependency is `thiserror`.
 
 ## Installation
 
 ```toml
 [dependencies]
-oxih5-core = "0.1.4"
+oxih5-core = "0.2.0"
 
-# Optional: enable the ndarray bridge (Dataset::to_array_f32 / _f64 / _i32)
-oxih5-core = { version = "0.1.4", features = ["ndarray"] }
+# Optional: enable the ndarray bridge (Dataset::to_array_* — full numeric coverage)
+oxih5-core = { version = "0.2.0", features = ["ndarray"] }
 ```
 
 ## Quick Start
@@ -29,6 +31,7 @@ let ds = Dataset {
     shape: vec![3],
     dtype: Dtype::Float { size: 4, order: ByteOrder::Little },
     attributes: vec![],
+    max_dims: None,
 };
 
 // Decode to a typed Vec (validates the dtype, returns Err on mismatch).
@@ -45,7 +48,7 @@ assert_eq!(sum, 6.0);
 
 ### `Dataset` — fully-decoded N-dimensional array
 
-A public-field struct holding the dataset's raw bytes, shape, [`Dtype`], and attributes.
+A public-field struct holding the dataset's raw bytes, shape, [`Dtype`], attributes, and optional max-dims metadata.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -53,6 +56,7 @@ A public-field struct holding the dataset's raw bytes, shape, [`Dtype`], and att
 | `shape` | `Vec<usize>` | Dimensions in elements (empty ⇒ scalar) |
 | `dtype` | `Dtype` | The element datatype |
 | `attributes` | `Vec<Attribute>` | Attributes attached to the dataset |
+| `max_dims` | `Option<Vec<u64>>` | Maximum dimensions from the HDF5 dataspace; an axis of `u64::MAX` is `H5S_UNLIMITED`; `None` when the source didn't carry max-dims info |
 
 #### Shape / metadata methods
 
@@ -62,6 +66,9 @@ A public-field struct holding the dataset's raw bytes, shape, [`Dtype`], and att
 | `is_empty()` | True when `len() == 0` |
 | `attrs()` | All attributes as `&[Attribute]` |
 | `attr(name)` | Find one attribute by name → `Option<&Attribute>` |
+| `max_dims()` | Maximum dimensions as `Option<&[u64]>`, if the source dataspace carried them |
+| `is_unlimited()` | `true` if any axis is `H5S_UNLIMITED` (extendable without bound) |
+| `unlimited_axes()` | Indices of axes that are `H5S_UNLIMITED` → `Vec<usize>` (empty if none) |
 | `slice(ranges)` | Extract a sub-region (`&[Range<usize>]`, one per dim) → new `Dataset` |
 | `reshape(new_shape)` | Validate element count and return a re-shaped `Dataset` |
 
@@ -78,6 +85,8 @@ Each checks the dtype (and byte order) and returns `TypeMismatch` on mismatch, `
 | `as_u8()` / `as_u16()` / `as_u32()` / `as_u64()` | unsigned integers |
 | `as_string()` | fixed-length `String` dataset → `Vec<String>` (NUL-trimmed, UTF-8) |
 
+The half→single decode behind `as_f16`/`iter_f16`/`to_array_f16` is also exposed as a standalone function, `oxih5_core::f16_to_f32(bits: u16) -> f32`.
+
 #### Lazy iterator accessors → `Result<impl Iterator<Item = T>, OxiH5Error>`
 
 Decode values on the fly directly from the byte buffer with no intermediate `Vec`.
@@ -91,11 +100,21 @@ Decode values on the fly directly from the byte buffer with no intermediate `Vec
 
 #### `ndarray` bridge (feature `ndarray`)
 
+Full numeric coverage — one `to_array_*` per eager/lazy accessor type above.
+
 | Method | Returns |
 |--------|---------|
+| `to_array_f16()` | `ndarray::ArrayD<f32>` (widened from half-precision) |
 | `to_array_f32()` | `ndarray::ArrayD<f32>` |
 | `to_array_f64()` | `ndarray::ArrayD<f64>` |
+| `to_array_i8()` | `ndarray::ArrayD<i8>` |
+| `to_array_i16()` | `ndarray::ArrayD<i16>` |
 | `to_array_i32()` | `ndarray::ArrayD<i32>` |
+| `to_array_i64()` | `ndarray::ArrayD<i64>` |
+| `to_array_u8()` | `ndarray::ArrayD<u8>` |
+| `to_array_u16()` | `ndarray::ArrayD<u16>` |
+| `to_array_u32()` | `ndarray::ArrayD<u32>` |
+| `to_array_u64()` | `ndarray::ArrayD<u64>` |
 
 ### `Dtype` enum — HDF5 datatype model
 
@@ -134,6 +153,17 @@ Decode values on the fly directly from the byte buffer with no intermediate `Vec
 | `FilterPipeline` | `filters: Vec<FilterInfo>` | Ordered filter chain |
 | `PropertyList` | `chunk_dims: Option<Vec<u64>>`, `filters: Option<FilterPipeline>`, `fill_value: Option<Vec<u8>>` | Dataset creation properties |
 | `Group` | `name`, `children: Vec<(String, Link)>`, `attributes: Vec<Attribute>` | A decoded group node |
+
+`Attribute` additionally exposes scalar-decode helpers for reading common metadata conventions (e.g. CF/NetCDF attributes) without matching on `dtype` by hand:
+
+| Method | Description |
+|--------|-------------|
+| `as_i64()` | Decode as a scalar `i64`, widening any 1/2/4/8-byte signed or unsigned integer → `Option<i64>` |
+| `as_u64()` | Decode as a scalar `u64` (unsigned integer dtypes only) → `Option<u64>` |
+| `as_f64()` | Decode as a scalar `f64` (widens `f32`) → `Option<f64>` |
+| `as_str_fixed()` | Decode a fixed-length string attribute, NUL-trimmed → `Option<String>` |
+| `is_scalar()` | `true` when the dataspace is `Scalar` or holds exactly one element |
+| `shape()` | The attribute's dataspace shape as `Vec<u64>` (`Scalar` ⇒ `[]`, `Null` ⇒ `[0]`) |
 
 ### `OxiH5Error` variants
 

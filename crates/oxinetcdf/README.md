@@ -8,7 +8,8 @@ no C FFI — and is a member of the [OxiH5](https://github.com/cool-japan/oxih5)
 
 ## Features
 
-- `NcFile::open(path)` / `open_from_bytes(&[u8])` — open any NetCDF-4 file (HDF5 backend)
+- `NcFile::open(path)` / `open_from_bytes(&[u8])` — open any NetCDF-4 file (HDF5 backend,
+  now including files using HDF5 superblock v1, via OxiH5 0.2.0)
 - Full `NcGroup` / `NcVariable` / `NcDimension` / `NcAxis` / `NcAttribute` model
 - NetCDF-4 convention resolution: `DIMENSION_SCALE`, `_Netcdf4Dimid`, `DIMENSION_LIST`
   object-reference axis linkage
@@ -65,6 +66,7 @@ w.close()?;
 - Pure Rust: no `libnetcdf`, no `libhdf5`, no C/C++ dependencies in default features.
 - All compression via `oxiarc-deflate` / `oxiarc-szip` (COOLJAPAN policy).
 - No `unwrap()` in production code paths.
+- **72 tests passing** (`cargo nextest run -p oxinetcdf --all-features`).
 
 ---
 

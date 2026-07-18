@@ -356,18 +356,21 @@ fn parse_v2_block(
 
         (p, p + chunk0_size as usize, track_co)
     } else if sig == Some(OCHK_SIGNATURE) {
-        // --- OCHK continuation block ---
-        // OCHK: sig(4) + messages(cont_length − 8) + checksum(4)
-        // We don't have cont_length here directly; we rely on the caller having
-        // populated `seen` and having passed the right block_start.
-        // To find the end we scan using depth-first order — the continuation
-        // message body gives us the length when we encounter it in the parent.
-        // Since we don't store that here, we read until we hit a parse error or
-        // a NIL message.  In practice a NIL message marks the end of the live
-        // portion; the checksum occupies the final 4 bytes and won't form a
-        // valid message record.
+        // --- OCHK continuation block (defensive fallback) ---
+        // In normal operation `parse_v2_block` is only ever invoked on the main
+        // OHDR block (depth 0); continuation blocks discovered via a
+        // MSG_CONTINUATION_V2 message are routed through `parse_v2_ochk_block`
+        // below, which now honours the owning object's creation-order flag.
+        // This branch is therefore unreachable for the standard call graph and
+        // exists only as a guard should `parse_v2_block` ever be pointed
+        // directly at an OCHK block.  The owning OHDR's creation-order flag is
+        // not threaded into this entry point, so we conservatively assume it is
+        // unset here; correctness for creation-order-tracked objects is
+        // guaranteed by `parse_v2_ochk_block`, which receives the real flag.
         //
-        // For robustness we cap at file_data.len().
+        // OCHK: sig(4) + messages(cont_length − 8) + checksum(4).  Without a
+        // cont_length at this entry point we cap the scan at file_data.len()
+        // and stop at the terminating NIL message.
         (base + 4, file_data.len(), false)
     } else {
         return Err(OxiH5Error::Format(format!(
@@ -413,10 +416,14 @@ fn parse_v2_block(
                 // OCHK block: sig(4) + messages(cont_length − 8) + checksum(4)
                 // We store the adjusted end so parse_v2_block can use it.
                 // We pass the block start; the OCHK parser caps at cont_length - 8.
+                // Thread THIS block's creation-order flag through: the OCHK block
+                // belongs to the same object, so its message records share the
+                // same 4-vs-6-byte header layout.
                 parse_v2_ochk_block(
                     file_data,
                     cont_offset,
                     cont_length,
+                    track_creation_order,
                     messages,
                     first_addr,
                     extra_seen,
@@ -441,10 +448,18 @@ fn parse_v2_block(
 /// OCHK layout: `sig(4) + messages(cont_length − 8) + checksum(4)`
 /// The `cont_length` comes from the continuation message body (it includes the
 /// sig and checksum, so the message region is `cont_length − 8` bytes).
+///
+/// `track_creation_order` is the creation-order tracking flag of the owning
+/// OHDR (OHDR flags bit 2).  It MUST be threaded in from the parent block: when
+/// set, every message record in this block (and in any nested continuation)
+/// carries an extra 2-byte creation-order field, making each record header
+/// 6 bytes instead of 4.  Assuming `false` here would mis-read every record.
+#[allow(clippy::too_many_arguments)]
 fn parse_v2_ochk_block(
     file_data: &[u8],
     block_start: u64,
     cont_length: u64,
+    track_creation_order: bool,
     messages: &mut Vec<Message>,
     first_addr: u64,
     extra_seen: &mut Option<std::collections::HashSet<u64>>,
@@ -491,15 +506,13 @@ fn parse_v2_ochk_block(
 
     let mut pos = base4; // skip OCHK signature
 
-    // Inherit track_creation_order from the enclosing OHDR? No — OCHK blocks
-    // use the same creation-order flag as the owning OHDR.  However, we don't
-    // have convenient access to that flag here.  In practice when track_co is
-    // false (by far the common case) this is fine.  When true the caller
-    // `parse_v2_block` would need to thread the flag through.  We accept a
-    // minor limitation: OCHK blocks always assume track_co=false until a
-    // refactor threads the flag through.  This matches behaviour for the vast
-    // majority of files.
-    let track_co = false;
+    // OCHK continuation blocks share the creation-order tracking flag of the
+    // owning OHDR: when the object tracks creation order, EVERY message record
+    // (including those spilled into continuation blocks) carries the extra
+    // 2-byte creation-order field, making each record header 6 bytes instead of
+    // 4.  The flag is threaded in from the parent block so continuation
+    // messages for creation-order-tracked objects are never mis-read.
+    let track_co = track_creation_order;
 
     while pos + 4 <= msg_area_end {
         let msg_type = file_data[pos];
@@ -523,10 +536,13 @@ fn parse_v2_ochk_block(
             if msg_size >= 16 {
                 let sub_offset = read_u64_at(file_data, data_start)?;
                 let sub_length = read_u64_at(file_data, data_start + 8)?;
+                // Nested continuation belongs to the same object — preserve the
+                // creation-order flag at every recursion depth.
                 parse_v2_ochk_block(
                     file_data,
                     sub_offset,
                     sub_length,
+                    track_creation_order,
                     messages,
                     first_addr,
                     extra_seen,
@@ -837,6 +853,76 @@ mod tests {
             !attr_msgs.is_empty(),
             "expected attribute message from OCHK"
         );
+        assert_eq!(attr_msgs[0].data, vec![0x01, 0x02]);
+    }
+
+    #[test]
+    fn test_parse_messages_v2_ochk_continuation_creation_order() {
+        // Regression test: an OHDR with creation-order tracking (flags bit 2 set)
+        // whose messages spill into an OCHK continuation block.  When creation
+        // order is tracked, EVERY message record — including those in the OCHK
+        // block — carries an extra 2-byte creation-order field, making each
+        // record header 6 bytes instead of 4.  If the OCHK parser mistakenly
+        // assumed 4-byte headers it would read the creation-order bytes as the
+        // start of the message body and return corrupted data.
+        //
+        // The OCHK attribute message below has creation_order = 0x0009 and
+        // body = [0x01, 0x02].  A correct (6-byte-header) parse yields
+        // [0x01, 0x02]; the old broken (4-byte-header) parse would instead yield
+        // the creation-order bytes [0x09, 0x00] — so this assertion actually
+        // distinguishes fixed-vs-broken behaviour.
+
+        let ochk_offset: u64 = 200;
+        // OCHK: sig(4) + attr_record(8) + checksum(4) = 16
+        //   attr_record = type(1)+size(2)+flags(1)+creation_order(2)+data(2)
+        let cont_length: u64 = 16;
+
+        // OHDR chunk-0 holds a single continuation message with a 6-byte header:
+        //   continuation_record = type(1)+size(2)+flags(1)+creation_order(2)+body(16)
+        let chunk0_size: usize = 6 + 16;
+        let mut data = vec![0u8; 500];
+
+        // --- OHDR at offset 0 ---
+        data[0..4].copy_from_slice(b"OHDR");
+        data[4] = 2; // version
+        data[5] = 0x04; // flags: bit 2 = track creation order; bits 0-1 = 0 → chunk_size_size = 1
+        data[6] = chunk0_size as u8;
+
+        // Continuation message (6-byte header because creation order is tracked)
+        let p = 7;
+        data[p] = 0x10; // type = continuation
+        data[p + 1] = 0x10; // size lo = 16
+        data[p + 2] = 0x00; // size hi
+        data[p + 3] = 0x00; // message flags
+        data[p + 4] = 0x00; // creation_order lo
+        data[p + 5] = 0x00; // creation_order hi
+                            // body: ochk_offset(8) + cont_length(8)
+        data[p + 6..p + 14].copy_from_slice(&ochk_offset.to_le_bytes());
+        data[p + 14..p + 22].copy_from_slice(&cont_length.to_le_bytes());
+
+        // --- OCHK block at offset 200 ---
+        let ob = ochk_offset as usize;
+        data[ob..ob + 4].copy_from_slice(b"OCHK");
+        // Attribute message with a 6-byte header (creation order tracked)
+        data[ob + 4] = 0x0C; // type = attribute
+        data[ob + 5] = 0x02; // size lo = 2
+        data[ob + 6] = 0x00; // size hi
+        data[ob + 7] = 0x00; // message flags
+        data[ob + 8] = 0x09; // creation_order lo (distinct from body bytes)
+        data[ob + 9] = 0x00; // creation_order hi
+        data[ob + 10] = 0x01; // body[0]
+        data[ob + 11] = 0x02; // body[1]
+                              // bytes [ob+12 .. ob+16) are the checksum region (ignored)
+
+        let msgs = parse_messages(&data, 0).unwrap();
+        let attr_msgs: Vec<_> = msgs.iter().filter(|m| m.msg_type == 0x000C).collect();
+        assert_eq!(
+            attr_msgs.len(),
+            1,
+            "expected exactly one attribute message from the OCHK block"
+        );
+        // Correct 6-byte-header parse → body [0x01, 0x02].
+        // Broken 4-byte-header parse would return the creation-order bytes [0x09, 0x00].
         assert_eq!(attr_msgs[0].data, vec![0x01, 0x02]);
     }
 

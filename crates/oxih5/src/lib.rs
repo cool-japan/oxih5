@@ -193,7 +193,7 @@ pub fn version() -> &'static str {
 
 /// File-level metadata returned by [`File::info`].
 pub struct FileInfo {
-    /// Superblock version (currently always 0 — v0 is the only supported version).
+    /// The actual superblock version parsed from the file (0, 1, 2, or 3).
     pub superblock_version: u8,
     /// Total byte size of the file as loaded into memory.
     pub file_size: u64,
@@ -201,7 +201,18 @@ pub struct FileInfo {
     pub offset_size: u8,
     /// `size_of_lengths` field from the superblock (typically 8).
     pub length_size: u8,
+    /// Address of the superblock extension object header, if the file has one.
+    ///
+    /// Only superblock versions 2 and 3 can carry a superblock extension;
+    /// versions 0 and 1 always report `None`.
+    pub superblock_extension_address: Option<u64>,
 }
+
+// The superblock-extension message types (`SuperblockExtension`,
+// `BtreeKValues`) and their decoders live in `oxih5_format::superblock`
+// alongside the rest of the superblock parsing.  They are re-exported here so
+// that callers use them as `oxih5::SuperblockExtension` / `oxih5::BtreeKValues`.
+pub use oxih5_format::superblock::{BtreeKValues, SuperblockExtension};
 
 // ---------------------------------------------------------------------------
 // File handle
@@ -498,11 +509,36 @@ impl File {
     pub fn info(&self) -> Result<FileInfo, OxiH5Error> {
         let sb = superblock::parse(&self.data)?;
         Ok(FileInfo {
-            superblock_version: 0,
+            superblock_version: sb.version,
             file_size: self.data.len() as u64,
             offset_size: sb.size_of_offsets,
             length_size: sb.size_of_lengths,
+            superblock_extension_address: sb.superblock_extension_address,
         })
+    }
+
+    /// Parse and return the interpretable messages from this file's superblock
+    /// extension, or `Ok(None)` when the file has no extension.
+    ///
+    /// The superblock extension is a regular object header carrying file-level
+    /// metadata messages.  It exists only for superblock versions 2 and 3
+    /// (versions 0/1 carry a Driver Info Block instead) and only when the
+    /// superblock's extension-address field is defined.  This accessor decodes
+    /// the messages oxih5 currently understands — B-tree 'K' Values (0x0013),
+    /// Shared Message Table (0x000F), File Space Info (0x0018) and Driver Info
+    /// (0x0014) — and surfaces them via [`SuperblockExtension`].
+    ///
+    /// A malformed message (too short to decode, or an unsupported message
+    /// version) is reported as a typed error rather than silently ignored.
+    ///
+    /// Note: the returned [`BtreeKValues`] are surfaced for inspection only.
+    /// oxih5's old-style B-tree/group traversal currently uses the HDF5
+    /// specification default K values, which is correct for all standard files.
+    /// Applying non-default K values from the extension to traversal is a
+    /// documented follow-up (it would require threading the values into the
+    /// B-tree and group readers).
+    pub fn superblock_extension(&self) -> Result<Option<SuperblockExtension>, OxiH5Error> {
+        superblock::read_superblock_extension(&self.data)
     }
 
     /// Resolve an HDF5 object reference (absolute byte address) to a `Dataset` or `Group`.
@@ -1802,6 +1838,35 @@ fn read_attributes_from_header(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Superblock extension: File-level accessor
+    // -----------------------------------------------------------------------
+
+    /// A file written by [`FileWriter`] uses superblock v0, which has no
+    /// superblock extension; `info()` must report version 0 and no extension,
+    /// and `superblock_extension()` must return `Ok(None)`.
+    #[test]
+    fn test_superblock_extension_none_on_v0_file() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("oxih5_test_sb_ext_none.h5");
+
+        crate::write::FileWriter::new()
+            .write_dataset_f32("d", &[1.0f32, 2.0, 3.0], &[3])
+            .expect("write")
+            .build(&tmp)
+            .expect("build");
+
+        let file = File::open(&tmp).expect("open");
+        let _ = std::fs::remove_file(&tmp);
+
+        let info = file.info().expect("info");
+        assert_eq!(info.superblock_version, 0);
+        assert_eq!(info.superblock_extension_address, None);
+
+        let ext = file.superblock_extension().expect("superblock_extension");
+        assert!(ext.is_none(), "v0 file must have no superblock extension");
+    }
 
     // -----------------------------------------------------------------------
     // A1 — integration: DataspaceInfo max_dims parsing + Dataset::is_unlimited

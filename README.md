@@ -9,10 +9,10 @@ provides a minimal write path for flat contiguous datasets.
 
 ---
 
-## Release: 0.1.4 (2026-07-17)
+## Release: 0.2.0 (2026-07-18)
 
-479 unit + integration tests (`--all-features`; 458 with default features);
-all pass.  Full workspace (~21.7 k SLOC of Rust across four crates).
+494 unit + integration tests (`--all-features`; 473 with default features);
+all pass.  Full workspace (~22.1 k SLOC of Rust across four crates).
 
 ---
 
@@ -33,7 +33,7 @@ all pass.  Full workspace (~21.7 k SLOC of Rust across four crates).
 HDF5 file bytes
       │
       ▼
-superblock.rs       — v0/v2/v3 root group address
+superblock.rs       — v0/v1/v2/v3 root group address + superblock extension
       │
       ▼
 header.rs           — object header v1/v2 message list + continuation
@@ -59,12 +59,18 @@ message.rs          — decode all standard message types
 
 ---
 
-## What Works (v0.1.4)
+## What Works (v0.2.0)
 
 ### Superblock
 
 - v0 (`libver='earliest'`)
+- v1 (transitional format; parses the extra 4 bytes inserted after the File
+  Consistency Flags before Base Address / Root Group Symbol Table Entry)
 - v2 and v3 (`libver='latest'`)
+- Superblock extension (v2/v3): `File::superblock_extension()` decodes the
+  extension object header's B-tree 'K' Values (0x0013), Shared Message Table
+  (0x000F), File Space Info (0x0018), and Driver Info (0x0014) messages into
+  `SuperblockExtension` / `BtreeKValues`
 
 ### Object Headers
 
@@ -212,6 +218,7 @@ FileWriter::new("output.h5")?
 | M6 | DONE | NetCDF-4 read conventions (oxinetcdf), hyperslab, AttrView, vlen/compound decode |
 | M7 | DONE (0.1.2) | NcFileWriter, unlimited dims, sub-groups, GlobalHeap writer, CF conventions, fill masks, deep group hierarchy |
 | M8 | DONE (0.1.4) | Virtual dataset (VDS) reads, chunked vlen/vlen-string reads, szip RAW-mode decoding, filtered fractal-heap root blocks, soft→external link chains |
+| M9 | DONE (0.2.0) | Superblock v1 parsing, superblock v2/v3 extension parsing (B-tree K values, shared message table, file space info, driver info), object-header v2 OCHK continuation creation-order fix |
 
 ---
 
@@ -239,8 +246,11 @@ cargo +nightly fuzz run fuzz_file_open
 - DEFLATE via `oxiarc-deflate` (COOLJAPAN policy; never flate2/miniz/zlib-ng).
 - SZIP via `oxiarc-szip` (feature-gated; COOLJAPAN policy).
 - HDF5 FFI crates banned workspace-wide via `deny.toml`.
-- Working toward zero `unwrap()` in production code paths (232 non-test call
-  sites remain as of 2026-07-17; tracked in TODO.md).
+- Zero `unwrap()` in production code paths: a full workspace audit
+  (2026-07-18) found 327 total `.unwrap()` call sites, and every one is
+  confined to test modules (`#[cfg(test)]`), the `oxih5/tests/write_tests.rs`
+  integration-test binary, `benches/*.rs` Criterion benchmarks, or
+  `///`/`//!` rustdoc example code — none in shipped library logic.
 
 ---
 

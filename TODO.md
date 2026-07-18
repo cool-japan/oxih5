@@ -1,11 +1,14 @@
 # OxiH5 Project TODO
 
-## Status — 0.1.4 (Unreleased)
+## Status — 0.2.0 (2026-07-18)
 
-Functional read/write HDF5 library (~21.7 k SLOC Rust, 479 tests with
-`--all-features` / 458 with default features, all pass).
-Supports superblock v0/v2/v3, object header v1/v2 (+continuation), B-tree
-v1/v2, local heap, SNOD, fractal heap (FRHP+FHDB+FHIB), extensible/fixed array
+Functional read/write HDF5 library (~22.1 k SLOC Rust, 494 tests with
+`--all-features` / 473 with default features, all pass).
+Supports superblock v0/v1/v2/v3 (+ v2/v3 superblock extension parsing:
+B-tree K values, shared message table, file space info, driver info via
+`File::superblock_extension()`), object header v1/v2 (+continuation, with
+creation-order now correctly threaded through OCHK continuation blocks),
+B-tree v1/v2, local heap, SNOD, fractal heap (FRHP+FHDB+FHIB), extensible/fixed array
 chunk indices, all 11 datatype classes, dataspace v1/v2, attributes (0x000C
 v1/v2/v3), filter pipeline (deflate/shuffle/fletcher32/nbit/scaleoffset), fill
 value, global heap, and **contiguous + compact + chunked + virtual** layouts.  New-style
@@ -73,6 +76,32 @@ groups, 2-D partial-edge chunks.  Write support via `FileWriter`.
 - [x] README.md updated to reflect all completed milestones
 - [x] cargo check/clippy/nextest all clean (0 errors, 0 warnings, 273 tests pass)
 - [x] oxih5-core dry-run publish passes
+
+### M9 — Superblock v1 + extension parsing (DONE, 0.2.0, 2026-07-18)
+- [x] Superblock v1 ("transitional" format) parsing: new
+      `oxih5_format::superblock::parse_v1`; 4 new unit tests
+      (`test_superblock_v1_parse`, `test_superblock_v1_nonzero_base_and_root`,
+      `test_superblock_v1_too_short`, `test_superblock_v1_bad_offset_width`)
+- [x] Superblock extension parsing (v2/v3): new
+      `oxih5_format::superblock::{SuperblockExtension, BtreeKValues}` +
+      `read_superblock_extension()`, decoding B-tree 'K' Values (0x0013),
+      Shared Message Table (0x000F), File Space Info (0x0018), and Driver
+      Info (0x0014) messages; exposed via `oxih5::File::superblock_extension()`
+      (re-exported as `oxih5::{SuperblockExtension, BtreeKValues}`); 6 new
+      unit tests + `test_superblock_extension_none_on_v0_file` integration test
+- [x] `Superblock::version` / `FileInfo::superblock_extension_address` expose
+      the real on-disk superblock version — `File::info().superblock_version`
+      no longer hardcoded to `0`
+- [x] Fixed object-header v2 continuation block (OCHK) creation-order bug:
+      `track_creation_order` was always assumed `false` inside OCHK blocks,
+      misdecoding messages when the owning object header tracks creation
+      order; now threaded through `parse_v2_block` → `parse_v2_ochk_block`
+      (including nested continuations); regression test
+      `test_parse_messages_v2_ochk_continuation_creation_order`
+- [x] cargo fmt clean; clippy --all-features --all-targets -D warnings clean;
+      rustdoc -D warnings clean; 494 tests pass (`--all-features`) / 473 with
+      default features; cargo audit 0 vulnerabilities; cargo +nightly udeps
+      0 unused dependencies
 
 ---
 
@@ -229,5 +258,5 @@ _Consolidated from static audit + Opus adversarial bug-hunt (48 verified defects
 - [x] **A/hard/Opus · H2** virtual dataset layout. (done 0.1.4: new `oxih5-format/src/vds.rs`, 728 lines — `VdsMapping`/`VdsEntry`/`VdsSelection`, `parse_vds_mapping`/`parse_vds_block`, `selection_element_offsets`; 9 unit tests + 4 integration tests in `tests/vds_tests.rs`.)
 - [x] **A/hard/Opus · H3** variable-length elements in chunked/hyperslab. (done 0.1.4: new `on_disk_elem_footprint` helper accounts for the 16-byte vlen global-heap-reference footprint; incompatible filters now explicitly rejected; `crates/oxih5/tests/vlen_chunked_tests.rs`.)
 - [x] **A/med/Opus · H4** szip RAW mode + FractalHeap I/O filters + soft→external link. (done 0.1.4: public `apply_pipeline_sized` in `filters.rs` for RAW-mode szip; fractal-heap I/O-Filters-Encoded-Length field now read at the correct offset/width; `soft_link_through_external_link` integration test in `crates/oxih5/tests/vds_tests.rs`.)
-- [ ] **B/med · H5** write-path unwrap reduction (232 non-test, up from 225) + panic!17 triage (overlaps confirmed bugs).
+- [ ] **B/med · H5** write-path unwrap reduction (232 non-test, up from 225) + panic!17 triage (overlaps confirmed bugs). (clarified 2026-07-18: a full workspace audit found 0 unwrap() call sites in actual production logic — the historical "232 non-test" count conflated test-module and doctest unwraps with production code; see README Policy Compliance. The panic! triage portion remains open.)
 - [ ] **B/easy · H6** preventive split lib.rs(1934, was 1948)/chunked.rs(1800, was 1730); examples/doctests. Both still under the 2000-line policy threshold — lib.rs actually shrank slightly (links.rs extracted per CHANGELOG) but remains the closer of the two to the cap; chunked.rs grew from the H3 vlen work above.

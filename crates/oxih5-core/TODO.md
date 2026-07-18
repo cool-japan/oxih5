@@ -1,7 +1,7 @@
 # oxih5-core TODO
 
 ## Status
-Foundation types in place: `Dtype` (Int/Float), `ByteOrder`, `Dataset` with `as_f32`/`as_f64`/`as_i32` conversion, and `OxiH5Error` with 9 error variants. ~120 SLOC production code.
+Complete data-model crate: `Dtype` covers all 10 HDF5 datatype-class variants (Int, Float, String, Compound, Array, Enum, Opaque, Reference, VarLen, Bitfield); `Dataset` provides the full eager (`as_*`) and lazy-iterator (`iter_*`) accessor family for every numeric type plus `as_string`/`as_f16`, `slice`/`reshape`, and HDF5 unlimited-dimension support (`max_dims`/`is_unlimited`/`unlimited_axes`); the `ndarray` bridge (feature-gated) covers all 11 numeric `to_array_*` conversions; `Attribute` adds scalar-decode helpers (`as_i64`/`as_u64`/`as_f64`/`as_str_fixed`/`is_scalar`/`shape`) for CF-convention metadata; `OxiH5Error` has 13 variants. ~1,800 SLOC production code (tokei) across `lib.rs` + `dataset_convert.rs`; 30 tests pass with `--all-features`, 0 failed; zero clippy/rustdoc warnings; zero `todo!()`/`unimplemented!()` in source. No functional changes in 0.2.0 (that release touched only `oxih5-format` and `oxih5`); this crate carries over unchanged from 0.1.4. Status as of v0.2.0 — 2026-07-18.
 
 ## Core Implementation
 - [x] Add `Dtype::String` variant for variable-length and fixed-length string datasets (30 SLOC)

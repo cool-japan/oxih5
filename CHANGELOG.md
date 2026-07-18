@@ -7,6 +7,20 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.2.0] - 2026-07-18
+
+### Added
+
+- **Superblock version 1 support**: files written with HDF5 superblock v1 (the "transitional" format that inserts 4 extra bytes after the File Consistency Flags, shifting the Base Address and Root Group Symbol Table Entry by +4 bytes) now parse correctly instead of failing with `OxiH5Error::UnsupportedSuperblock(1)`. New `oxih5_format::superblock::parse_v1`; covered by 4 new unit tests (`test_superblock_v1_parse`, `test_superblock_v1_nonzero_base_and_root`, `test_superblock_v1_too_short`, `test_superblock_v1_bad_offset_width`).
+- **Superblock extension parsing** (versions 2/3): new `oxih5_format::superblock::{SuperblockExtension, BtreeKValues}` and `read_superblock_extension()` decode the superblock extension object header's B-tree 'K' Values (0x0013), Shared Message Table (0x000F), File Space Info (0x0018), and Driver Info (0x0014) messages. Exposed at the facade level via `oxih5::File::superblock_extension()` and re-exported as `oxih5::{SuperblockExtension, BtreeKValues}`. 9 new unit tests plus a new integration test `test_superblock_extension_none_on_v0_file`.
+- `Superblock::version` and `FileInfo::superblock_extension_address` fields expose the actual parsed superblock version and extension address: `File::info().superblock_version` now reports the real on-disk version (0/1/2/3) instead of being hardcoded to `0`.
+
+### Fixed
+
+- **Object header v2 continuation blocks (OCHK) with creation-order tracking**: `parse_v2_ochk_block` always assumed `track_creation_order = false` for messages inside continuation blocks, so an object header that tracks creation order (flags bit 2 set) and spills messages into an OCHK continuation block had those messages misdecoded — the parser read the 2-byte creation-order field as message body data instead of skipping it. The owning object header's `track_creation_order` flag is now threaded through `parse_v2_block` → `parse_v2_ochk_block` (including nested continuations). New regression test `test_parse_messages_v2_ochk_continuation_creation_order`.
+
+---
+
 ## [0.1.4] - 2026-07-17
 
 ### Added
@@ -262,6 +276,7 @@ message.rs          — decode all standard message types
 
 ---
 
+[0.2.0]: https://github.com/cool-japan/oxih5/releases/tag/v0.2.0
 [0.1.4]: https://github.com/cool-japan/oxih5/releases/tag/v0.1.4
 [0.1.3]: https://github.com/cool-japan/oxih5/releases/tag/v0.1.3
 [0.1.2]: https://github.com/cool-japan/oxih5/releases/tag/v0.1.2
