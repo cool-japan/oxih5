@@ -1,6 +1,6 @@
 use crate::chunked::{
-    apply_filters_to_chunk, flat_to_coords, read_chunk_bytes, resolve_chunk_index,
-    row_major_strides, ChunkIndex, ChunkIndexCache, ChunkSliceParams,
+    apply_filters_to_chunk, chunk_records, flat_to_coords, index_of, read_chunk_bytes,
+    row_major_strides, ChunkIndexCache, ChunkIndexQuery, ChunkSliceParams,
 };
 use crate::hyperslab::{scatter_chunk_hyperslab, Hyperslab};
 use crate::message::LayoutInfo;
@@ -45,6 +45,7 @@ pub fn read_chunked_hyperslab(
         dimensionality,
         chunk_dims,
         index_type,
+        single_chunk,
     } = layout
     else {
         return Err(OxiH5Error::Format(
@@ -95,54 +96,21 @@ pub fn read_chunked_hyperslab(
         )));
     };
 
-    // Translate index_type (internal convention) to ChunkIndex.
-    let index = match index_type {
-        0 => ChunkIndex::BTreeV1,
-        1 => ChunkIndex::FixedArray,
-        2 => ChunkIndex::ExtensibleArray,
-        3 => ChunkIndex::BTreeV2,
-        other => {
-            return Err(OxiH5Error::Format(format!(
-                "read_chunked_hyperslab: unknown chunk index type {other}"
-            )))
-        }
-    };
+    let index = index_of(*index_type, "read_chunked_hyperslab")?;
 
     // Resolve all chunk records (with optional caching).
-    let chunks_arc: Arc<Vec<crate::btree_v2::ChunkRecord>> = if let Some(c) = cache {
-        let uncompressed_for_fa = real_chunk_dims.iter().product::<u64>() as usize * elem_size;
-        let real_chunk_dims_clone = real_chunk_dims.clone();
-        let dataset_dims_clone = dataset_dims.to_vec();
-        c.get_or_insert((*data_address, ndims), move || {
-            if index == ChunkIndex::FixedArray {
-                crate::fa_index::parse_fixed_array_v4_with_dataset_dims(
-                    file_data,
-                    *data_address,
-                    ndims,
-                    &real_chunk_dims_clone,
-                    &dataset_dims_clone,
-                    uncompressed_for_fa,
-                )
-            } else {
-                resolve_chunk_index(file_data, index, *data_address, ndims)
-            }
-        })?
-    } else {
-        let records = if index == ChunkIndex::FixedArray {
-            let uncompressed = real_chunk_dims.iter().product::<u64>() as usize * elem_size;
-            crate::fa_index::parse_fixed_array_v4_with_dataset_dims(
-                file_data,
-                *data_address,
-                ndims,
-                &real_chunk_dims,
-                dataset_dims,
-                uncompressed,
-            )?
-        } else {
-            resolve_chunk_index(file_data, index, *data_address, ndims)?
-        };
-        Arc::new(records)
-    };
+    let chunks_arc: Arc<Vec<crate::btree_v2::ChunkRecord>> = chunk_records(
+        file_data,
+        &ChunkIndexQuery {
+            index,
+            index_address: *data_address,
+            real_chunk_dims: &real_chunk_dims,
+            dataset_dims,
+            elem_size,
+            single_chunk: *single_chunk,
+        },
+        cache,
+    )?;
 
     // Build a lookup map: chunk origin → record index.
     let mut chunk_map: HashMap<Vec<u64>, usize> = HashMap::with_capacity(chunks_arc.len());

@@ -1,60 +1,120 @@
-//! Low-level HDF5 binary format writers.
+//! Low-level HDF5 binary primitives.
 //!
-//! Functions in this module write fixed-structure HDF5 elements:
-//! superblock, object headers, B-tree nodes, local heaps, and SNOD nodes.
+//! This module is a leaf of the writer: it emits fixed-shape byte structures —
+//! little-endian integers, object-header message headers, the superblock,
+//! local heaps and symbol table nodes — and knows nothing about datatypes,
+//! attributes, or object-header contents.  Everything whose length varies with
+//! user data lives in [`super::elem`] and [`super::oh`]; the shape of a group's
+//! symbol table, including the `leaf_node_K` this superblock declares, lives in
+//! [`super::btree_v1`].
+//!
+//! Every structure writer returns the number of bytes it owns, so callers can
+//! feed that straight into [`super::check_size`].
+
+use oxih5_core::OxiH5Error;
+
+use super::btree_v1::{self, SNOD_MAX_ENTRIES, SNOD_PREFIX, SNOD_SIZE, STE_SIZE};
+use super::narrow;
 
 // ---------------------------------------------------------------------------
-// Byte-write helpers (pub(super) so mod.rs and messages.rs can use them)
+// Byte-write helpers
 // ---------------------------------------------------------------------------
 
+/// Write a little-endian `u16` at `offset`.
 #[inline]
 pub(super) fn write_u16_le(buf: &mut [u8], offset: usize, val: u16) {
     buf[offset..offset + 2].copy_from_slice(&val.to_le_bytes());
 }
 
+/// Write a little-endian `u32` at `offset`.
 #[inline]
 pub(super) fn write_u32_le(buf: &mut [u8], offset: usize, val: u32) {
     buf[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
 }
 
+/// Write a little-endian `u64` at `offset`.
 #[inline]
 pub(super) fn write_u64_le(buf: &mut [u8], offset: usize, val: u64) {
     buf[offset..offset + 8].copy_from_slice(&val.to_le_bytes());
 }
 
-/// Write an 8-byte object header message header.
-pub(super) fn write_msg_header(buf: &mut [u8], offset: usize, msg_type: u16, body_size: u16) {
-    write_u16_le(buf, offset, msg_type);
-    write_u16_le(buf, offset + 2, body_size);
-    // flags = 0, reserved = 0 (already zero)
+/// Zero `len` bytes at `start`.
+///
+/// Body writers call this first so that the bytes they emit never depend on the
+/// caller having handed them a pre-zeroed buffer.
+#[inline]
+pub(super) fn fill_zero(buf: &mut [u8], start: usize, len: usize) {
+    buf[start..start + len].fill(0);
 }
 
-/// Write an 8-byte object header message header with explicit flags byte.
-pub(super) fn write_msg_header_flags(
+/// Size of an object-header message header: type, body size, flags, reserved.
+pub(super) const MSG_HDR_SIZE: usize = 8;
+
+/// Write an 8-byte object header message header.
+pub(super) fn write_msg_header(
     buf: &mut [u8],
     offset: usize,
     msg_type: u16,
     body_size: u16,
     flags: u8,
 ) {
+    fill_zero(buf, offset, MSG_HDR_SIZE);
     write_u16_le(buf, offset, msg_type);
     write_u16_le(buf, offset + 2, body_size);
     buf[offset + 4] = flags;
+    // bytes 5..8 are reserved and stay zero
 }
 
 // ---------------------------------------------------------------------------
-// HDF5 signature
+// HDF5 signature + superblock v0
 // ---------------------------------------------------------------------------
 
-pub(super) fn write_signature(buf: &mut [u8]) {
-    buf[0..8].copy_from_slice(&[0x89, 0x48, 0x44, 0x46, 0x0d, 0x0a, 0x1a, 0x0a]);
+/// Size of the HDF5 file signature.
+pub(super) const SIGNATURE_SIZE: usize = 8;
+
+/// Address of the root group's object header, fixed by the superblock layout.
+pub(super) const ROOT_OH_ADDR: usize = 96;
+
+/// Write the 8-byte HDF5 signature; returns bytes written.
+pub(super) fn write_signature(buf: &mut [u8]) -> usize {
+    buf[0..SIGNATURE_SIZE].copy_from_slice(&[0x89, 0x48, 0x44, 0x46, 0x0d, 0x0a, 0x1a, 0x0a]);
+    SIGNATURE_SIZE
 }
 
-// ---------------------------------------------------------------------------
-// Superblock v0 (bytes 8..96) — parameterized addresses
-// ---------------------------------------------------------------------------
+/// Narrow a compile-time geometry constant to the width of its superblock
+/// field.
+///
+/// Used only to initialise `const` items, so the assertion fails the *build*
+/// rather than a write if the geometry ever stops fitting.
+const fn as_u16(value: usize) -> u16 {
+    assert!(value <= u16::MAX as usize);
+    value as u16
+}
 
-pub(super) fn write_superblock(buf: &mut [u8], btree_addr: usize, heap_addr: usize, eof_addr: u64) {
+/// `leaf_node_K` as the superblock encodes it.
+///
+/// libhdf5 sizes a symbol table node's on-disk image from this field alone —
+/// `8 + 2*K*40` — so it must be the same K that
+/// [`btree_v1::SNOD_SIZE`](super::btree_v1::SNOD_SIZE) is built from.  Reading
+/// it from there rather than repeating a literal is what makes the superblock
+/// and the nodes provably agree.
+const SYM_LEAF_K_FIELD: u16 = as_u16(btree_v1::SYM_LEAF_K);
+
+/// `internal_node_K` as the superblock encodes it.
+const GROUP_INTERNAL_K_FIELD: u16 = as_u16(btree_v1::GROUP_INTERNAL_K);
+
+/// Write superblock v0 into `buf[8..96]`; returns bytes written.
+///
+/// The trailing root-group symbol table entry points at the root object header
+/// at [`ROOT_OH_ADDR`], whose symbol table message duplicates `btree_addr` and
+/// `heap_addr`.
+pub(super) fn write_superblock(
+    buf: &mut [u8],
+    btree_addr: usize,
+    heap_addr: usize,
+    eof_addr: u64,
+) -> usize {
+    fill_zero(buf, SIGNATURE_SIZE, ROOT_OH_ADDR - SIGNATURE_SIZE);
     buf[8] = 0x00; // superblock version 0
     buf[9] = 0x00; // free-space version
     buf[10] = 0x00; // root group STE version
@@ -63,8 +123,8 @@ pub(super) fn write_superblock(buf: &mut [u8], btree_addr: usize, heap_addr: usi
     buf[13] = 0x08; // size_of_offsets = 8
     buf[14] = 0x08; // size_of_lengths = 8
     buf[15] = 0x00; // reserved
-    write_u16_le(buf, 16, 4); // leaf_node_K = 4
-    write_u16_le(buf, 18, 16); // internal_node_K = 16
+    write_u16_le(buf, 16, SYM_LEAF_K_FIELD); // leaf_node_K
+    write_u16_le(buf, 18, GROUP_INTERNAL_K_FIELD); // internal_node_K
     write_u32_le(buf, 20, 0); // file consistency flags
 
     write_u64_le(buf, 24, 0); // base address
@@ -74,199 +134,183 @@ pub(super) fn write_superblock(buf: &mut [u8], btree_addr: usize, heap_addr: usi
 
     // Root Group Symbol Table Entry
     write_u64_le(buf, 56, 0); // link_name_offset = 0
-    write_u64_le(buf, 64, 96); // root group OH address = 96
+    write_u64_le(buf, 64, ROOT_OH_ADDR as u64); // root group OH address
     write_u32_le(buf, 72, 1); // cache_type = 1 (root group)
     write_u32_le(buf, 76, 0); // reserved
     write_u64_le(buf, 80, btree_addr as u64); // B-tree address
     write_u64_le(buf, 88, heap_addr as u64); // local heap address
+
+    ROOT_OH_ADDR - SIGNATURE_SIZE
 }
-
-// ---------------------------------------------------------------------------
-// Root group object header v1 at address 96 — parameterized + root attrs
-// ---------------------------------------------------------------------------
-
-/// Compute the size (bytes) of the root group OH for the given root string attrs.
-pub(super) fn compute_root_oh_size(root_str_attrs: &[(String, String)]) -> usize {
-    let sym_tab_msg = super::messages::msg_total(16); // Symbol Table msg body = 16
-    let attr_total: usize = root_str_attrs
-        .iter()
-        .map(|(name, val)| {
-            super::messages::msg_total(super::messages::attr_body_size_str(name, val))
-        })
-        .sum();
-    16 + sym_tab_msg + attr_total // 16-byte OH prefix
-}
-
-/// Write the root group OH at buf[96..96+oh_size].
-pub(super) fn write_root_oh(
-    buf: &mut [u8],
-    btree_addr: usize,
-    heap_addr: usize,
-    root_str_attrs: &[(String, String)],
-    oh_size: usize,
-) {
-    const BASE: usize = 96;
-    let sym_tab_body = 16u16;
-    let sym_tab_msg_total = super::messages::msg_total(16);
-    let attr_total: usize = root_str_attrs
-        .iter()
-        .map(|(name, val)| {
-            super::messages::msg_total(super::messages::attr_body_size_str(name, val))
-        })
-        .sum();
-
-    let header_data_size = sym_tab_msg_total + attr_total;
-    let num_messages = 1 + root_str_attrs.len();
-
-    // OH prefix
-    buf[BASE] = 0x01;
-    buf[BASE + 1] = 0x00;
-    write_u16_le(buf, BASE + 2, num_messages as u16);
-    write_u32_le(buf, BASE + 4, 1);
-    write_u32_le(buf, BASE + 8, header_data_size as u32);
-    write_u32_le(buf, BASE + 12, 0);
-
-    let mut pos = BASE + 16;
-
-    // Symbol Table message (type 0x0011)
-    write_msg_header(buf, pos, 0x0011, sym_tab_body);
-    write_u64_le(buf, pos + 8, btree_addr as u64);
-    write_u64_le(buf, pos + 16, heap_addr as u64);
-    pos += sym_tab_msg_total;
-
-    // Root group string attribute messages
-    for (name, val) in root_str_attrs {
-        let body_sz = super::messages::attr_body_size_str(name, val);
-        write_msg_header(buf, pos, 0x000C, body_sz as u16);
-        super::messages::write_str_attr_body(buf, pos + 8, name, val);
-        pos += super::messages::msg_total(body_sz);
-    }
-    let _ = (pos, oh_size);
-}
-
-// ---------------------------------------------------------------------------
-// Group object header (for sub-groups, W0b)
-// ---------------------------------------------------------------------------
-
-/// Write a sub-group object header (40 bytes: 16-byte prefix + Symbol Table msg).
-pub(super) fn write_group_oh(
-    buf: &mut [u8],
-    base: usize,
-    grp_btree_addr: usize,
-    grp_heap_addr: usize,
-) {
-    buf[base] = 0x01; // version = 1
-    buf[base + 1] = 0x00; // reserved
-    write_u16_le(buf, base + 2, 1); // num_messages = 1
-    write_u32_le(buf, base + 4, 1); // reference count = 1
-    write_u32_le(buf, base + 8, 24); // header_data_size = 24 (sym table msg)
-    write_u32_le(buf, base + 12, 0); // reserved
-
-    // Symbol Table message
-    write_msg_header(buf, base + 16, 0x0011, 16);
-    write_u64_le(buf, base + 24, grp_btree_addr as u64);
-    write_u64_le(buf, base + 32, grp_heap_addr as u64);
-}
-
-/// Fixed size of a sub-group OH = 40 bytes.
-pub(super) const GROUP_OH_SIZE: usize = 40;
-
-// ---------------------------------------------------------------------------
-// B-tree v1 leaf node — group B-tree (node type 0)
-// ---------------------------------------------------------------------------
-
-/// Write a B-tree v1 group leaf node (48 bytes) at `base`.
-/// `snod_addr` is the address of the single child SNOD.
-/// `key1` is the last name offset in the associated heap (upper key).
-pub(super) fn write_btree_leaf(buf: &mut [u8], base: usize, snod_addr: u64, key1: u64) {
-    buf[base..base + 4].copy_from_slice(b"TREE");
-    buf[base + 4] = 0x00; // node_type = 0 (group)
-    buf[base + 5] = 0x00; // level = 0 (leaf)
-    write_u16_le(buf, base + 6, 1); // entries_used = 1
-    write_u64_le(buf, base + 8, u64::MAX); // left sibling (undefined)
-    write_u64_le(buf, base + 16, u64::MAX); // right sibling (undefined)
-    write_u64_le(buf, base + 24, 0); // key[0]
-    write_u64_le(buf, base + 32, snod_addr); // child[0]
-    write_u64_le(buf, base + 40, key1); // key[1]
-}
-
-/// Fixed size of a group B-tree leaf node = 48 bytes.
-pub(super) const BTREE_LEAF_SIZE: usize = 48;
 
 // ---------------------------------------------------------------------------
 // Local heap — header + data segment
 // ---------------------------------------------------------------------------
 
-/// Write local heap header (32 bytes) at `base`.
-/// `data_addr` is the absolute address of the heap data segment.
-/// `data_size` is the total allocated size of the data segment.
-/// `used_size` is how many bytes are actually used (free list starts here).
+/// Fixed size of a local heap header.
+pub(super) const HEAP_HEADER_SIZE: usize = 32;
+
+/// Write a local heap header at `base`; returns bytes written.
+///
+/// `data_addr` is the absolute address of the heap data segment, `data_size`
+/// its total allocated size, and `used_size` how much of it is occupied — the
+/// free list starts at that offset.
 pub(super) fn write_local_heap(
     buf: &mut [u8],
     base: usize,
     data_addr: usize,
     data_size: usize,
     used_size: usize,
-) {
+) -> usize {
+    fill_zero(buf, base, HEAP_HEADER_SIZE);
     buf[base..base + 4].copy_from_slice(b"HEAP");
     buf[base + 4] = 0x00; // version = 0
-                          // bytes 5..8 = reserved (already zero)
+                          // bytes 5..8 = reserved
     write_u64_le(buf, base + 8, data_size as u64); // data segment size
     write_u64_le(buf, base + 16, used_size as u64); // first free block offset
     write_u64_le(buf, base + 24, data_addr as u64); // data segment address
+    HEAP_HEADER_SIZE
 }
-
-/// Fixed size of a local heap header = 32 bytes.
-pub(super) const HEAP_HEADER_SIZE: usize = 32;
 
 // ---------------------------------------------------------------------------
 // SNOD — Symbol Table Node
 // ---------------------------------------------------------------------------
 
-/// Write a SNOD at `snod_addr` with `n` dataset entries (cache_type=0)
-/// and `m` group entries (cache_type=1).
+/// One symbol table entry.
+pub(super) struct SnodEntry {
+    /// Offset of the link name within the enclosing local heap.
+    pub(super) name_offset: u64,
+    /// Object-header address of the linked object.
+    pub(super) oh_addr: u64,
+    /// Present for groups only (`cache_type = 1`): the group's own B-tree and
+    /// local heap addresses, cached in the entry's scratch pad.
+    pub(super) group_cache: Option<(u64, u64)>,
+}
+
+/// Write a SNOD holding `entries`; returns bytes written, always
+/// [`SNOD_SIZE`](super::btree_v1::SNOD_SIZE).
 ///
-/// Dataset entries: name_offsets[0..n], oh_addrs[0..n]
-/// Group entries: grp_name_offsets[0..m], grp_oh_addrs[0..m],
-///                grp_btree_addrs[0..m], grp_heap_addrs[0..m]
-#[allow(clippy::too_many_arguments)]
+/// Every SNOD in the file is emitted at that one fixed width, with the slots
+/// past `entries.len()` zero-filled, because libhdf5 sizes the image it reads
+/// from the superblock's `leaf_node_K` and not from the node's own `nsyms` —
+/// see [`super::btree_v1`].
+///
+/// # Errors
+///
+/// Returns `OxiH5Error::Format` if `entries` overruns
+/// [`SNOD_MAX_ENTRIES`](super::btree_v1::SNOD_MAX_ENTRIES), or if the entry
+/// count does not fit the 16-bit on-disk field.
 pub(super) fn write_snod(
     buf: &mut [u8],
     snod_addr: usize,
-    name_offsets: &[u64],
-    oh_addrs: &[usize],
-    grp_name_offsets: &[u64],
-    grp_oh_addrs: &[usize],
-    grp_btree_addrs: &[usize],
-    grp_heap_addrs: &[usize],
-) {
-    let n_ds = name_offsets.len();
-    let n_grp = grp_name_offsets.len();
-    let n = n_ds + n_grp;
+    entries: &[SnodEntry],
+) -> Result<usize, OxiH5Error> {
+    if entries.len() > SNOD_MAX_ENTRIES {
+        return Err(OxiH5Error::Format(format!(
+            "internal writer error: symbol table node holds {} entries, capacity {SNOD_MAX_ENTRIES}",
+            entries.len()
+        )));
+    }
+    let total = SNOD_SIZE;
+    fill_zero(buf, snod_addr, total);
 
-    let base = snod_addr;
-    buf[base..base + 4].copy_from_slice(b"SNOD");
-    buf[base + 4] = 0x01; // version = 1
-    buf[base + 5] = 0x00; // reserved
-    write_u16_le(buf, base + 6, n as u16); // num_symbols
+    buf[snod_addr..snod_addr + 4].copy_from_slice(b"SNOD");
+    buf[snod_addr + 4] = 0x01; // version = 1
+    buf[snod_addr + 5] = 0x00; // reserved
+    write_u16_le(
+        buf,
+        snod_addr + 6,
+        narrow::<u16>("symbol table entry count", entries.len())?,
+    );
 
-    // Dataset entries (cache_type = 0)
-    for i in 0..n_ds {
-        let ste = base + 8 + i * 40;
-        write_u64_le(buf, ste, name_offsets[i]);
-        write_u64_le(buf, ste + 8, oh_addrs[i] as u64);
-        // cache_type = 0, reserved = 0, scratch = 0 (already zero)
+    for (i, entry) in entries.iter().enumerate() {
+        let ste = snod_addr + SNOD_PREFIX + i * STE_SIZE;
+        write_u64_le(buf, ste, entry.name_offset);
+        write_u64_le(buf, ste + 8, entry.oh_addr);
+        if let Some((btree_addr, heap_addr)) = entry.group_cache {
+            write_u32_le(buf, ste + 16, 1); // cache_type = 1 (group)
+            write_u32_le(buf, ste + 20, 0); // reserved
+            write_u64_le(buf, ste + 24, btree_addr); // scratch: B-tree addr
+            write_u64_le(buf, ste + 32, heap_addr); // scratch: local heap addr
+        }
+        // cache_type = 0 and an all-zero scratch pad for plain objects.
     }
 
-    // Group entries (cache_type = 1, scratch = btree + heap)
-    for i in 0..n_grp {
-        let ste = base + 8 + (n_ds + i) * 40;
-        write_u64_le(buf, ste, grp_name_offsets[i]);
-        write_u64_le(buf, ste + 8, grp_oh_addrs[i] as u64);
-        write_u32_le(buf, ste + 16, 1); // cache_type = 1 (group)
-        write_u32_le(buf, ste + 20, 0); // reserved
-        write_u64_le(buf, ste + 24, grp_btree_addrs[i] as u64); // scratch: B-tree addr
-        write_u64_le(buf, ste + 32, grp_heap_addrs[i] as u64); // scratch: heap addr
+    Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signature_and_superblock_fill_the_root_oh_prefix() {
+        let mut buf = vec![0u8; ROOT_OH_ADDR];
+        let sig = write_signature(&mut buf);
+        let sb = write_superblock(&mut buf, 200, 300, 4096);
+        assert_eq!(sig + sb, ROOT_OH_ADDR);
+        assert_eq!(&buf[0..4], &[0x89, b'H', b'D', b'F']);
+        assert_eq!(u64::from_le_bytes(buf[40..48].try_into().unwrap()), 4096);
+        assert_eq!(
+            u64::from_le_bytes(buf[64..72].try_into().unwrap()),
+            ROOT_OH_ADDR as u64
+        );
     }
-    // Any remaining entries are zero (already zero from vec initialization).
+
+    /// The superblock must declare the very `leaf_node_K` the SNOD writer is
+    /// built from: libhdf5 sizes a node's image from the field, our writer
+    /// sizes it from the constant, and they are the same number by
+    /// construction.
+    #[test]
+    fn superblock_declares_the_geometry_the_nodes_are_built_from() {
+        let mut buf = vec![0u8; ROOT_OH_ADDR];
+        write_superblock(&mut buf, 200, 300, 4096);
+        let leaf_k = u16::from_le_bytes([buf[16], buf[17]]) as usize;
+        let internal_k = u16::from_le_bytes([buf[18], buf[19]]) as usize;
+        assert_eq!(leaf_k, btree_v1::SYM_LEAF_K);
+        assert_eq!(internal_k, btree_v1::GROUP_INTERNAL_K);
+        // The arithmetic H5G__cache_node_deserialize performs on the field.
+        assert_eq!(SNOD_PREFIX + 2 * leaf_k * STE_SIZE, SNOD_SIZE);
+    }
+
+    #[test]
+    fn snod_entries_are_written_at_forty_byte_stride() {
+        let mut buf = vec![0u8; SNOD_SIZE];
+        let entries = vec![
+            SnodEntry {
+                name_offset: 8,
+                oh_addr: 0x1000,
+                group_cache: None,
+            },
+            SnodEntry {
+                name_offset: 16,
+                oh_addr: 0x2000,
+                group_cache: Some((0x3000, 0x4000)),
+            },
+        ];
+        let wrote = write_snod(&mut buf, 0, &entries).expect("write_snod");
+        assert_eq!(wrote, SNOD_SIZE);
+        assert_eq!(&buf[0..4], b"SNOD");
+        assert_eq!(u16::from_le_bytes([buf[6], buf[7]]), 2);
+        assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 8);
+        // Second entry is a group: cache_type 1 plus the scratch-pad addresses.
+        assert_eq!(u32::from_le_bytes(buf[64..68].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(buf[72..80].try_into().unwrap()), 0x3000);
+        assert_eq!(u64::from_le_bytes(buf[80..88].try_into().unwrap()), 0x4000);
+        // Unused slots stay zero — libhdf5 decodes all 2K of them regardless.
+        assert!(buf[88..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn snod_rejects_more_entries_than_one_node_can_hold() {
+        let mut buf = vec![0u8; SNOD_SIZE];
+        let entries: Vec<SnodEntry> = (0..SNOD_MAX_ENTRIES + 1)
+            .map(|_| SnodEntry {
+                name_offset: 0,
+                oh_addr: 0,
+                group_cache: None,
+            })
+            .collect();
+        assert!(write_snod(&mut buf, 0, &entries).is_err());
+    }
 }

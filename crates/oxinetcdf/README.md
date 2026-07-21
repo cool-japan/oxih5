@@ -36,18 +36,20 @@ use oxinetcdf::{NcFile, NcFileWriter};
 // Reading
 let nc = NcFile::open("data.nc")?;
 let root = nc.root_group()?;
-for var in root.variables() {
-    println!("{}: {:?}", var.name(), var.shape());
+for var in &root.variables {
+    println!("{}: {:?}", var.name, var.shape);
 }
 let lat = root.variable("lat").unwrap();
 let values = lat.read_f64(&nc)?;
 
 // Writing
-let mut w = NcFileWriter::create("out.nc")?;
-w.def_dim("time", 0)?;   // 0 = unlimited
-w.def_var("temp", &["time"], oxinetcdf::NcType::Float64)?;
-w.put_var_f64("temp", &[20.5, 21.0, 19.8])?;
-w.close()?;
+let mut w = NcFileWriter::new();
+let lat_dim = w.def_dim("lat", 4)?;
+let lon_dim = w.def_dim("lon", 8)?;
+let temp = w.def_var("temp", &[lat_dim, lon_dim], oxinetcdf::NcType::Float64)?;
+let data: Vec<f64> = (0..32).map(|i| i as f64 * 0.5).collect();
+w.put_var_f64(temp, &data)?;
+w.close("out.nc")?;
 ```
 
 ---

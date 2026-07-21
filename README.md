@@ -9,10 +9,10 @@ provides a minimal write path for flat contiguous datasets.
 
 ---
 
-## Release: 0.2.0 (2026-07-18)
+## Release: 0.2.1 (2026-07-21)
 
-494 unit + integration tests (`--all-features`; 473 with default features);
-all pass.  Full workspace (~22.1 k SLOC of Rust across four crates).
+682 unit + integration tests (`--all-features`; 661 with default features);
+all pass.  Full workspace (~27.9 k SLOC of Rust across four crates).
 
 ---
 
@@ -59,7 +59,7 @@ message.rs          — decode all standard message types
 
 ---
 
-## What Works (v0.2.0)
+## What Works (v0.2.1)
 
 ### Superblock
 
@@ -140,7 +140,8 @@ Enable the `parallel` feature for concurrent chunk decompression via Rayon.
 ### Write support
 
 `FileWriter` — creates valid HDF5 files readable by h5py and libhdf5.
-Supported dtypes: float32, float64, int32, uint8.  v0.1.2 additions:
+Supported dtypes: float32, float64, int8, int16, int32, int64, uint8,
+uint16, uint32, uint64 (all ten fixed-width element types).  v0.1.2 additions:
 - Multi-group HDF5 files (`create_group`, `write_group_dataset_f64/i32`)
 - Unlimited / chunked datasets (`create_dataset_unlimited`)
 - Root group string attributes (`write_root_str_attr`)
@@ -197,10 +198,11 @@ let f = oxih5::open_mmap("large_file.h5")?;
 
 // Write a new HDF5 file
 use oxih5::FileWriter;
-FileWriter::new("output.h5")?
-    .write_dataset_f32("temperature", &[1.0f32, 2.0, 3.0], &[3])?
-    .write_dataset_i32("index", &[0i32, 1, 2], &[3])?
-    .finish()?;
+let path = std::env::temp_dir().join("output.h5");
+let mut writer = FileWriter::new();
+writer.write_dataset_f32("temperature", &[1.0f32, 2.0, 3.0], &[3])?;
+writer.write_dataset_i32("index", &[0i32, 1, 2], &[3])?;
+writer.build(&path)?;
 ```
 
 ---
@@ -219,6 +221,7 @@ FileWriter::new("output.h5")?
 | M7 | DONE (0.1.2) | NcFileWriter, unlimited dims, sub-groups, GlobalHeap writer, CF conventions, fill masks, deep group hierarchy |
 | M8 | DONE (0.1.4) | Virtual dataset (VDS) reads, chunked vlen/vlen-string reads, szip RAW-mode decoding, filtered fractal-heap root blocks, soft→external link chains |
 | M9 | DONE (0.2.0) | Superblock v1 parsing, superblock v2/v3 extension parsing (B-tree K values, shared message table, file space info, driver info), object-header v2 OCHK continuation creation-order fix |
+| M10 | DONE (0.2.1) | DEFLATE compression on write (`set_deflate`), real multi-chunk tiling with per-chunk compression, in-place dataset overwrite (`write_dataset_in_place`), nested groups at any depth (`create_group("a/b/c")`, auto-created intermediate groups), attributes on sub-groups and non-string/array-valued root-group attributes; fixed 8 write-path correctness bugs (chunk B-tree sized for libhdf5's real `2×K` node width instead of the dataset's own chunk count, 2-D unlimited variables reading back mostly zero, groups with 9+ links being unreadable by libhdf5, links declared out of name order being silently invisible, a dataset able to shadow a group of the same name, dangling object references silently becoming the undefined-address sentinel, soft links inside old-style/default-libver groups not resolving, and HDF5 layout-message version 4 — used by `libver='latest'` files — being entirely unsupported on read) |
 
 ---
 
@@ -247,7 +250,7 @@ cargo +nightly fuzz run fuzz_file_open
 - SZIP via `oxiarc-szip` (feature-gated; COOLJAPAN policy).
 - HDF5 FFI crates banned workspace-wide via `deny.toml`.
 - Zero `unwrap()` in production code paths: a full workspace audit
-  (2026-07-18) found 327 total `.unwrap()` call sites, and every one is
+  (2026-07-21) found 404 total `.unwrap()` call sites, and every one is
   confined to test modules (`#[cfg(test)]`), the `oxih5/tests/write_tests.rs`
   integration-test binary, `benches/*.rs` Criterion benchmarks, or
   `///`/`//!` rustdoc example code — none in shipped library logic.

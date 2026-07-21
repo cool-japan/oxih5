@@ -1,9 +1,9 @@
 # OxiH5 Project TODO
 
-## Status — 0.2.0 (2026-07-18)
+## Status — 0.2.1 (2026-07-21)
 
-Functional read/write HDF5 library (~22.1 k SLOC Rust, 494 tests with
-`--all-features` / 473 with default features, all pass).
+Functional read/write HDF5 library (~27.9 k SLOC Rust, 682 tests with
+`--all-features` / 661 with default features, all pass).
 Supports superblock v0/v1/v2/v3 (+ v2/v3 superblock extension parsing:
 B-tree K values, shared message table, file space info, driver info via
 `File::superblock_extension()`), object header v1/v2 (+continuation, with
@@ -232,6 +232,77 @@ groups, 2-D partial-edge chunks.  Write support via `FileWriter`.
         arm in build_bytes; 12 new tests (`w0d_gcol_round_trip`, `w0d_gcol_empty_string`,
         `w0d_gcol_with_coexisting_numeric_dataset`, 6 GlobalHeapWriter unit tests,
         `nc_string_variable_round_trip`, `nc_string_var_with_empty_strings`); 440 total tests, zero warnings)
+  - [x] Nested groups: paths at every writer entry point, with intermediate groups created on demand
+        (done 2026-07-21: W1b — `GroupDesc` and `root_str_attrs` collapsed into one recursive
+        `tree::GroupNode`; new `write/tree.rs` (object model, `split_path`, `group_mut`, `name_taken`,
+        `insertion_point`, `attrs_mut`) and `write/plan.rs` (recursive pass one), `write/build.rs` now
+        pass two only; the root group is planned and emitted like any other, pinned to address 96;
+        `write_dataset_f64("/a/b/x", …)` creates `a` and `a/b` (h5py `create_intermediate_group=True`);
+        one `name_taken` at every insertion point, so a dataset can no longer shadow a group; object
+        references resolved over the whole plan tree by path and an unresolvable target is now an error
+        instead of `u64::MAX`; tests `w1b_three_level_nesting_roundtrip`,
+        `w1b_intermediate_groups_auto_created`, `w1b_dataset_cannot_shadow_group_name`,
+        `w1b_group_cannot_shadow_dataset_name`, `w1b_objref_across_groups_resolves`,
+        `w1b_unresolvable_objref_is_an_error`, `w1b_deep_nesting_many_groups`, plus h5py interop
+        `test_write_h5py_three_level_nesting` and `test_write_h5py_subgroup_spanning_multiple_snods`)
+  - [x] Group attributes, non-string root-group attributes, and array-valued attributes
+        (done 2026-07-21: W1c — `GroupNode.attrs` → `OhMsg::Attr` after `OhMsg::SymbolTable`, so any group
+        at any depth carries attributes; `write_string_attr`/`write_f64_attr`/`write_i64_attr`/
+        `write_i32_attr`/`write_obj_ref_list_attr` resolve their path to a dataset *or* a group, `"/"`
+        being the root group, and `write_root_str_attr` is now `write_string_attr("/", …)`;
+        new `write_i64_array_attr`/`write_f64_array_attr`/`write_string_array_attr` with a
+        `ResolvedAttrKind::vector_len()` that decides scalar-versus-1-D dataspace once; tests
+        `w1c_subgroup_attrs_roundtrip`, `w1c_root_group_non_string_attrs`,
+        `w1c_root_str_attr_is_a_root_group_attr`, `w1c_array_valued_attrs`, plus h5py interop
+        `test_write_h5py_group_attributes` and `test_write_h5py_root_group_attributes`;
+        golden hash moved `0x3a9a_d435_7143_2277` → `0x199c_ba54_0314_ee2a` because the W1x fixture was
+        extended to cover the new features — the restructure itself was byte-neutral)
+
+  - [x] Chunk B-tree conformance + DEFLATE compression on write
+        (done 2026-07-21: W1e — `write/chunked.rs` rewritten; a node is now `chunk_node_size(rank)`
+        bytes wide (2096 for 1-D) because libhdf5 sizes the image from a compile-time
+        `HDF5_BTREE_CHUNK_IK_DEF = 32` that superblock v0 never records, and the old 80-byte node
+        made *every* chunked file we had ever written fail with `addr overflow, addr = 3000,
+        size = 2096, eoa = 3112`; terminal key `key[K]` now carries the extent rounded up to a
+        chunk boundary with `nbytes = 0`, where it used to be all-zero and gave `H5D__btree_cmp3`
+        an empty search range; `DatasetDesc`'s `unlimited: bool` + `chunk_shape` collapsed into
+        `Storage::{Contiguous, Chunked}` plus `Option<Filter>`; new `write/payload.rs` compresses
+        during the *layout* pass — a compressed length is not derivable, and the B-tree key needs
+        it before emission — with one `data_size()` both passes agree through, and new
+        `write/pipeline.rs` encodes the 0x000B message (v1 emitted, v2 implemented behind
+        `PIPELINE_VERSION`, both round-tripped through the real `parse_filter_pipeline`, which
+        silently returns an *empty* pipeline with `Ok` for any other version); public API is one
+        method, `FileWriter::set_deflate(path, level)`, which flips storage to chunked and rejects
+        vlen-string datasets because the read side refuses to decode them through a pipeline;
+        a short `chunk_shape` is now completed from the *dataset shape* rather than from 1s, which
+        fixes `oxinetcdf`'s 2-D unlimited variables reading back mostly zeroes without touching
+        `oxinetcdf`; tests `w1e_deflate_roundtrip_f64`, `w1e_deflate_every_level_roundtrips`,
+        `w1e_deflate_pipeline_msg_parses`, `w1e_chunk_btree_terminal_key_is_extent`,
+        `w1e_zero_length_chunked_dataset`, `w1e_zero_length_dataset_indexes_nothing`,
+        `w1e_vlen_string_deflate_rejected`, `w1e_set_deflate_rejects_non_datasets`,
+        `w1e_deflate_preserves_an_unlimited_dimension`, h5py interop
+        `test_write_h5py_deflate_roundtrip` + `test_write_h5py_chunked_unlimited`, and read-side
+        `w1e_read_h5py_deflate_*` against a new h5py-authored `fixtures/deflate_chunked.h5`;
+        golden hash moved `0x199c_ba54_0314_ee2a` → `0xa273_56da_84d2_67f6` and the fixture grew
+        6 968 → 11 504 bytes, entirely from the two chunk B-tree nodes)
+  - [x] Real chunk tiling: N chunks, N-entry multi-level index, per-chunk compression
+        (done 2026-07-21: W1e2 — `chunk_origins` cuts the dataset into `ceil(shape/chunk)` tiles
+        row-major with dimension 0 most significant, the order confirmed by dumping the B-tree keys
+        of an h5py-authored 2-D file rather than inferred; `payload::cut_tile` stores an edge chunk
+        **full-size** with fill in the overhang, because a short tile would contradict the chunk
+        dimensions in the layout message; new `chunked::ChunkTree` plans, places and emits the whole
+        index, growing levels past 64 chunks so the layout message points at the tree *root* and not
+        at the first leaf — `key[i]` is a child's inclusive lower bound and `key[i+1]` its exclusive
+        upper bound, the opposite of the group B-tree's convention in `btree_v1.rs`; capped at 2^24
+        chunks with a typed error; tests `w1e2_multi_chunk_roundtrip_ragged_1d` (`[7]` in `[3]`),
+        `w1e2_multi_chunk_roundtrip_ragged_2d` (`[5,3]` in `[2,2]`, plus each dimension ragged
+        alone), `w1e2_multi_level_chunk_index_roundtrip`, `tree_depth_follows_the_chunk_count`,
+        `a_two_level_tree_brackets_every_child`, and h5py interop
+        `test_write_h5py_multi_chunk_tiling`, which additionally checks the chunk origins
+        `iter_chunks()` decodes and enumerates all 8500 chunks of a three-level index.
+        **Mutation-tested**: transposing the chunk grid to column-major leaves every oxih5
+        round-trip test passing and fails only the h5py test — the same trap four agents have now
+        hit, so the h5py interop tests are the load-bearing ones for chunk conformance)
 
 ### Publish prerequisites
 - [x] oxiarc-szip must be published to crates.io before oxih5-format can be
@@ -259,4 +330,4 @@ _Consolidated from static audit + Opus adversarial bug-hunt (48 verified defects
 - [x] **A/hard/Opus · H3** variable-length elements in chunked/hyperslab. (done 0.1.4: new `on_disk_elem_footprint` helper accounts for the 16-byte vlen global-heap-reference footprint; incompatible filters now explicitly rejected; `crates/oxih5/tests/vlen_chunked_tests.rs`.)
 - [x] **A/med/Opus · H4** szip RAW mode + FractalHeap I/O filters + soft→external link. (done 0.1.4: public `apply_pipeline_sized` in `filters.rs` for RAW-mode szip; fractal-heap I/O-Filters-Encoded-Length field now read at the correct offset/width; `soft_link_through_external_link` integration test in `crates/oxih5/tests/vds_tests.rs`.)
 - [ ] **B/med · H5** write-path unwrap reduction (232 non-test, up from 225) + panic!17 triage (overlaps confirmed bugs). (clarified 2026-07-18: a full workspace audit found 0 unwrap() call sites in actual production logic — the historical "232 non-test" count conflated test-module and doctest unwraps with production code; see README Policy Compliance. The panic! triage portion remains open.)
-- [ ] **B/easy · H6** preventive split lib.rs(1934, was 1948)/chunked.rs(1800, was 1730); examples/doctests. Both still under the 2000-line policy threshold — lib.rs actually shrank slightly (links.rs extracted per CHANGELOG) but remains the closer of the two to the cap; chunked.rs grew from the H3 vlen work above.
+- [ ] **B/easy · H6** preventive split lib.rs(**done**)/chunked.rs(1963, was 1730); examples/doctests. lib.rs reached 1999 of the 2000-line cap and has now been split (0.2.1) into `file.rs` (`File`), `group_handle.rs` (`Group`), `reader.rs` (navigation + object-header dataset assembly) and `slicing.rs` (lazy range/hyperslab reads), leaving lib.rs at 388 lines; `links.rs` swapped its `use super::*` glob for explicit imports. Behaviour-preserving — the public API surface is unchanged apart from the two `pub use` re-exports that keep `oxih5::File`/`oxih5::Group` at their original paths. `oxih5-format/src/chunked.rs` (1963) remains the outstanding half.

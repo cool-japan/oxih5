@@ -11,16 +11,16 @@ This crate is the recommended entry point: it wires together [`oxih5-core`] (the
 
 ```toml
 [dependencies]
-oxih5 = "0.2.0"
+oxih5 = "0.2.1"
 
 # With the ndarray bridge (Dataset::to_array_f32 / _f64 / _i32):
-oxih5 = { version = "0.2.0", features = ["ndarray"] }
+oxih5 = { version = "0.2.1", features = ["ndarray"] }
 
 # With rayon-parallel chunk assembly:
-oxih5 = { version = "0.2.0", features = ["parallel"] }
+oxih5 = { version = "0.2.1", features = ["parallel"] }
 
 # With szip (compression id 4) chunk decoding:
-oxih5 = { version = "0.2.0", features = ["szip"] }
+oxih5 = { version = "0.2.1", features = ["szip"] }
 ```
 
 ## Quick Start
@@ -142,7 +142,7 @@ Both old-style groups (B-tree v1 + SNOD + local heap) and new-style groups (Link
 
 ## `FileWriter` — flat-file writer
 
-A builder that produces minimal, valid HDF5 files (superblock v0, old-style root group). `write_dataset_*` / `create_dataset` write contiguous, uncompressed data; `create_dataset_unlimited` writes a single chunk with an unlimited first dimension; `create_group` / `write_group_dataset_*` add single-level sub-groups (no nesting); `create_vlen_string_dataset` writes variable-length UTF-8 strings; the `write_*_attr` family attaches attributes to a dataset, the root group, or a grouped dataset. Constraints: up to **64** datasets + sub-groups combined at root, **32** datasets per sub-group. Each `write_dataset_*` returns `&mut Self` for chaining; most other `create_*` / `write_*_attr` methods return `Result<(), OxiH5Error>` (`write_root_str_attr` is infallible and returns `()`).
+A builder that produces minimal, valid HDF5 files (superblock v0, old-style root group). `write_dataset_*` / `create_dataset` write contiguous data; `create_dataset_unlimited` writes a chunked dataset with an unlimited first dimension, tiled into `ceil(shape[d] / chunk_shape[d])` chunks per dimension exactly as libhdf5 tiles one; `set_deflate` DEFLATE-compresses a dataset's chunks, converting a contiguous dataset to chunked storage first if needed; `create_vlen_string_dataset` writes variable-length UTF-8 strings; the `write_*_attr` family attaches scalar or 1-D attributes to a dataset **or** a group at any depth, `"/"` naming the root group. Every method takes a path: a leading `/` is optional, and writing to `"/a/b/x"` creates the groups above `x`, matching h5py's `create_intermediate_group=True` — `create_group` is only needed for a group that holds nothing yet. There is no fixed link limit and no nesting limit short of 64 path components: symbol table nodes chain and the group B-tree grows a level as needed, exactly as libhdf5 does. Each `write_dataset_*` returns `&mut Self` for chaining; most other `create_*` / `set_deflate` / `write_*_attr` methods return `Result<(), OxiH5Error>` (`write_root_str_attr` is infallible and returns `()`).
 
 | Method | Element type / purpose |
 |--------|--------------|
@@ -152,22 +152,43 @@ A builder that produces minimal, valid HDF5 files (superblock v0, old-style root
 | `write_dataset_i32(name, &[i32], shape)` | signed 32-bit int |
 | `write_dataset_i64(name, &[i64], shape)` | signed 64-bit int |
 | `write_dataset_u8(name, &[u8], shape)` | unsigned 8-bit int |
+| `write_dataset_i8(name, &[i8], shape)` | signed 8-bit int |
+| `write_dataset_i16(name, &[i16], shape)` | signed 16-bit int |
+| `write_dataset_u16(name, &[u16], shape)` | unsigned 16-bit int |
+| `write_dataset_u32(name, &[u32], shape)` | unsigned 32-bit int |
+| `write_dataset_u64(name, &[u64], shape)` | unsigned 64-bit int |
 | `create_dataset(name, shape, &Dtype)` | Zero-filled dataset of any fixed-size dtype |
 | `create_vlen_string_dataset(name, &[&str])` | Variable-length UTF-8 string dataset |
 | `create_dataset_unlimited(name, shape, chunk_shape, &Dtype, data)` | Chunked dataset with an unlimited first dimension |
-| `create_group(name)` | Single-level sub-group under root |
+| `set_deflate(path, level)` | DEFLATE/gzip-compress a dataset (level 0–9); converts contiguous storage to chunked as needed |
+| `create_group(path)` | Sub-group at `path`, creating any missing groups above it too (e.g. `create_group("a/b/c")` creates all three levels) |
 | `write_group_dataset_f64` / `write_group_dataset_i32(group, name, data, shape)` | Add a dataset inside a sub-group |
-| `write_string_attr` / `write_f64_attr` / `write_i64_attr` / `write_i32_attr` / `write_obj_ref_list_attr(obj_path, attr_name, value)` | Attribute on a dataset |
+| `write_string_attr` / `write_f64_attr` / `write_i64_attr` / `write_i32_attr` / `write_obj_ref_list_attr(obj_path, attr_name, value)` | Scalar attribute on a dataset or group |
+| `write_i64_array_attr` / `write_f64_array_attr` / `write_string_array_attr(path, attr_name, values)` | 1-D array-valued attribute (`i64[]` / `f64[]` / string vector) on a dataset or group |
 | `write_root_str_attr(name, value)` | String attribute on the root group |
 | `write_group_string_attr(group, obj, attr_name, value)` | String attribute on a dataset inside a group |
 | `build(path)` | Serialize and write the file to disk |
 | `build_to_vec()` | Serialize to an in-memory `Vec<u8>` without touching disk |
 
-Adding a duplicate/invalid name or exceeding capacity returns `OxiH5Error::Format`. A `write_dataset_*` call whose data length doesn't match `shape.iter().product() × element_size` also returns `OxiH5Error::Format`, instead of writing a corrupt file.
+Adding a duplicate or invalid name returns `OxiH5Error::Format`. A `write_dataset_*` call whose data length doesn't match `shape.iter().product() × element_size` also returns `OxiH5Error::Format`, instead of writing a corrupt file.
+
+## `write_dataset_in_place` — non-destructive dataset overwrite
+
+A free function — not a `FileWriter` method — that overwrites an existing **contiguous** dataset's raw bytes exactly where they already sit, leaving every other byte of the file untouched. `FileWriter` is the wrong tool for a file oxih5 did not author: rebuilding it from `FileWriter`'s in-memory model discards whatever that model doesn't represent, which is destructive for e.g. a MATLAB v7.3 `.mat` file — `MATLAB_class` attributes, object references, the `#refs#` group, cell arrays and compound structs would all be lost.
+
+```rust,no_run
+let bytes: Vec<u8> = [1.0f64, 2.0, 3.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+oxih5::write_dataset_in_place("measurements.mat", "/results/values", &bytes)?;
+# Ok::<(), oxih5::OxiH5Error>(())
+```
+
+The supplied buffer must match the dataset's allocated size **exactly** — because the byte count never changes, no address recorded anywhere else in the file can shift. Typed wrappers `write_dataset_in_place_f32` / `_f64` / `_i8` / `_i16` / `_i32` / `_i64` / `_u8` / `_u16` / `_u32` / `_u64` additionally verify the dataset's on-disk element type and encode in the dataset's *own* byte order, so a big-endian file is written back big-endian. `dataset_data_extent(path, dataset_path)` returns a `DataExtent { address, size }` giving the writable byte range — useful for sizing a buffer up front, and for asking whether a dataset is overwritable at all, since it applies every precondition the overwrite itself applies except the length check.
+
+Rejected with a typed error, and the file left completely unmodified: a non-contiguous layout (chunked, compact, or virtual — only a contiguous layout is a single flat run of bytes); a filter pipeline (compressed data cannot be overwritten with raw bytes at a fixed size); a variable-length datatype (its data area holds global-heap references, not values); and `dataset_path` naming a group.
 
 ## Re-exported types
 
-The data-model types from [`oxih5-core`] are re-exported at the crate root (alongside [`Value`], `SuperblockExtension`, and `BtreeKValues` from [`oxih5-format`]), so most programs need only `use oxih5::...`:
+The data-model types from [`oxih5-core`] are re-exported at the crate root (alongside [`Value`], `SuperblockExtension`, and `BtreeKValues` from [`oxih5-format`], and `DataExtent` defined in `oxih5` itself), so most programs need only `use oxih5::...`:
 
 - `Dataset` — fully-decoded N-dimensional array with typed accessors (`as_f32`, `iter_i64`, `slice`, `reshape`, …)
 - `Dtype` — HDF5 datatype enum
@@ -176,6 +197,7 @@ The data-model types from [`oxih5-core`] are re-exported at the crate root (alon
 - `Value` — dynamically-typed decoded element (`Int`, `Uint`, `Float`, `Str`, `Sequence`, …) returned by `File::dataset_vlen_sequences`
 - `SuperblockExtension` — decoded superblock-extension messages returned by `File::superblock_extension()` (`btree_k`, `shared_message_table_address`, `file_space_info_present`, `file_space_strategy`, `driver_info_present`)
 - `BtreeKValues` — decoded "B-tree 'K' Values" message (`indexed_storage_internal_k`, `group_internal_k`, `group_leaf_k`), surfaced via `SuperblockExtension::btree_k`
+- `DataExtent` — `{ address, size }` byte range of a dataset's on-disk data, returned by `dataset_data_extent()` to size a buffer for (or check the overwritability of) a `write_dataset_in_place()` call
 - `OxiH5Error` — the crate-wide error enum
 
 ## Feature Flags
@@ -189,9 +211,9 @@ The data-model types from [`oxih5-core`] are re-exported at the crate root (alon
 
 ## What is supported
 
-- **Read:** superblock v0/v1/v2/v3 (v2/v3 superblock-extension messages — B-tree 'K' Values, Shared Message Table, File Space Info, Driver Info — available via `File::superblock_extension()`); object headers v1/v2; old- and new-style groups; hierarchical paths; hard / soft / external links (including a soft link chained to an external link); contiguous, compact, chunked, and virtual-dataset (VDS) layouts; B-tree v1/v2, fixed-array and extensible-array chunk indices; deflate / shuffle / fletcher32 / nbit / scaleoffset filters, plus szip behind the `szip` feature; all 11 datatype classes, including chunked variable-length strings and sequences; dataset and group attributes; sub-region slicing.
-- **Write:** contiguous, uncompressed datasets (`f32`, `f64`, `i32`, `i64`, `u8`), variable-length string datasets, single-chunk unlimited-dimension datasets, single-level sub-groups, and attributes — see `FileWriter` below for exact limits.
-- **Not yet implemented:** a virtual dataset with variable-length elements returns `OxiH5Error::NotImplemented` (fixed-size element types are supported); unmapped virtual-dataset regions always read as zero (non-zero fill values are not applied yet); a soft link returns `OxiH5Error::NotImplemented` only if it targets an external-file *group* (an external-file *dataset* target — a soft → external chain — is resolved).
+- **Read:** superblock v0/v1/v2/v3 (v2/v3 superblock-extension messages — B-tree 'K' Values, Shared Message Table, File Space Info, Driver Info — available via `File::superblock_extension()`); object headers v1/v2; old- and new-style groups; hierarchical paths; hard / soft / external links (including a soft link chained to an external link); contiguous, compact, chunked, and virtual-dataset (VDS) layouts; B-tree v1/v2 and fixed-array chunk indices (an extensible-array index's location is parsed correctly, but its chunk records are not yet decoded — see "Not yet implemented" below); deflate / shuffle / fletcher32 / nbit / scaleoffset filters, plus szip behind the `szip` feature; all 11 datatype classes, including chunked variable-length strings and sequences; dataset and group attributes; sub-region slicing.
+- **Write:** contiguous datasets (all ten fixed-width element types), optionally DEFLATE/gzip-compressed via `set_deflate` (which converts them to chunked storage as needed), variable-length string datasets, chunked datasets with an unlimited first dimension genuinely tiled per a caller-supplied chunk shape, sub-groups nested to any depth, and scalar or array attributes on datasets, sub-groups and the root group — see `FileWriter` below for exact limits. Outside `FileWriter`, `write_dataset_in_place` overwrites an existing contiguous dataset's raw bytes in place without touching anything else in the file.
+- **Not yet implemented:** a virtual dataset with variable-length elements returns `OxiH5Error::NotImplemented` (fixed-size element types are supported); unmapped virtual-dataset regions always read as zero (non-zero fill values are not applied yet); a soft link returns `OxiH5Error::NotImplemented` only if it targets an external-file *group* (an external-file *dataset* target — a soft → external chain — is resolved); a chunked dataset indexed by an extensible array (HDF5 layout-v4, one unlimited dimension) returns `OxiH5Error::NotImplemented` naming the index and element size — the index block itself is located correctly, but decoding its chunk records needs the dataset's chunk geometry, which is not yet threaded in.
 
 ## Errors
 

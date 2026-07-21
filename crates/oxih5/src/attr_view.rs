@@ -88,12 +88,21 @@ impl<'a> AttrView<'a> {
                 if n == 0 {
                     return Ok(vec![]);
                 }
-                if self.attr.data.len() % n != 0 {
+                // An attribute's data section is padded out to an 8-byte
+                // boundary inside its object-header message — libhdf5 does this
+                // too, so `data` routinely carries up to 7 trailing bytes that
+                // belong to no element.  The element count therefore has to come
+                // from the dataspace; deriving it from `data.len()` either
+                // rejected valid attributes (`"hello"`, 5 bytes padded to 8, is
+                // not divisible by 5) or invented empty ones (`"km"`, 2 bytes
+                // padded to 8, yielded four strings).
+                let count = self.n_elems();
+                let needed = count.checked_mul(n).ok_or(OxiH5Error::DataTruncated)?;
+                if self.attr.data.len() < needed {
                     return Err(OxiH5Error::DataTruncated);
                 }
-                let count = self.attr.data.len() / n;
                 let mut out = Vec::with_capacity(count);
-                for chunk in self.attr.data.chunks_exact(n) {
+                for chunk in self.attr.data[..needed].chunks_exact(n) {
                     let trimmed = chunk.split(|&b| b == 0).next().unwrap_or(chunk);
                     let s = String::from_utf8(trimmed.to_vec())
                         .map_err(|e| OxiH5Error::Format(format!("fixed-string attr UTF-8: {e}")))?;

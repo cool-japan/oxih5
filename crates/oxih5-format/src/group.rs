@@ -4,8 +4,55 @@ use crate::btree_v2::parse_name_index;
 use crate::context::ParseContext;
 use crate::fractal_heap::FractalHeap;
 use crate::link_msg::{parse_link, parse_link_info, ParsedLink};
+use crate::snod::{SymTabCache, SymTabEntry};
 use crate::{btree, heap, snod};
 use oxih5_core::OxiH5Error;
+
+/// What a symbol-table entry in an old-style group points at.
+///
+/// Old-style groups (`libver='earliest'`, which is h5py's default) index their
+/// members with a version-1 B-tree over SNOD symbol-table nodes.  Unlike a
+/// new-style Link message, a symbol-table entry has no link-type field: a hard
+/// link and a soft link are distinguished by the entry's *cache type*, and a
+/// soft link's value is not an address at all but a path held in the group's
+/// local heap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SymTabLink {
+    /// A hard link: the absolute file address of the target's object header.
+    Hard(u64),
+    /// A soft link: the path stored in the group's local heap.  It may be
+    /// absolute (`/a/b`) or relative to the group holding the link (`b`).
+    Soft(String),
+}
+
+/// Decode one symbol-table entry into the link it represents.
+///
+/// `local_heap` must be the local heap of the group that owns the entry, since
+/// a soft link's value is stored there.
+fn entry_to_link(
+    entry: &SymTabEntry,
+    local_heap: &heap::LocalHeap<'_>,
+) -> Result<SymTabLink, OxiH5Error> {
+    match entry.cache {
+        SymTabCache::SoftLink { link_value_offset } => {
+            let target = local_heap.name_at(link_value_offset as usize)?;
+            Ok(SymTabLink::Soft(target.to_string()))
+        }
+        _ => {
+            if entry.object_header_address == u64::MAX {
+                // An undefined address with a cache type that does not explain
+                // it: report that rather than passing the sentinel on as if it
+                // were a real file offset.
+                return Err(OxiH5Error::Format(format!(
+                    "symbol table entry has an undefined object header address \
+                     but cache type {:?}, which does not carry a link value",
+                    entry.cache
+                )));
+            }
+            Ok(SymTabLink::Hard(entry.object_header_address))
+        }
+    }
+}
 
 /// List all non-empty dataset names in the root group by traversing the B-tree
 /// and reading names from the local heap.
@@ -32,16 +79,21 @@ pub fn list_datasets(
     Ok(names)
 }
 
-/// Find a dataset by name and return its object-header address.
+/// Find an entry by name in an old-style group and return the link it holds.
+///
+/// This is the soft-link-aware counterpart of [`find_dataset`]: where that
+/// function yields a bare object-header address (and so can only describe hard
+/// links), this one distinguishes [`SymTabLink::Hard`] from
+/// [`SymTabLink::Soft`] and reads the soft link's path out of the group's local
+/// heap.
 ///
 /// The `name` may be given with or without a leading `/`.
-/// Only top-level (root group) datasets are searched.
-pub fn find_dataset(
+pub fn find_entry(
     file_data: &[u8],
     btree_address: u64,
     heap_address: u64,
     name: &str,
-) -> Result<u64, OxiH5Error> {
+) -> Result<SymTabLink, OxiH5Error> {
     let local_heap = heap::parse(file_data, heap_address)?;
     let tree = btree::parse(file_data, btree_address)?;
 
@@ -50,15 +102,70 @@ pub fn find_dataset(
 
     for leaf_addr in &tree.leaf_addresses {
         let entries = snod::parse(file_data, *leaf_addr)?;
-        for entry in entries {
+        for entry in &entries {
             let entry_name = local_heap.name_at(entry.name_offset as usize)?;
             if entry_name == target {
-                return Ok(entry.object_header_address);
+                return entry_to_link(entry, &local_heap);
             }
         }
     }
 
     Err(OxiH5Error::NotFound(name.to_string()))
+}
+
+/// List every entry of an old-style group as `(name, link)` pairs.
+///
+/// Unlike [`list_datasets`], which reports names only, this keeps each entry's
+/// link so callers can resolve soft links and classify entries without a second
+/// traversal.  Entries whose name is empty are skipped; an entry whose link
+/// cannot be decoded is skipped rather than aborting the whole listing, which
+/// matches how the new-style listing treats an unparsable Link message.
+pub fn list_entries(
+    file_data: &[u8],
+    btree_address: u64,
+    heap_address: u64,
+) -> Result<Vec<(String, SymTabLink)>, OxiH5Error> {
+    let local_heap = heap::parse(file_data, heap_address)?;
+    let tree = btree::parse(file_data, btree_address)?;
+
+    let mut out = Vec::with_capacity(tree.leaf_addresses.len() * 8);
+    for leaf_addr in &tree.leaf_addresses {
+        let entries = snod::parse(file_data, *leaf_addr)?;
+        for entry in &entries {
+            let name = local_heap.name_at(entry.name_offset as usize)?;
+            if name.is_empty() {
+                continue;
+            }
+            if let Ok(link) = entry_to_link(entry, &local_heap) {
+                out.push((name.to_string(), link));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Find a dataset by name and return its object-header address.
+///
+/// The `name` may be given with or without a leading `/`.
+/// Only entries of the group identified by `btree_address` / `heap_address`
+/// are searched.
+///
+/// This resolves **hard links only**.  A soft link has no object header of its
+/// own, so it is reported as [`OxiH5Error::NotImplemented`] naming its target
+/// rather than yielding the undefined-address sentinel; use [`find_entry`] and
+/// resolve the returned path when soft links must be followed.
+pub fn find_dataset(
+    file_data: &[u8],
+    btree_address: u64,
+    heap_address: u64,
+    name: &str,
+) -> Result<u64, OxiH5Error> {
+    match find_entry(file_data, btree_address, heap_address, name)? {
+        SymTabLink::Hard(address) => Ok(address),
+        SymTabLink::Soft(target) => Err(OxiH5Error::NotImplemented(format!(
+            "'{name}' is a soft link to '{target}'; it has no object header address of its own"
+        ))),
+    }
 }
 
 /// List all links in a new-style group.

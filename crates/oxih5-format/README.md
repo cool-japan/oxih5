@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/oxih5-format.svg)](https://crates.io/crates/oxih5-format)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**247 tests passing** (`cargo test -p oxih5-format --all-features`; 241 with default features) · zero clippy / rustdoc warnings
+**252 tests passing** (`cargo nextest run -p oxih5-format --all-features`; 246 with default features) · zero clippy / rustdoc warnings
 
 `oxih5-format` is the binary-parsing layer of **OxiH5**, the COOLJAPAN Pure-Rust HDF5 reader/writer. It turns raw HDF5 file bytes — exactly as produced by h5py / libhdf5 — into the typed data model from [`oxih5-core`]. Every standard structure of the HDF5 file format is decoded here: the superblock (versions 0, 1, 2, and 3, including the v2/v3 superblock extension), object headers (v1 and v2), all standard header messages, local/global/fractal heaps, B-tree v1 and v2 nodes, the extensible- and fixed-array chunk indices, the filter pipeline, full chunked-dataset assembly, and Virtual Dataset (VDS) mapping-block parsing.
 
@@ -13,10 +13,10 @@ This crate sits between [`oxih5-core`] (the data model) and the [`oxih5`] facade
 
 ```toml
 [dependencies]
-oxih5-format = "0.2.0"
+oxih5-format = "0.2.1"
 
 # Optional: rayon-parallel chunk assembly
-oxih5-format = { version = "0.2.0", features = ["parallel"] }
+oxih5-format = { version = "0.2.1", features = ["parallel"] }
 ```
 
 ## Quick Start
@@ -44,7 +44,7 @@ for msg in &messages {
 
 ## API Overview
 
-The crate re-exports [`ChunkIndexCache`] from `chunked` at the crate root; everything else is reached through its module path.
+The crate re-exports a handful of frequently-used items at the crate root: [`ChunkIndexCache`] (from `chunked`), [`Hyperslab`] / [`DimSelection`] (from `hyperslab`), [`read_chunked_hyperslab`] / [`gather_hyperslab_contiguous`] (from `chunked_hyperslab`), and [`GlobalHeapWriter`] / [`GlobalHeapRef`] (from `global_heap_writer`); everything else is reached through its module path.
 
 ### `superblock` — file superblock
 
@@ -72,6 +72,7 @@ The crate re-exports [`ChunkIndexCache`] from `chunked` at the crate root; every
 | `struct DatatypeInfo` | Wraps an `oxih5_core::Dtype` |
 | `struct SymbolTableInfo` | `btree_address`, `heap_address` (old-style groups) |
 | `enum LayoutInfo` | `Contiguous`, `Compact`, `Chunked`, `VirtualDataset` (see below) |
+| `struct SingleChunkInfo` | `stored_size: u64`, `filter_mask: u32` — set on `LayoutInfo::Chunked` only for a filtered layout-v4 single-chunk index |
 | `fn parse_dataspace` | Dataspace message (0x0001) → `DataspaceInfo` |
 | `fn parse_dataspace_rich` | Dataspace message → `oxih5_core::Dataspace` |
 | `fn parse_datatype` | Datatype message (0x0003) → `DatatypeInfo` |
@@ -82,7 +83,7 @@ The crate re-exports [`ChunkIndexCache`] from `chunked` at the crate root; every
 | `fn parse_symbol_table` | Symbol-table message (0x0011) → `SymbolTableInfo` |
 | `fn parse_modification_time` | Object-modification-time message → `u32` |
 
-`LayoutInfo` variants: `Contiguous { data_address, data_size }`, `Compact { data }`, `Chunked { data_address, dimensionality, chunk_dims, index_type }`, `VirtualDataset { heap_address, heap_index }` (`heap_index` is the global-heap *object index* of the serialized VDS mapping block — see `vds` below — not an entry count).
+`LayoutInfo` variants: `Contiguous { data_address, data_size }`, `Compact { data }`, `Chunked { data_address, dimensionality, chunk_dims, index_type, single_chunk: Option<SingleChunkInfo> }` (`single_chunk` is `Some` only for a filtered layout-v4 single-chunk index), `VirtualDataset { heap_address, heap_index }` (`heap_index` is the global-heap *object index* of the serialized VDS mapping block — see `vds` below — not an entry count).
 
 ### `datatype` — datatype class parsing
 
@@ -108,18 +109,28 @@ The crate re-exports [`ChunkIndexCache`] from `chunked` at the crate root; every
 | `global_heap::GlobalHeap` | Variable-length / VLen data; `parse(...)`, `object(index) -> &[u8]` |
 | `fractal_heap::FractalHeap` | New-style group object storage; `parse(...)`, `parse_heap_id`, `read_object`, plus `header_address` / `heap_id_len` / `table_width` / `root_indirect_rows` / `block_size_for_row` accessors. Transparently decodes a *filtered* root direct block (e.g. deflate/shuffle) when the heap declares I/O filters; a filtered *indirect*-block root remains `NotImplemented` |
 
+### `global_heap_writer` — Global Heap Collection (GCOL) writer
+
+The write-side counterpart to `global_heap` above — used when building HDF5 files (vlen strings, VDS mapping blocks, …).
+
+| Item | Description |
+|------|-------------|
+| `struct GlobalHeapWriter` (re-exported at root) | Accumulates heap objects in insertion order; `new()`, `write_bytes(data) -> u32`, `write_string(s) -> u32` (NUL-terminated), `is_empty()`, `len()`, `build() -> Vec<u8>` — serializes everything into a self-contained GCOL byte vector |
+| `struct GlobalHeapRef` (re-exported at root) | `collection_addr: u64`, `object_idx: u32` — a reference to one object in a GCOL, with the address filled in once the collection's file placement is known |
+
 ### B-trees, indices, and SNOD
 
 | Module / Item | Description |
 |---------------|-------------|
 | `btree::BTreeV1` | `leaf_addresses: Vec<u64>`; `parse(file_data, addr)` collects all SNOD leaves |
-| `btree_v2::BTreeV2` | New-style B-tree chunk index; `parse(file_data, addr, ndims)`, `records() -> &[ChunkRecord]` |
+| `btree_v2::BTreeV2` | New-style B-tree chunk index; `parse(file_data, addr, ndims, geom: &ChunkGeometry)`, `records() -> &[ChunkRecord]` |
 | `btree_v2::ChunkRecord` | `address`, `size: u32`, `filter_mask: u32`, `offsets: Vec<u64>` |
+| `btree_v2::ChunkGeometry` | `chunk_dims: &[u64]`, `chunk_bytes: u32` — the dataset's chunk shape/size, needed because a v2 B-tree record stores *scaled* (chunk-grid) coordinates rather than element offsets, and an unfiltered record omits the stored size entirely |
 | `btree_v2::parse_name_index` | Resolve a B-tree v2 name index |
 | `btree_v1_chunk::parse` | B-tree v1 chunk index (`libver='earliest'`) |
 | `ea_index::parse_extensible_array` | Extensible-array chunk index (one unlimited dimension) |
 | `fa_index::parse_fixed_array` / `parse_fixed_array_v4` | Fixed-array chunk index (no unlimited dimensions) |
-| `snod::SymTabEntry` | `name_offset: u64`, `object_header_address: u64` |
+| `snod::SymTabEntry` | `name_offset: u64`, `object_header_address: u64`, `cache: SymTabCache` (decoded scratch-pad: `None`, `Group { btree_address, heap_address }`, `SoftLink { link_value_offset }`, or `Unknown(u32)`) |
 | `snod::parse(file_data, addr) -> Vec<SymTabEntry>` | Decode a symbol-table node |
 
 ### `chunked` — chunked-dataset assembly
@@ -127,11 +138,26 @@ The crate re-exports [`ChunkIndexCache`] from `chunked` at the crate root; every
 | Item | Description |
 |------|-------------|
 | `struct ChunkIndexCache` (re-exported at root) | Thread-safe `(index_addr, ndims) → records` cache; `new()`, `get_or_insert(...)` |
-| `enum ChunkIndex` | `BTreeV1`, `BTreeV2`, `FixedArray`, `ExtensibleArray` |
-| `fn resolve_chunk_index(file_data, index, addr, ndims) -> Vec<ChunkRecord>` | Resolve any index variety into chunk records |
+| `enum ChunkIndex` | `BTreeV1`, `BTreeV2`, `FixedArray`, `ExtensibleArray`, `SingleChunk`, `Implicit` |
+| `fn resolve_chunk_index(file_data, index, addr, ndims) -> Vec<ChunkRecord>` | Resolve a `BTreeV1`, `FixedArray`, or `ExtensibleArray` index into chunk records. `BTreeV2`, `SingleChunk`, and `Implicit` need additional chunk-geometry context and return `Err` here |
 | `fn assemble_chunks(...)` | Scatter chunk records into a contiguous row-major buffer |
-| `fn read_chunked(file_data, layout, pipeline, dataset_dims, elem_size, cache) -> Vec<u8>` | High-level: resolve + read + unfilter + scatter a whole chunked dataset |
+| `struct ChunkSliceParams<'a>` | `elem_size: usize`, `fill_value: Option<&'a [u8]>` — shared parameter bundle for `read_chunked_slice` and `chunked_hyperslab::read_chunked_hyperslab` |
+| `fn read_chunked(file_data, layout, pipeline, dataset_dims, elem_size, fill_value, cache) -> Vec<u8>` | High-level: resolve + read + unfilter + scatter a whole chunked dataset |
 | `fn read_chunked_slice(..., ranges, cache) -> Vec<u8>` | As above, but only the requested N-dimensional sub-region |
+
+### `hyperslab` — N-dimensional hyperslab selections
+
+| Item | Description |
+|------|-------------|
+| `struct DimSelection` (re-exported at root) | `start`, `stride`, `count`, `block` — one dimension of an HDF5 hyperslab selection; `contiguous(range)`, `n_elements()`, `contains(coord)` |
+| `struct Hyperslab` (re-exported at root) | `dims: Vec<DimSelection>` — an N-dimensional selection; `contiguous(ranges)`, `output_shape()`, `bounding_ranges()`, `is_fully_contiguous()`, `is_empty()` |
+
+### `chunked_hyperslab` — hyperslab-selective chunk reads
+
+| Item | Description |
+|------|-------------|
+| `fn read_chunked_hyperslab(file_data, layout, pipeline, dataset_dims, params, selection, cache) -> Vec<u8>` (re-exported at root) | Read only the chunks overlapping a `Hyperslab` selection; bytes outside the selection stay zero (or the fill value) |
+| `fn gather_hyperslab_contiguous(full_data, dataset_dims, selection, elem_size) -> Vec<u8>` (re-exported at root) | Gather a `Hyperslab` selection out of an already-fully-loaded contiguous/compact buffer |
 
 ### `vds` — virtual dataset (VDS) mapping
 

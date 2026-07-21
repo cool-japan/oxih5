@@ -254,7 +254,12 @@ impl BTreeV2 {
     /// Parse a B-tree v2 chunk index rooted at `header_address`.
     ///
     /// `ndims` is the number of dataset dimensions (used to size the offset array).
-    pub fn parse(file_data: &[u8], header_address: u64, ndims: usize) -> Result<Self, OxiH5Error> {
+    pub fn parse(
+        file_data: &[u8],
+        header_address: u64,
+        ndims: usize,
+        geom: &ChunkGeometry<'_>,
+    ) -> Result<Self, OxiH5Error> {
         let base = header_address as usize;
 
         // --- B-tree v2 header ("BTHD") ---
@@ -335,6 +340,7 @@ impl BTreeV2 {
             record_size,
             btree_type,
             ndims,
+            geom,
             &mut records,
             0,
         )?;
@@ -365,6 +371,7 @@ fn parse_node(
     record_size: u16,
     btree_type: u8,
     ndims: usize,
+    geom: &ChunkGeometry<'_>,
     records: &mut Vec<ChunkRecord>,
     recursion: u16,
 ) -> Result<(), OxiH5Error> {
@@ -425,7 +432,7 @@ fn parse_node(
 
         for i in 0..record_count {
             let r_off = records_start + i * rs;
-            let rec = parse_chunk_record(&file_data[r_off..r_off + rs], btree_type, ndims)?;
+            let rec = parse_chunk_record(&file_data[r_off..r_off + rs], btree_type, ndims, geom)?;
             records.push(rec);
         }
     } else {
@@ -477,6 +484,7 @@ fn parse_node(
                 record_size,
                 btree_type,
                 ndims,
+                geom,
                 records,
                 recursion + 1,
             )?;
@@ -490,85 +498,93 @@ fn parse_node(
 // Record parsing
 // ---------------------------------------------------------------------------
 
+/// Chunk geometry needed to turn a version-2 B-tree record into a
+/// [`ChunkRecord`].
+///
+/// A v2 B-tree chunk record stores each chunk's position as a *scaled*
+/// coordinate — its index in the chunk grid, not its element offset — and an
+/// unfiltered record does not store the chunk's size at all, because every
+/// chunk of an unfiltered dataset is the same size.  Both therefore have to be
+/// reconstructed from the dataset's chunk shape.
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkGeometry<'a> {
+    /// Per-dimension chunk extent in elements.
+    pub chunk_dims: &'a [u64],
+    /// Uncompressed size of one whole chunk, in bytes.
+    pub chunk_bytes: u32,
+}
+
 /// Parse a single chunk record from a slice of exactly `record_size` bytes.
 ///
-/// Both type 10 (non-filtered) and type 11 (filtered) share the layout:
+/// The two chunk record types do **not** share a layout — this is the
+/// difference that used to make every unfiltered v2 B-tree chunked dataset
+/// decode as zeros:
+///
 /// ```text
-/// address     : 8 bytes
-/// chunk_size  : 4 bytes
-/// filter_mask : 4 bytes   (= 0 for non-filtered records unless type 11)
-/// offsets     : record_size - 16 bytes, split into ndims parts
+/// type 10 (unfiltered):  address (8) + scaled[ndims] (8 each)
+/// type 11 (filtered):    address (8) + chunk_size (4) + filter_mask (4)
+///                        + scaled[ndims] (8 each)
 /// ```
-fn parse_chunk_record(rec: &[u8], btree_type: u8, ndims: usize) -> Result<ChunkRecord, OxiH5Error> {
-    if rec.len() < 16 {
+///
+/// An unfiltered record carries neither a size nor a filter mask: every chunk
+/// occupies exactly one uncompressed chunk's worth of bytes, and no filter can
+/// have been skipped because there is no filter pipeline.
+fn parse_chunk_record(
+    rec: &[u8],
+    btree_type: u8,
+    ndims: usize,
+    geom: &ChunkGeometry<'_>,
+) -> Result<ChunkRecord, OxiH5Error> {
+    // Bytes preceding the scaled coordinates.
+    let prefix = if btree_type == 11 { 16 } else { 8 };
+    if rec.len() < prefix {
         return Err(OxiH5Error::Format(format!(
-            "chunk record: too short ({} bytes, need at least 16)",
+            "chunk record: too short ({} bytes, need at least {prefix})",
             rec.len()
         )));
     }
 
-    let address = u64::from_le_bytes(
-        rec[0..8]
-            .try_into()
-            .map_err(|_| OxiH5Error::Format("chunk record: address slice".into()))?,
-    );
-    let size = u32::from_le_bytes(
-        rec[8..12]
-            .try_into()
-            .map_err(|_| OxiH5Error::Format("chunk record: size slice".into()))?,
-    );
-
-    // Type 10 (non-filtered) has no filter_mask field per se, but the layout
-    // in the HDF5 spec actually still has 4 bytes here; type 11 has it too.
-    let filter_mask = if btree_type == 11 {
-        u32::from_le_bytes(
-            rec[12..16]
-                .try_into()
-                .map_err(|_| OxiH5Error::Format("chunk record: filter_mask slice".into()))?,
-        )
-    } else {
-        0u32
+    let read_u64_at = |o: usize| -> Result<u64, OxiH5Error> {
+        rec.get(o..o + 8)
+            .and_then(|s| s.try_into().ok())
+            .map(u64::from_le_bytes)
+            .ok_or_else(|| OxiH5Error::Format(format!("chunk record: u64 at {o} out of range")))
+    };
+    let read_u32_at = |o: usize| -> Result<u32, OxiH5Error> {
+        rec.get(o..o + 4)
+            .and_then(|s| s.try_into().ok())
+            .map(u32::from_le_bytes)
+            .ok_or_else(|| OxiH5Error::Format(format!("chunk record: u32 at {o} out of range")))
     };
 
-    // Remaining bytes encode the chunk offsets.
-    let offset_bytes = rec.len() - 16;
-    let offsets = if ndims == 0 || offset_bytes == 0 {
+    let address = read_u64_at(0)?;
+    let (size, filter_mask) = if btree_type == 11 {
+        (read_u32_at(8)?, read_u32_at(12)?)
+    } else {
+        (geom.chunk_bytes, 0u32)
+    };
+
+    // Remaining bytes encode the scaled (chunk-grid) coordinates, one u64 each.
+    let scaled_bytes = rec.len() - prefix;
+    let offsets = if ndims == 0 {
         Vec::new()
     } else {
-        let bytes_per_dim = offset_bytes / ndims;
-        if bytes_per_dim == 0 || offset_bytes % ndims != 0 {
+        let needed = ndims.checked_mul(8).ok_or_else(|| {
+            OxiH5Error::Format("chunk record: scaled coordinate size overflows".into())
+        })?;
+        if scaled_bytes < needed {
             return Err(OxiH5Error::Format(format!(
-                "chunk record: offset bytes {offset_bytes} not divisible by ndims {ndims}"
+                "chunk record: {scaled_bytes} bytes of scaled coordinates for {ndims} dimensions \
+                 (need {needed})"
             )));
         }
-
         let mut offs = Vec::with_capacity(ndims);
         for d in 0..ndims {
-            let o = 16 + d * bytes_per_dim;
-            let val = match bytes_per_dim {
-                8 => u64::from_le_bytes(
-                    rec[o..o + 8]
-                        .try_into()
-                        .map_err(|_| OxiH5Error::Format("chunk record: offset u64".into()))?,
-                ),
-                4 => u32::from_le_bytes(
-                    rec[o..o + 4]
-                        .try_into()
-                        .map_err(|_| OxiH5Error::Format("chunk record: offset u32".into()))?,
-                ) as u64,
-                2 => u16::from_le_bytes(
-                    rec[o..o + 2]
-                        .try_into()
-                        .map_err(|_| OxiH5Error::Format("chunk record: offset u16".into()))?,
-                ) as u64,
-                1 => rec[o] as u64,
-                other => {
-                    return Err(OxiH5Error::Format(format!(
-                        "chunk record: unsupported bytes_per_dim {other}"
-                    )))
-                }
-            };
-            offs.push(val);
+            let scaled = read_u64_at(prefix + d * 8)?;
+            // Scale the chunk-grid coordinate up to an element offset, which is
+            // what the chunk assembler works in.
+            let extent = geom.chunk_dims.get(d).copied().unwrap_or(1);
+            offs.push(scaled.saturating_mul(extent));
         }
         offs
     };
@@ -635,7 +651,11 @@ mod tests {
                                                                   // checksum after records (not validated, just needs to be present)
         buf[r + 24..r + 28].copy_from_slice(&0u32.to_le_bytes());
 
-        let tree = BTreeV2::parse(&buf, 0, ndims).expect("parse failed");
+        let geom = ChunkGeometry {
+            chunk_dims: &[1],
+            chunk_bytes: 0,
+        };
+        let tree = BTreeV2::parse(&buf, 0, ndims, &geom).expect("parse failed");
         assert_eq!(tree.records().len(), 1);
         let rec = &tree.records()[0];
         assert_eq!(rec.address, 0x1000);
@@ -662,7 +682,11 @@ mod tests {
         buf[26..34].copy_from_slice(&0u64.to_le_bytes());
         buf[34..38].copy_from_slice(&0u32.to_le_bytes());
 
-        let tree = BTreeV2::parse(&buf, 0, 1).expect("parse failed");
+        let geom = ChunkGeometry {
+            chunk_dims: &[1],
+            chunk_bytes: 0,
+        };
+        let tree = BTreeV2::parse(&buf, 0, 1, &geom).expect("parse failed");
         assert!(tree.records().is_empty());
     }
 
@@ -670,7 +694,11 @@ mod tests {
     fn test_bad_signature_rejected() {
         let buf = vec![0u8; 64];
         // Starts with all zeros — "BTHD" not present.
-        let result = BTreeV2::parse(&buf, 0, 1);
+        let geom = ChunkGeometry {
+            chunk_dims: &[1],
+            chunk_bytes: 0,
+        };
+        let result = BTreeV2::parse(&buf, 0, 1, &geom);
         assert!(result.is_err());
     }
 

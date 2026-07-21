@@ -203,6 +203,21 @@ pub fn parse_datatype(body: &[u8]) -> Result<DatatypeInfo, OxiH5Error> {
 // Data Layout (message type 0x0008)
 // ---------------------------------------------------------------------------
 
+/// Extra information carried inline by a layout-v4 **single chunk** index when
+/// the dataset has a filter pipeline.
+///
+/// A single-chunk index has no structure on disk — the layout message's address
+/// *is* the chunk address — so there is nowhere else to record how many bytes
+/// the filtered chunk actually occupies.  Unfiltered single chunks need no such
+/// record: their size is the chunk volume times the element size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SingleChunkInfo {
+    /// Size in bytes of the chunk as stored (i.e. after the filter pipeline).
+    pub stored_size: u64,
+    /// Bitmask of filters skipped for this chunk (0 = all filters applied).
+    pub filter_mask: u32,
+}
+
 /// Parsed data layout — either contiguous, compact (inline), chunked, or virtual.
 #[derive(Debug, Clone)]
 pub enum LayoutInfo {
@@ -210,12 +225,18 @@ pub enum LayoutInfo {
     Contiguous { data_address: u64, data_size: u64 },
     /// Inline data stored in the object header message body.
     Compact { data: Vec<u8> },
-    /// Chunked data with a B-tree index.
+    /// Chunked data with a chunk index.
     Chunked {
+        /// Address of the chunk index root — or, for the single-chunk and
+        /// implicit index types, of the chunk data itself.
         data_address: u64,
         dimensionality: u8,
         chunk_dims: Vec<u64>,
+        /// oxih5's *internal* index discriminant — see [`parse_layout`]; this
+        /// is deliberately not the HDF5 on-disk indexing-type value.
         index_type: u8,
+        /// Set only for a filtered layout-v4 single-chunk index.
+        single_chunk: Option<SingleChunkInfo>,
     },
     /// Virtual dataset layout — assembled from source dataset regions.
     ///
@@ -233,7 +254,16 @@ pub enum LayoutInfo {
 
 /// Parse a data layout message body.
 ///
-/// Handles layout v1 and v3 for classes 0 (compact), 1 (contiguous), and 2 (chunked).
+/// Handles layout versions 1, 3 and 4 for classes 0 (compact), 1 (contiguous)
+/// and 2 (chunked), plus class 3 (virtual) at version 4.
+///
+/// Versions 3 and 4 share an identical encoding for the compact and contiguous
+/// classes; they differ only for chunked data, where version 4 replaces the
+/// fixed 4-byte chunk dimensions and implicit version-1 B-tree with
+/// variable-width dimensions and an explicit chunk-indexing type.
+///
+/// All addresses are decoded as 8-byte values, matching the rest of this crate,
+/// which supports `size_of_offsets == 8` only.
 pub fn parse_layout(body: &[u8]) -> Result<LayoutInfo, OxiH5Error> {
     if body.len() < 2 {
         return Err(OxiH5Error::Format(format!(
@@ -247,12 +277,14 @@ pub fn parse_layout(body: &[u8]) -> Result<LayoutInfo, OxiH5Error> {
 
     match (version, class) {
         // -------------------------------------------------------------------
-        // V3 contiguous
+        // V3 / V4 contiguous — identical encoding:
+        //   body[2..10]  = data address (u64 LE)
+        //   body[10..18] = data size    (u64 LE)
         // -------------------------------------------------------------------
-        (3, 1) => {
+        (3 | 4, 1) => {
             if body.len() < 18 {
                 return Err(OxiH5Error::Format(format!(
-                    "layout v3 contiguous body too short: {} bytes",
+                    "layout v{version} contiguous body too short: {} bytes (need 18)",
                     body.len()
                 )));
             }
@@ -272,19 +304,21 @@ pub fn parse_layout(body: &[u8]) -> Result<LayoutInfo, OxiH5Error> {
         }
 
         // -------------------------------------------------------------------
-        // V3 compact: body[2..4] = size (u16 LE), body[4..4+size] = data
+        // V3 / V4 compact — identical encoding:
+        //   body[2..4]        = size (u16 LE)
+        //   body[4..4+size]   = raw data, inline in the message
         // -------------------------------------------------------------------
-        (3, 0) => {
+        (3 | 4, 0) => {
             if body.len() < 4 {
                 return Err(OxiH5Error::Format(format!(
-                    "layout v3 compact body too short: {} bytes",
+                    "layout v{version} compact body too short: {} bytes (need 4)",
                     body.len()
                 )));
             }
             let data_size = read_u16_le(body, 2)? as usize;
             if body.len() < 4 + data_size {
                 return Err(OxiH5Error::Format(format!(
-                    "layout v3 compact: data {} bytes but only {} available",
+                    "layout v{version} compact: data {} bytes but only {} available",
                     data_size,
                     body.len() - 4
                 )));
@@ -330,6 +364,7 @@ pub fn parse_layout(body: &[u8]) -> Result<LayoutInfo, OxiH5Error> {
                 dimensionality,
                 chunk_dims,
                 index_type: 0,
+                single_chunk: None,
             })
         }
 
@@ -361,98 +396,163 @@ pub fn parse_layout(body: &[u8]) -> Result<LayoutInfo, OxiH5Error> {
         }
 
         // -------------------------------------------------------------------
-        // V4 and V5 chunked (layout class 2, libver='latest' / superblock v3)
+        // V4 chunked (layout class 2, libver='latest').  HDF5 spec §IV.A.2.g:
         //
-        // Body format discovered empirically (verified against FAHD addresses):
-        //   body[0]  = version (4 or 5)
+        //   body[0]  = version (4)
         //   body[1]  = class (2 = chunked)
-        //   body[2]  = flags (reserved, usually 0x00)
-        //   body[3]  = ndims_incl — chunk rank + 1 (includes element-size "dim")
-        //   body[4]  = pline_size_flags — filter related, typically 0x01
-        //   body[5..5+ndims_incl-1]  = chunk_dims[ndims_actual] as u8 LE each
-        //              (ndims_actual = ndims_incl - 1)
-        //   body[4+ndims_incl]  = elem_size_byte (low 8 bits of element size)
-        //   body[5+ndims_incl]  = hdf5_idx_type (HDF5 internal: 3=fixed-array,
-        //                                        4=extensible-array, 5=B-tree-v2)
-        //   body[6+ndims_incl]  = max_nelmts_bits (FA/EA parameter, not used here)
-        //   body[7+ndims_incl..15+ndims_incl] = chunk index address (u64 LE)
-        //              — points to the FAHD (fixed array), EAHD (extensible array),
-        //                or BTHD (B-tree v2) header
+        //   body[2]  = flags
+        //   body[3]  = dimensionality D — chunk rank + 1 (the extra trailing
+        //              "dimension" is the element size, as in v3)
+        //   body[4]  = dimension size encoded length E, in bytes (1..=8)
+        //   body[5 .. 5+D*E]        = D chunk dimensions, E bytes each, LE
+        //   body[5+D*E]             = chunk indexing type
+        //   body[6+D*E ..]          = indexing-type information, whose *size
+        //                             depends on the indexing type*
+        //   ... followed by the chunk index address (u64 LE)
         //
-        // HDF5 index-type values → oxih5-format ChunkIndex:
-        //   3 (fixed-array)     → index_type = 1 (FixedArray)
-        //   4 (extensible-array)→ index_type = 2 (ExtensibleArray)
-        //   5 (B-tree v2)       → index_type = 3 (BTreeV2)
+        // The indexing-type information block is the part a decoder cannot skip
+        // blindly: it is 0 bytes for implicit and unfiltered single-chunk, 12
+        // bytes for a filtered single chunk, 1 for fixed array, 5 for
+        // extensible array and 6 for a version-2 B-tree.  Assuming any one of
+        // those widths for all of them reads the index address from the wrong
+        // offset, which is how extensible-array and B-tree-v2 datasets used to
+        // fail here with a nonsense address.
+        //
+        // Version 5 is not a version libhdf5 ever writes, but oxih5 has a
+        // committed synthetic fixture that uses it with an otherwise v4 body,
+        // so it is accepted here on the same terms.
+        //
+        // HDF5 indexing-type values → oxih5-format internal discriminant:
+        //   1 (single chunk)     → 4 (SingleChunk)
+        //   2 (implicit)         → 5 (Implicit)
+        //   3 (fixed array)      → 1 (FixedArray)
+        //   4 (extensible array) → 2 (ExtensibleArray)
+        //   5 (B-tree v2)        → 3 (BTreeV2)
         // -------------------------------------------------------------------
         (4 | 5, 2) => {
-            // Minimum: ver(1)+cls(1)+flags(1)+ndims_incl(1)+pline(1)
-            //          +chunk_dims(ndims_actual bytes)+elem_size(1)+idx_type(1)
-            //          +max_nelmts_bits(1)+index_addr(8)
-            if body.len() < 4 {
+            // Fixed prologue: version, class, flags, dimensionality, encoded length.
+            if body.len() < 5 {
                 return Err(OxiH5Error::Format(format!(
-                    "layout v{}/{} chunked body too short: {} bytes",
-                    body[0],
-                    body[1],
+                    "layout v{version} chunked body too short: {} bytes (need 5)",
                     body.len()
                 )));
             }
-            let ndims_incl = body[3] as usize;
-            if ndims_incl < 1 {
-                return Err(OxiH5Error::Format(format!(
-                    "layout v{} chunked: invalid ndims_incl=0",
-                    body[0]
-                )));
-            }
-            let ndims_actual = ndims_incl - 1;
-            // Byte offset to hdf5_idx_type:  5 + ndims_actual  (= 5 + ndims_incl - 1 = 4 + ndims_incl)
-            // Byte offset to max_nelmts_bits: 6 + ndims_actual  (= 5 + ndims_incl)
-            // Byte offset to index_addr:      8 + ndims_actual  (= 7 + ndims_incl)
-            let min_len = 8 + ndims_actual + 8; // = 16 + ndims_actual
-            if body.len() < min_len {
-                return Err(OxiH5Error::Format(format!(
-                    "layout v{} chunked body too short: {} bytes (need {})",
-                    body[0],
-                    body.len(),
-                    min_len,
-                )));
-            }
-            // Chunk dims — one byte each (u8, suitable for real-world chunk sizes ≤ 255
-            // elements; larger values would require a different encoding not yet seen).
-            let mut chunk_dims = Vec::with_capacity(ndims_incl);
-            for i in 0..ndims_actual {
-                chunk_dims.push(body[5 + i] as u64);
-            }
-            // Append element size as the trailing "chunk dim" (v3/v4 convention).
-            let elem_size_byte = body[4 + ndims_incl] as u64;
-            chunk_dims.push(elem_size_byte);
+            let flags = body[2];
+            let dimensionality = body[3] as usize;
+            let enc_bytes = body[4] as usize;
 
-            // HDF5 index type → internal ChunkIndex discriminant:
-            // 3=FixedArray→1, 4=ExtensibleArray→2, 5=BTreeV2→3
-            let hdf5_idx = body[5 + ndims_incl];
-            let index_type: u8 = match hdf5_idx {
-                3 => 1, // FixedArray
-                4 => 2, // ExtensibleArray
-                5 => 3, // BTreeV2
+            if dimensionality == 0 {
+                return Err(OxiH5Error::Format(format!(
+                    "layout v{version} chunked: invalid dimensionality 0"
+                )));
+            }
+            if enc_bytes == 0 || enc_bytes > 8 {
+                return Err(OxiH5Error::Format(format!(
+                    "layout v{version} chunked: invalid dimension size encoded length {enc_bytes} \
+                     (must be 1..=8)"
+                )));
+            }
+
+            // Chunk dimensions: `dimensionality` little-endian values of
+            // `enc_bytes` bytes each.  The final one is the element size.
+            let dims_end = 5usize
+                .checked_add(dimensionality.checked_mul(enc_bytes).ok_or_else(|| {
+                    OxiH5Error::Format(format!(
+                        "layout v{version} chunked: dimension table size overflows"
+                    ))
+                })?)
+                .ok_or_else(|| {
+                    OxiH5Error::Format(format!(
+                        "layout v{version} chunked: dimension table size overflows"
+                    ))
+                })?;
+            if body.len() < dims_end {
+                return Err(OxiH5Error::Format(format!(
+                    "layout v{version} chunked: {dimensionality} dimensions of {enc_bytes} bytes \
+                     need {dims_end} bytes but body has {}",
+                    body.len()
+                )));
+            }
+            let mut chunk_dims = Vec::with_capacity(dimensionality);
+            for i in 0..dimensionality {
+                let at = 5 + i * enc_bytes;
+                let mut value: u64 = 0;
+                for (shift, &byte) in body[at..at + enc_bytes].iter().enumerate() {
+                    value |= (byte as u64) << (8 * shift);
+                }
+                chunk_dims.push(value);
+            }
+
+            // Chunk indexing type, then its variable-size parameter block.
+            let idx_type_at = dims_end;
+            if body.len() <= idx_type_at {
+                return Err(OxiH5Error::Format(format!(
+                    "layout v{version} chunked: body ends before the chunk indexing type"
+                )));
+            }
+            let hdf5_idx = body[idx_type_at];
+
+            // `H5O_LAYOUT_CHUNK_SINGLE_INDEX_WITH_FILTER`: a single-chunk index
+            // records its filtered size and filter mask inline, because it has
+            // no index structure on disk to hold them.
+            const SINGLE_INDEX_WITH_FILTER: u8 = 0x02;
+            let single_filtered =
+                hdf5_idx == 1 && (flags & SINGLE_INDEX_WITH_FILTER) == SINGLE_INDEX_WITH_FILTER;
+
+            // Size in bytes of the indexing-type information block.
+            let (index_type, info_len): (u8, usize) = match hdf5_idx {
+                // Single chunk: filtered size (8) + filter mask (4), or nothing.
+                1 => (4, if single_filtered { 12 } else { 0 }),
+                // Implicit: no parameters at all.
+                2 => (5, 0),
+                // Fixed array: page bits (1).
+                3 => (1, 1),
+                // Extensible array: max bits, index elements, min pointers,
+                // min elements, page bits (1 each).
+                4 => (2, 5),
+                // Version-2 B-tree: node size (4), split percent, merge percent.
+                5 => (3, 6),
                 other => {
-                    return Err(OxiH5Error::Format(format!(
-                        "layout v{} chunked: unknown HDF5 index type {other}",
-                        body[0]
+                    return Err(OxiH5Error::NotImplemented(format!(
+                        "layout v{version} chunked: chunk indexing type {other} is not supported"
                     )))
                 }
             };
 
-            // Index address (FAHD / EAHD / BTHD pointer).
-            // Layout: ..+pline(1)+chunk_dims(ndims_actual)+elem_size(1)+idx_type(1)+max_bits(1)+addr(8)
-            // Base offset = 4 (ver+cls+flags+ndims_incl) + 1 (pline) = 5
-            // Plus: ndims_actual (chunk_dims) + 1 (elem_size) + 1 (idx_type) + 1 (max_bits) = ndims_actual+3
-            // Total offset = 5 + ndims_actual + 3 = 8 + ndims_actual
-            let data_address = read_u64_le(body, 8 + ndims_actual)?;
+            let info_at = idx_type_at + 1;
+            let addr_at = info_at.checked_add(info_len).ok_or_else(|| {
+                OxiH5Error::Format(format!(
+                    "layout v{version} chunked: indexing-type information size overflows"
+                ))
+            })?;
+            let needed = addr_at.checked_add(8).ok_or_else(|| {
+                OxiH5Error::Format(format!("layout v{version} chunked: message size overflows"))
+            })?;
+            if body.len() < needed {
+                return Err(OxiH5Error::Format(format!(
+                    "layout v{version} chunked: indexing type {hdf5_idx} needs {needed} bytes but \
+                     body has {}",
+                    body.len()
+                )));
+            }
+
+            let single_chunk = if single_filtered {
+                Some(SingleChunkInfo {
+                    stored_size: read_u64_le(body, info_at)?,
+                    filter_mask: read_u32_le(body, info_at + 8)?,
+                })
+            } else {
+                None
+            };
+
+            let data_address = read_u64_le(body, addr_at)?;
 
             Ok(LayoutInfo::Chunked {
                 data_address,
-                dimensionality: ndims_incl as u8,
+                dimensionality: dimensionality as u8,
                 chunk_dims,
                 index_type,
+                single_chunk,
             })
         }
 

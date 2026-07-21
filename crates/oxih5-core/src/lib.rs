@@ -1,3 +1,38 @@
+//! # OxiH5 Core — shared data model for OxiH5
+//!
+//! `oxih5-core` defines the parser-agnostic, in-memory data model shared
+//! across the OxiH5 stack: [`Dataset`], [`Dtype`], [`Attribute`], [`Group`],
+//! [`Link`], the filter-pipeline types, and the crate-wide [`OxiH5Error`]
+//! error enum. It deliberately contains **no binary-parsing logic** — the
+//! on-disk format readers live in `oxih5-format`, and the user-facing file
+//! API lives in the `oxih5` facade crate. This crate is 100% Pure Rust,
+//! sets `#![forbid(unsafe_code)]`, and its only required dependency is
+//! `thiserror`.
+//!
+//! Most users should depend on the `oxih5` facade crate instead; reach for
+//! `oxih5-core` directly only when building custom tooling on top of
+//! `oxih5-format`.
+//!
+//! ## Quick start
+//!
+//! ```
+//! use oxih5_core::{ByteOrder, Dataset, Dtype};
+//!
+//! // A single little-endian f32 value, wrapped as a 1-element Dataset.
+//! let ds = Dataset {
+//!     data: 42.0f32.to_le_bytes().to_vec(),
+//!     shape: vec![1],
+//!     dtype: Dtype::Float { size: 4, order: ByteOrder::Little },
+//!     attributes: vec![],
+//!     max_dims: None,
+//! };
+//!
+//! // Decode it back through a typed accessor.
+//! let values = ds.as_f32()?;
+//! assert_eq!(values[0], 42.0);
+//! # Ok::<(), oxih5_core::OxiH5Error>(())
+//! ```
+
 #![forbid(unsafe_code)]
 
 mod dataset_convert;

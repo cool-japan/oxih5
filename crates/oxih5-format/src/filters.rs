@@ -26,6 +26,37 @@ pub fn inflate_deflate(data: &[u8]) -> Result<Vec<u8>, OxiH5Error> {
         .map_err(|e| OxiH5Error::Corrupted(format!("deflate filter: zlib inflate failed: {e}")))
 }
 
+/// Highest DEFLATE compression level accepted by [`oxiarc_deflate`]
+/// (`0` = stored / no compression, `9` = maximum compression).
+const MAX_DEFLATE_LEVEL: u8 = 9;
+
+/// Compress a chunk into an HDF5 *deflate* (filter id 1) payload.
+///
+/// The exact inverse of [`inflate_deflate`]: the returned bytes form a complete
+/// zlib stream (RFC 1950: 2-byte header, raw DEFLATE body, 4-byte Adler-32
+/// trailer), which is what HDF5's deflate filter stores on disk.  Compression is
+/// delegated to the COOLJAPAN Pure-Rust [`oxiarc_deflate`] crate — never
+/// flate2 / miniz.
+///
+/// * `data`  – the chunk bytes to compress (after any earlier pipeline filters)
+/// * `level` – zlib compression level, `0` (stored) through `9` (maximum);
+///   HDF5 conventionally uses `6`, which is also the level recorded in the
+///   filter pipeline message's client data.
+///
+/// # Errors
+/// Returns [`OxiH5Error::Format`] if `level` is outside the `0..=9` range
+/// accepted by [`oxiarc_deflate`], and [`OxiH5Error::Corrupted`] if the encoder
+/// itself fails.
+pub fn deflate_compress(data: &[u8], level: u8) -> Result<Vec<u8>, OxiH5Error> {
+    if level > MAX_DEFLATE_LEVEL {
+        return Err(OxiH5Error::Format(format!(
+            "deflate filter: compression level {level} out of range (expected 0..={MAX_DEFLATE_LEVEL})"
+        )));
+    }
+    oxiarc_deflate::zlib_compress(data, level)
+        .map_err(|e| OxiH5Error::Corrupted(format!("deflate filter: zlib compress failed: {e}")))
+}
+
 /// Apply the inverse of an HDF5 filter pipeline to a single raw chunk.
 ///
 /// On write, HDF5 applies filters in the order they appear in the pipeline
@@ -578,6 +609,28 @@ mod tests {
         let compressed = oxiarc_deflate::zlib_compress(&original, 6).expect("zlib compress");
         let result = inflate_deflate(&compressed).expect("inflate_deflate");
         assert_eq!(result, original);
+    }
+
+    #[test]
+    fn test_deflate_compress_roundtrip() {
+        // Compress with our HDF5 deflate-filter wrapper, then inflate it back
+        // through the matching decode half: the two must be exact inverses at
+        // every compression level oxiarc-deflate accepts.
+        let original: Vec<u8> = (0u8..=255).cycle().take(1000).collect();
+        for level in 0..=MAX_DEFLATE_LEVEL {
+            let compressed = deflate_compress(&original, level).expect("deflate_compress");
+            let result = inflate_deflate(&compressed).expect("inflate_deflate");
+            assert_eq!(result, original, "roundtrip failed at level {level}");
+        }
+    }
+
+    #[test]
+    fn test_deflate_compress_invalid_level_errors() {
+        // Levels above 9 are not a valid zlib compression level.
+        assert!(matches!(
+            deflate_compress(b"payload", MAX_DEFLATE_LEVEL + 1),
+            Err(OxiH5Error::Format(_))
+        ));
     }
 
     #[test]

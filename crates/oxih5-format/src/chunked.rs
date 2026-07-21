@@ -1,5 +1,5 @@
 use crate::btree_v2::{BTreeV2, ChunkRecord};
-use crate::message::LayoutInfo;
+use crate::message::{LayoutInfo, SingleChunkInfo};
 use crate::{btree_v1_chunk, ea_index, fa_index, filters};
 /// Chunk assembly: scatter-to-contiguous buffer reconstruction.
 ///
@@ -189,12 +189,45 @@ pub enum ChunkIndex {
     FixedArray,
     /// Extensible array (layout v4, single-extensible-dimension datasets).
     ExtensibleArray,
+    /// Single chunk (layout v4): the dataset is exactly one chunk, so there is
+    /// no index at all — the layout message's address *is* the chunk address.
+    SingleChunk,
+    /// Implicit (layout v4): no index either.  Every chunk is allocated up
+    /// front, unfiltered, laid out back to back in row-major chunk order
+    /// starting at the layout message's address.
+    Implicit,
+}
+
+/// Translate oxih5's internal `index_type` discriminant (as stored in
+/// [`LayoutInfo::Chunked`]) into a [`ChunkIndex`].
+///
+/// These numbers are *this crate's* convention and deliberately differ from the
+/// HDF5 on-disk indexing-type values; `message::parse_layout` performs that
+/// translation when decoding a version-4 layout message.
+pub(crate) fn index_of(index_type: u8, whose: &str) -> Result<ChunkIndex, OxiH5Error> {
+    match index_type {
+        0 => Ok(ChunkIndex::BTreeV1),
+        1 => Ok(ChunkIndex::FixedArray),
+        2 => Ok(ChunkIndex::ExtensibleArray),
+        3 => Ok(ChunkIndex::BTreeV2),
+        4 => Ok(ChunkIndex::SingleChunk),
+        5 => Ok(ChunkIndex::Implicit),
+        other => Err(OxiH5Error::Format(format!(
+            "{whose}: unknown chunk index type {other}"
+        ))),
+    }
 }
 
 /// Resolve a chunk index into its chunk records.
 ///
 /// `index_address` points at the index root; `ndims` is the *real* dataset
 /// rank (not the layout's `dimensionality`, which is rank + 1).
+///
+/// Several index varieties need the dataset's chunk geometry to produce usable
+/// records — the single-chunk and implicit indexes have no on-disk structure at
+/// all, and a version-2 B-tree stores *scaled* (chunk-grid) coordinates rather
+/// than element offsets.  Those are rejected here; go through `chunk_records`
+/// (as every reader in this crate does) instead.
 pub fn resolve_chunk_index(
     file_data: &[u8],
     index: ChunkIndex,
@@ -203,13 +236,220 @@ pub fn resolve_chunk_index(
 ) -> Result<Vec<ChunkRecord>, OxiH5Error> {
     match index {
         ChunkIndex::BTreeV1 => btree_v1_chunk::parse(file_data, index_address, ndims),
-        ChunkIndex::BTreeV2 => Ok(BTreeV2::parse(file_data, index_address, ndims)?
-            .records()
-            .to_vec()),
         ChunkIndex::FixedArray => fa_index::parse_fixed_array(file_data, index_address, ndims),
         ChunkIndex::ExtensibleArray => {
             ea_index::parse_extensible_array(file_data, index_address, ndims)
         }
+        ChunkIndex::BTreeV2 | ChunkIndex::SingleChunk | ChunkIndex::Implicit => {
+            Err(OxiH5Error::Format(format!(
+                "resolve_chunk_index: the {index:?} index needs the dataset's chunk geometry; \
+                 use chunk_records instead"
+            )))
+        }
+    }
+}
+
+/// Everything needed to turn a chunked layout's index into chunk records.
+///
+/// Grouped into one struct because six of these travel together through the
+/// three readers (`read_chunked`, `read_chunked_slice`,
+/// `read_chunked_hyperslab`), which previously each carried their own copy of
+/// the resolution logic.
+pub(crate) struct ChunkIndexQuery<'a> {
+    pub index: ChunkIndex,
+    /// Index root address, or chunk data address for single-chunk / implicit.
+    pub index_address: u64,
+    /// Per-dimension chunk shape in elements (element-size entry stripped).
+    pub real_chunk_dims: &'a [u64],
+    /// Full dataset shape in elements.
+    pub dataset_dims: &'a [u64],
+    pub elem_size: usize,
+    /// Stored size + filter mask for a filtered single-chunk index.
+    pub single_chunk: Option<SingleChunkInfo>,
+}
+
+/// Number of chunks along each dimension: `ceil(dataset_dim / chunk_dim)`.
+fn chunk_counts(dataset_dims: &[u64], chunk_dims: &[u64]) -> Result<Vec<u64>, OxiH5Error> {
+    dataset_dims
+        .iter()
+        .zip(chunk_dims.iter())
+        .map(|(&d, &c)| {
+            if c == 0 {
+                Err(OxiH5Error::Format(
+                    "chunked layout: chunk dimension of zero".into(),
+                ))
+            } else {
+                Ok(d.div_ceil(c))
+            }
+        })
+        .collect()
+}
+
+/// Uncompressed byte size of one whole chunk.
+fn chunk_byte_size(chunk_dims: &[u64], elem_size: usize) -> Result<usize, OxiH5Error> {
+    let volume = chunk_dims
+        .iter()
+        .try_fold(1u64, |acc, &d| acc.checked_mul(d))
+        .ok_or_else(|| OxiH5Error::Format("chunked layout: chunk volume overflows".into()))?;
+    usize::try_from(volume)
+        .ok()
+        .and_then(|v| v.checked_mul(elem_size))
+        .ok_or_else(|| OxiH5Error::Format("chunked layout: chunk size overflows".into()))
+}
+
+/// Build the single record described by a [`ChunkIndex::SingleChunk`] layout.
+///
+/// The chunk covers the whole dataset and therefore sits at offset zero in
+/// every dimension.  Its stored size comes from the layout message when a
+/// filter pipeline is present, and is the plain chunk size otherwise.
+fn single_chunk_records(q: &ChunkIndexQuery<'_>) -> Result<Vec<ChunkRecord>, OxiH5Error> {
+    let (size, filter_mask) = match q.single_chunk {
+        Some(info) => (
+            u32::try_from(info.stored_size).map_err(|_| {
+                OxiH5Error::Format(format!(
+                    "single-chunk layout: stored size {} exceeds u32",
+                    info.stored_size
+                ))
+            })?,
+            info.filter_mask,
+        ),
+        None => {
+            let bytes = chunk_byte_size(q.real_chunk_dims, q.elem_size)?;
+            let size = u32::try_from(bytes).map_err(|_| {
+                OxiH5Error::Format(format!(
+                    "single-chunk layout: chunk size {bytes} exceeds u32"
+                ))
+            })?;
+            (size, 0)
+        }
+    };
+    Ok(vec![ChunkRecord {
+        address: q.index_address,
+        size,
+        filter_mask,
+        offsets: vec![0; q.dataset_dims.len()],
+    }])
+}
+
+/// Enumerate the records of a [`ChunkIndex::Implicit`] layout.
+///
+/// Implicit indexing is only chosen by libhdf5 when the dataset has fixed
+/// dimensions, no filter pipeline and early allocation, so every chunk exists,
+/// every chunk is stored uncompressed at its full size, and chunk *n* begins at
+/// `address + n * chunk_bytes` with *n* running in row-major order over the
+/// chunk grid.
+fn implicit_records(q: &ChunkIndexQuery<'_>) -> Result<Vec<ChunkRecord>, OxiH5Error> {
+    let ndims = q.dataset_dims.len();
+    let counts = chunk_counts(q.dataset_dims, q.real_chunk_dims)?;
+    let chunk_bytes = chunk_byte_size(q.real_chunk_dims, q.elem_size)?;
+    let size = u32::try_from(chunk_bytes).map_err(|_| {
+        OxiH5Error::Format(format!(
+            "implicit chunk layout: chunk size {chunk_bytes} exceeds u32"
+        ))
+    })?;
+
+    let total: u64 = counts
+        .iter()
+        .try_fold(1u64, |acc, &c| acc.checked_mul(c))
+        .ok_or_else(|| OxiH5Error::Format("implicit chunk layout: chunk count overflows".into()))?;
+    let total = usize::try_from(total).map_err(|_| {
+        OxiH5Error::Format("implicit chunk layout: chunk count exceeds addressable range".into())
+    })?;
+
+    let mut records = Vec::with_capacity(total);
+    let mut coords = vec![0u64; ndims];
+    for n in 0..total {
+        let byte_offset = (n as u64).checked_mul(chunk_bytes as u64).ok_or_else(|| {
+            OxiH5Error::Format("implicit chunk layout: chunk offset overflows".into())
+        })?;
+        let address = q.index_address.checked_add(byte_offset).ok_or_else(|| {
+            OxiH5Error::Format("implicit chunk layout: chunk address overflows".into())
+        })?;
+        // Chunk offsets are in *elements*, so scale the chunk-grid coordinate
+        // by the chunk extent in each dimension.
+        let offsets: Vec<u64> = coords
+            .iter()
+            .zip(q.real_chunk_dims.iter())
+            .map(|(&c, &extent)| c.saturating_mul(extent))
+            .collect();
+        records.push(ChunkRecord {
+            address,
+            size,
+            filter_mask: 0,
+            offsets,
+        });
+
+        // Advance the row-major chunk-grid coordinate.
+        for d in (0..ndims).rev() {
+            coords[d] += 1;
+            if coords[d] < counts[d] {
+                break;
+            }
+            coords[d] = 0;
+        }
+    }
+    Ok(records)
+}
+
+/// Resolve a chunked layout's index into chunk records, honouring the cache.
+///
+/// An index address of `u64::MAX` is HDF5's "undefined address": the dataset
+/// has no chunks allocated yet (nothing was ever written to it).  That is not
+/// an error — libhdf5 reads such a dataset as all fill value — so it yields an
+/// empty record list and the caller's fill-initialised buffer stands.
+pub(crate) fn chunk_records(
+    file_data: &[u8],
+    q: &ChunkIndexQuery<'_>,
+    cache: Option<&ChunkIndexCache>,
+) -> Result<Arc<Vec<ChunkRecord>>, OxiH5Error> {
+    let ndims = q.dataset_dims.len();
+
+    if q.index_address == u64::MAX {
+        return Ok(Arc::new(Vec::new()));
+    }
+
+    let compute = || -> Result<Vec<ChunkRecord>, OxiH5Error> {
+        match q.index {
+            // The fixed-array index needs the chunk and dataset shapes to
+            // reconstruct each chunk's offset from its linear array position.
+            ChunkIndex::FixedArray => fa_index::parse_fixed_array_v4_with_dataset_dims(
+                file_data,
+                q.index_address,
+                ndims,
+                q.real_chunk_dims,
+                q.dataset_dims,
+                chunk_byte_size(q.real_chunk_dims, q.elem_size)?,
+            ),
+            // A v2 B-tree stores scaled coordinates, and an unfiltered record
+            // omits the chunk size entirely; both come from the geometry.
+            ChunkIndex::BTreeV2 => {
+                let chunk_bytes = chunk_byte_size(q.real_chunk_dims, q.elem_size)?;
+                let chunk_bytes = u32::try_from(chunk_bytes).map_err(|_| {
+                    OxiH5Error::Format(format!(
+                        "B-tree v2 chunk index: chunk size {chunk_bytes} exceeds u32"
+                    ))
+                })?;
+                Ok(BTreeV2::parse(
+                    file_data,
+                    q.index_address,
+                    ndims,
+                    &crate::btree_v2::ChunkGeometry {
+                        chunk_dims: q.real_chunk_dims,
+                        chunk_bytes,
+                    },
+                )?
+                .records()
+                .to_vec())
+            }
+            ChunkIndex::SingleChunk => single_chunk_records(q),
+            ChunkIndex::Implicit => implicit_records(q),
+            other => resolve_chunk_index(file_data, other, q.index_address, ndims),
+        }
+    };
+
+    match cache {
+        Some(c) => c.get_or_insert((q.index_address, ndims), compute),
+        None => Ok(Arc::new(compute()?)),
     }
 }
 
@@ -244,6 +484,7 @@ pub fn read_chunked(
         dimensionality,
         chunk_dims,
         index_type,
+        single_chunk,
     } = layout
     else {
         return Err(OxiH5Error::Format(
@@ -269,67 +510,21 @@ pub fn read_chunked(
         )));
     };
 
-    // Layout v3 (the only chunked layout `parse_layout` currently emits) always
-    // uses a version-1 B-tree, so `index_type` is hardcoded to 0 upstream and
-    // only the `0` arm is reachable today.
-    //
-    // NOTE: these `index_type` values are *this crate's* internal convention,
-    // NOT the HDF5 layout-v4 "indexing type" field (whose values differ:
-    // 1=single-chunk, 2=implicit, 3=fixed-array, 4=extensible-array,
-    // 5=B-tree-v2). When layout v4 parsing is added, translate the v4 field
-    // into `ChunkIndex` directly rather than reusing these numbers.
-    let index = match index_type {
-        0 => ChunkIndex::BTreeV1,
-        1 => ChunkIndex::FixedArray,
-        2 => ChunkIndex::ExtensibleArray,
-        3 => ChunkIndex::BTreeV2,
-        other => {
-            return Err(OxiH5Error::Format(format!(
-                "read_chunked: unknown chunk index type {other}"
-            )))
-        }
-    };
+    let index = index_of(*index_type, "read_chunked")?;
 
     // Compute (or retrieve from cache) the chunk records.
-    //
-    // Both the FixedArray special path and the generic `resolve_chunk_index`
-    // path are wrapped inside a single closure so the cache key
-    // `(data_address, ndims)` is sufficient regardless of index type.
-    let chunks_arc: Arc<Vec<ChunkRecord>> = if let Some(c) = cache {
-        let uncompressed_for_fa = real_chunk_dims.iter().product::<u64>() as usize * elem_size;
-        let real_chunk_dims_clone = real_chunk_dims.clone();
-        let dataset_dims_clone = dataset_dims.to_vec();
-        c.get_or_insert((*data_address, ndims), move || {
-            if index == ChunkIndex::FixedArray {
-                fa_index::parse_fixed_array_v4_with_dataset_dims(
-                    file_data,
-                    *data_address,
-                    ndims,
-                    &real_chunk_dims_clone,
-                    &dataset_dims_clone,
-                    uncompressed_for_fa,
-                )
-            } else {
-                resolve_chunk_index(file_data, index, *data_address, ndims)
-            }
-        })?
-    } else {
-        // No cache: compute directly.
-        let records = if index == ChunkIndex::FixedArray {
-            let uncompressed = real_chunk_dims.iter().product::<u64>() as usize * elem_size;
-            fa_index::parse_fixed_array_v4_with_dataset_dims(
-                file_data,
-                *data_address,
-                ndims,
-                &real_chunk_dims,
-                dataset_dims,
-                uncompressed,
-            )?
-        } else {
-            resolve_chunk_index(file_data, index, *data_address, ndims)?
-        };
-        Arc::new(records)
-    };
+    let chunks_arc: Arc<Vec<ChunkRecord>> = chunk_records(
+        file_data,
+        &ChunkIndexQuery {
+            index,
+            index_address: *data_address,
+            real_chunk_dims: &real_chunk_dims,
+            dataset_dims,
+            elem_size,
+            single_chunk: *single_chunk,
+        },
+        cache,
+    )?;
 
     #[cfg(feature = "parallel")]
     {
@@ -442,6 +637,7 @@ pub fn read_chunked_slice(
         dimensionality,
         chunk_dims,
         index_type,
+        single_chunk,
     } = layout
     else {
         return Err(OxiH5Error::Format(
@@ -496,54 +692,21 @@ pub fn read_chunked_slice(
         )));
     };
 
-    // Translate index_type (internal convention) to ChunkIndex.
-    let index = match index_type {
-        0 => ChunkIndex::BTreeV1,
-        1 => ChunkIndex::FixedArray,
-        2 => ChunkIndex::ExtensibleArray,
-        3 => ChunkIndex::BTreeV2,
-        other => {
-            return Err(OxiH5Error::Format(format!(
-                "read_chunked_slice: unknown chunk index type {other}"
-            )))
-        }
-    };
+    let index = index_of(*index_type, "read_chunked_slice")?;
 
     // Resolve all chunk records (with optional caching).
-    let chunks_arc: Arc<Vec<ChunkRecord>> = if let Some(c) = cache {
-        let uncompressed_for_fa = real_chunk_dims.iter().product::<u64>() as usize * elem_size;
-        let real_chunk_dims_clone = real_chunk_dims.clone();
-        let dataset_dims_clone = dataset_dims.to_vec();
-        c.get_or_insert((*data_address, ndims), move || {
-            if index == ChunkIndex::FixedArray {
-                crate::fa_index::parse_fixed_array_v4_with_dataset_dims(
-                    file_data,
-                    *data_address,
-                    ndims,
-                    &real_chunk_dims_clone,
-                    &dataset_dims_clone,
-                    uncompressed_for_fa,
-                )
-            } else {
-                resolve_chunk_index(file_data, index, *data_address, ndims)
-            }
-        })?
-    } else {
-        let records = if index == ChunkIndex::FixedArray {
-            let uncompressed = real_chunk_dims.iter().product::<u64>() as usize * elem_size;
-            crate::fa_index::parse_fixed_array_v4_with_dataset_dims(
-                file_data,
-                *data_address,
-                ndims,
-                &real_chunk_dims,
-                dataset_dims,
-                uncompressed,
-            )?
-        } else {
-            resolve_chunk_index(file_data, index, *data_address, ndims)?
-        };
-        Arc::new(records)
-    };
+    let chunks_arc: Arc<Vec<ChunkRecord>> = chunk_records(
+        file_data,
+        &ChunkIndexQuery {
+            index,
+            index_address: *data_address,
+            real_chunk_dims: &real_chunk_dims,
+            dataset_dims,
+            elem_size,
+            single_chunk: *single_chunk,
+        },
+        cache,
+    )?;
 
     #[cfg(feature = "parallel")]
     {

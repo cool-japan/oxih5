@@ -1,254 +1,325 @@
 //! Link resolution: soft links, external links, and soft→external chains.
 //!
 //! Extracted from `lib.rs` to keep individual source files under the 2000-line
-//! limit.  These helpers navigate new-style (Link-message) groups and open
+//! limit.  These helpers navigate groups of **either** storage style and open
 //! external HDF5 files referenced by external links.
+//!
+//! # Why one resolver for both group styles
+//!
+//! HDF5 has two unrelated ways to store a group's members:
+//!
+//! * **New-style** (`libver='latest'`): Link messages (0x0006) in the object
+//!   header, or a fractal heap referenced by a Link Info message (0x0002).
+//!   Each link carries an explicit type — hard, soft or external.
+//! * **Old-style** (h5py's *default* `libver`): a version-1 B-tree over SNOD
+//!   symbol-table nodes plus a local heap.  A symbol-table entry has no link
+//!   type field: a soft link is one whose *cache type* is 2, whose object
+//!   header address is the undefined-address sentinel (`u64::MAX`), and whose
+//!   value is a path stored in the group's local heap.
+//!
+//! A path may cross groups of both styles, and a soft link's target is just a
+//! path — so following one requires navigation that does not care which style
+//! each group along the way uses.  [`GroupRef`] erases that difference and
+//! [`lookup_child`] is the single per-segment step every resolver here builds
+//! on.
 
-use super::*;
+use oxih5_core::{Dataset, Dtype, OxiH5Error};
+use oxih5_format::{group, header, superblock, ChunkIndexCache};
 
-/// Resolve a soft-link target path to an object header address, starting from
-/// `current_header_addr` (the root).
+use crate::open;
+use crate::reader::{find_symbol_table_addresses, is_vlen_dtype, read_dataset_from_object_header};
+use crate::{File, Group};
+
+/// A group, identified by its object header and by how its members are indexed.
 ///
-/// `visited` is a cycle guard: if `target_path` is already in the set the link
-/// chain is cyclic and we return an error rather than looping infinitely.
-pub(crate) fn resolve_soft_link_to_header(
-    file_data: &[u8],
-    root_header_addr: u64,
-    target_path: &str,
-    visited: &mut std::collections::HashSet<String>,
-) -> Result<u64, OxiH5Error> {
-    if !visited.insert(target_path.to_string()) {
-        return Err(OxiH5Error::Format(format!(
-            "soft link cycle detected at path '{target_path}'"
-        )));
-    }
-
-    // Navigate from root, following each segment.
-    let normalized = target_path.trim_start_matches('/');
-    let parts: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
-
-    // Empty path → root itself.
-    if parts.is_empty() {
-        return Ok(root_header_addr);
-    }
-
-    let sb = superblock::parse(file_data)?;
-    let ctx = oxih5_format::context::ParseContext::new(
-        sb.size_of_offsets,
-        sb.size_of_lengths,
-        sb.base_address,
-    );
-
-    let mut current_header = root_header_addr;
-    for (idx, segment) in parts.iter().enumerate() {
-        let is_last = idx == parts.len() - 1;
-        let links = group::list_new_style_links(file_data, current_header, &ctx)?;
-        let mut found = false;
-        for pl in &links {
-            if pl.name == *segment {
-                match &pl.link {
-                    oxih5_core::Link::Hard { address } => {
-                        current_header = *address;
-                        found = true;
-                        break;
-                    }
-                    oxih5_core::Link::Soft { path } => {
-                        if is_last {
-                            // Recurse into nested soft link with cycle guard.
-                            return resolve_soft_link_to_header(
-                                file_data,
-                                root_header_addr,
-                                path,
-                                visited,
-                            );
-                        }
-                        // Mid-path soft link: resolve it then continue.
-                        let addr = resolve_soft_link_to_header(
-                            file_data,
-                            root_header_addr,
-                            path,
-                            visited,
-                        )?;
-                        current_header = addr;
-                        found = true;
-                        break;
-                    }
-                    oxih5_core::Link::External { .. } => {
-                        return Err(OxiH5Error::NotImplemented(
-                            "soft link targeting external link not supported".into(),
-                        ));
-                    }
-                }
-            }
-        }
-        if !found {
-            return Err(OxiH5Error::NotFound(format!(
-                "soft link target '{target_path}': segment '{segment}' not found"
-            )));
-        }
-    }
-
-    Ok(current_header)
+/// Constructed either from an object-header address via [`GroupRef::at`], or
+/// directly by a [`crate::Group`] handle that already knows its own addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GroupRef {
+    /// Absolute file address of this group's object header.
+    pub(crate) header: u64,
+    /// `Some((btree_address, heap_address))` for an old-style symbol-table
+    /// group; `None` for a new-style Link-message group.
+    pub(crate) symbol_table: Option<(u64, u64)>,
 }
 
-/// The resolved target of a soft link.
-pub(crate) enum SoftTarget {
-    /// A hard object header address within the same file.
-    Local(u64),
-    /// The soft link ultimately points at an external link — the referenced
-    /// object lives in another file.
+impl GroupRef {
+    /// Classify the group whose object header lives at `header_addr`.
+    ///
+    /// An object with a Symbol Table message (0x0011) is old-style; anything
+    /// else is treated as new-style, which yields an empty child list for
+    /// objects that are not groups at all (and hence a `NotFound` from
+    /// [`lookup_child`] rather than a misleading parse error).
+    pub(crate) fn at(file_data: &[u8], header_addr: u64) -> Result<Self, OxiH5Error> {
+        let msgs = header::parse_messages(file_data, header_addr)?;
+        Ok(GroupRef {
+            header: header_addr,
+            symbol_table: find_symbol_table_addresses(&msgs),
+        })
+    }
+
+    /// Build a reference from addresses a caller already holds.
+    pub(crate) fn new(header: u64, symbol_table: Option<(u64, u64)>) -> Self {
+        GroupRef {
+            header,
+            symbol_table,
+        }
+    }
+
+    /// The root group of `file_data`.
+    pub(crate) fn root(file_data: &[u8]) -> Result<Self, OxiH5Error> {
+        let sb = superblock::parse(file_data)?;
+        GroupRef::at(file_data, sb.root_object_header_address)
+    }
+}
+
+/// What a name resolves to inside a group, independent of storage style.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChildLink {
+    /// A hard link: the object header address of the target.
+    Hard(u64),
+    /// A soft link: an in-file path, absolute (`/a/b`) or relative to the group
+    /// that holds the link.
+    Soft(String),
+    /// An external link: a path inside another file.
     External { file: String, path: String },
 }
 
-/// Resolve a soft link, following it through hard links, nested soft links and,
-/// crucially, a terminal **external** link (soft → external).
+/// Look up `name` among the children of `group`.
 ///
-/// This mirrors [`resolve_soft_link_to_header`] but can report an external
-/// target instead of failing with `NotImplemented`, so callers reading a
-/// dataset can open the external file and continue.
-pub(crate) fn resolve_soft_link_target(
+/// This is the one place that knows the difference between the two group
+/// storage styles; every path-walking routine below is written in terms of it.
+pub(crate) fn lookup_child(
     file_data: &[u8],
-    root_header_addr: u64,
-    target_path: &str,
-    visited: &mut std::collections::HashSet<String>,
-) -> Result<SoftTarget, OxiH5Error> {
-    if !visited.insert(target_path.to_string()) {
-        return Err(OxiH5Error::Format(format!(
-            "soft link cycle detected at path '{target_path}'"
-        )));
+    group: GroupRef,
+    name: &str,
+) -> Result<ChildLink, OxiH5Error> {
+    match group.symbol_table {
+        Some((btree, heap)) => match group::find_entry(file_data, btree, heap, name)? {
+            group::SymTabLink::Hard(address) => Ok(ChildLink::Hard(address)),
+            group::SymTabLink::Soft(path) => Ok(ChildLink::Soft(path)),
+        },
+        None => {
+            for pl in &list_links(file_data, group.header)? {
+                if pl.name == name {
+                    return Ok(child_link_of(&pl.link));
+                }
+            }
+            Err(OxiH5Error::NotFound(name.to_string()))
+        }
     }
+}
 
-    let normalized = target_path.trim_start_matches('/');
-    let parts: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.is_empty() {
-        return Ok(SoftTarget::Local(root_header_addr));
+/// List every child of `group` as `(name, link)` pairs, in either style.
+pub(crate) fn list_children(
+    file_data: &[u8],
+    group: GroupRef,
+) -> Result<Vec<(String, ChildLink)>, OxiH5Error> {
+    match group.symbol_table {
+        Some((btree, heap)) => Ok(group::list_entries(file_data, btree, heap)?
+            .into_iter()
+            .map(|(name, link)| {
+                let child = match link {
+                    group::SymTabLink::Hard(address) => ChildLink::Hard(address),
+                    group::SymTabLink::Soft(path) => ChildLink::Soft(path),
+                };
+                (name, child)
+            })
+            .collect()),
+        None => Ok(list_links(file_data, group.header)?
+            .into_iter()
+            .map(|pl| {
+                let child = child_link_of(&pl.link);
+                (pl.name, child)
+            })
+            .collect()),
     }
+}
 
+/// Read the Link messages of the new-style group at `header_addr`.
+fn list_links(
+    file_data: &[u8],
+    header_addr: u64,
+) -> Result<Vec<oxih5_format::link_msg::ParsedLink>, OxiH5Error> {
     let sb = superblock::parse(file_data)?;
     let ctx = oxih5_format::context::ParseContext::new(
         sb.size_of_offsets,
         sb.size_of_lengths,
         sb.base_address,
     );
+    group::list_new_style_links(file_data, header_addr, &ctx)
+}
 
-    let mut current_header = root_header_addr;
+fn child_link_of(link: &oxih5_core::Link) -> ChildLink {
+    match link {
+        oxih5_core::Link::Hard { address } => ChildLink::Hard(*address),
+        oxih5_core::Link::Soft { path } => ChildLink::Soft(path.clone()),
+        oxih5_core::Link::External { file, path } => ChildLink::External {
+            file: file.clone(),
+            path: path.clone(),
+        },
+    }
+}
+
+/// The resolved target of a link path.
+pub(crate) enum SoftTarget {
+    /// A hard object header address within the same file.
+    Local(u64),
+    /// The path ultimately reaches an external link — the referenced object
+    /// lives in another file.
+    External { file: String, path: String },
+}
+
+/// Cycle guard for link resolution.
+///
+/// Keyed by `(starting group's object header, path)` rather than by path alone:
+/// a *relative* soft link value such as `"inner"` is a different target in
+/// every group that holds one, so the path on its own does not identify a
+/// resolution step.
+pub(crate) type VisitedLinks = std::collections::HashSet<(u64, String)>;
+
+/// Resolve `path` against `base`, following hard, soft and (terminal) external
+/// links through groups of either storage style.
+///
+/// A path beginning with `/` is resolved from the file root; any other path is
+/// resolved from `base`, which is how libhdf5 interprets a relative soft-link
+/// value — relative to the group that holds the link.
+pub(crate) fn resolve_path_target(
+    file_data: &[u8],
+    base: GroupRef,
+    path: &str,
+    visited: &mut VisitedLinks,
+) -> Result<SoftTarget, OxiH5Error> {
+    let start = if path.starts_with('/') {
+        GroupRef::root(file_data)?
+    } else {
+        base
+    };
+
+    if !visited.insert((start.header, path.to_string())) {
+        return Err(OxiH5Error::Format(format!(
+            "soft link cycle detected at path '{path}'"
+        )));
+    }
+
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    // An empty path ("" or "/") names the group we started from.
+    if parts.is_empty() {
+        return Ok(SoftTarget::Local(start.header));
+    }
+
+    let mut current = start;
     for (idx, segment) in parts.iter().enumerate() {
         let is_last = idx == parts.len() - 1;
-        let links = group::list_new_style_links(file_data, current_header, &ctx)?;
-        let mut found = false;
-        for pl in &links {
-            if pl.name == *segment {
-                match &pl.link {
-                    oxih5_core::Link::Hard { address } => {
-                        current_header = *address;
-                        found = true;
-                        break;
-                    }
-                    oxih5_core::Link::Soft { path } => {
-                        // Recurse for both mid-path and terminal soft links; the
-                        // terminal case may itself resolve to an external target.
-                        let target =
-                            resolve_soft_link_target(file_data, root_header_addr, path, visited)?;
-                        if is_last {
-                            return Ok(target);
-                        }
-                        match target {
-                            SoftTarget::Local(addr) => {
-                                current_header = addr;
-                                found = true;
-                                break;
-                            }
-                            SoftTarget::External { .. } => {
-                                return Err(OxiH5Error::NotImplemented(
-                                    "soft link traverses an external link mid-path".into(),
-                                ));
-                            }
-                        }
-                    }
-                    oxih5_core::Link::External { file, path } => {
-                        if is_last {
-                            return Ok(SoftTarget::External {
-                                file: file.clone(),
-                                path: path.clone(),
-                            });
-                        }
+        let child = lookup_child(file_data, current, segment).map_err(|e| match e {
+            OxiH5Error::NotFound(_) => OxiH5Error::NotFound(format!(
+                "link target '{path}': segment '{segment}' not found"
+            )),
+            other => other,
+        })?;
+
+        let next_header = match child {
+            ChildLink::Hard(address) => address,
+            ChildLink::Soft(nested) => {
+                // The nested value is resolved relative to `current`, the group
+                // that holds it — not relative to wherever this walk began.
+                let target = resolve_path_target(file_data, current, &nested, visited)?;
+                if is_last {
+                    return Ok(target);
+                }
+                match target {
+                    SoftTarget::Local(address) => address,
+                    SoftTarget::External { .. } => {
                         return Err(OxiH5Error::NotImplemented(
                             "soft link traverses an external link mid-path".into(),
-                        ));
+                        ))
                     }
                 }
             }
+            ChildLink::External { file, path: p } => {
+                if is_last {
+                    return Ok(SoftTarget::External { file, path: p });
+                }
+                return Err(OxiH5Error::NotImplemented(
+                    "soft link traverses an external link mid-path".into(),
+                ));
+            }
+        };
+
+        if is_last {
+            return Ok(SoftTarget::Local(next_header));
         }
-        if !found {
-            return Err(OxiH5Error::NotFound(format!(
-                "soft link target '{target_path}': segment '{segment}' not found"
-            )));
-        }
+        current = GroupRef::at(file_data, next_header)?;
     }
 
-    Ok(SoftTarget::Local(current_header))
+    Ok(SoftTarget::Local(current.header))
 }
 
-/// Resolve a dataset name within a new-style group, handling both hard links
-/// and external file links.
+/// Resolve `path` against `base` to an object header address in this file.
+///
+/// Fails with `NotImplemented` when the path leads out of the file through an
+/// external link, because such a target has no address here.
+pub(crate) fn resolve_path_to_header(
+    file_data: &[u8],
+    base: GroupRef,
+    path: &str,
+    visited: &mut VisitedLinks,
+) -> Result<u64, OxiH5Error> {
+    match resolve_path_target(file_data, base, path, visited)? {
+        SoftTarget::Local(address) => Ok(address),
+        SoftTarget::External { file, path: p } => Err(OxiH5Error::NotImplemented(format!(
+            "soft link resolves to an external link to '{p}' in '{file}'; that target has no \
+             object-header address in this file"
+        ))),
+    }
+}
+
+/// Convenience wrapper: resolve a soft-link value held by `base`.
+pub(crate) fn resolve_soft_link_to_header(
+    file_data: &[u8],
+    base: GroupRef,
+    target_path: &str,
+) -> Result<u64, OxiH5Error> {
+    let mut visited = VisitedLinks::new();
+    resolve_path_to_header(file_data, base, target_path, &mut visited)
+}
+
+/// Resolve a dataset name within `group`, handling hard links, soft links
+/// (including soft → external chains) and external file links.
 ///
 /// For hard links the dataset is read from the local file at the resolved
 /// object header address.  For external links the referenced file is opened
 /// and `File::dataset` is called with the target path stored in the link.
-/// Soft links and group-type external links return `NotImplemented`.
-pub(crate) fn resolve_new_style_dataset(
+pub(crate) fn resolve_dataset_in_group(
     file_data: &[u8],
-    parent_header_addr: u64,
+    group: GroupRef,
     name: &str,
     source_dir: &std::path::Path,
     cache: Option<&ChunkIndexCache>,
 ) -> Result<Dataset, OxiH5Error> {
-    let sb = superblock::parse(file_data)?;
-    let ctx = oxih5_format::context::ParseContext::new(
-        sb.size_of_offsets,
-        sb.size_of_lengths,
-        sb.base_address,
-    );
-    let links = group::list_new_style_links(file_data, parent_header_addr, &ctx)?;
-    for parsed_link in &links {
-        if parsed_link.name == name {
-            match &parsed_link.link {
-                oxih5_core::Link::Hard { address } => {
-                    return read_dataset_from_object_header(
-                        file_data, *address, name, source_dir, cache,
-                    );
+    match lookup_child(file_data, group, name)? {
+        ChildLink::Hard(address) => {
+            read_dataset_from_object_header(file_data, address, name, source_dir, cache)
+        }
+        ChildLink::Soft(path) => {
+            // Follow the soft link to its target, then read the dataset.  The
+            // target may be local, or (soft → external) in another file.
+            let mut visited = VisitedLinks::new();
+            match resolve_path_target(file_data, group, &path, &mut visited)? {
+                SoftTarget::Local(address) => {
+                    read_dataset_from_object_header(file_data, address, name, source_dir, cache)
                 }
-                oxih5_core::Link::Soft { path } => {
-                    // Follow the soft link to its target, then read the dataset.
-                    // The target may be local, or (soft → external) in another file.
-                    let sb = superblock::parse(file_data)?;
-                    let mut visited = std::collections::HashSet::new();
-                    let target = resolve_soft_link_target(
-                        file_data,
-                        sb.root_object_header_address,
-                        path,
-                        &mut visited,
-                    )?;
-                    return match target {
-                        SoftTarget::Local(addr) => read_dataset_from_object_header(
-                            file_data, addr, name, source_dir, cache,
-                        ),
-                        SoftTarget::External {
-                            file: ext_file,
-                            path: ext_path,
-                        } => resolve_external_link(&ext_file, &ext_path, source_dir),
-                    };
-                }
-                oxih5_core::Link::External {
+                SoftTarget::External {
                     file: ext_file,
                     path: ext_path,
-                } => {
-                    return resolve_external_link(ext_file, ext_path, source_dir);
-                }
+                } => resolve_external_link(&ext_file, &ext_path, source_dir),
             }
         }
+        ChildLink::External {
+            file: ext_file,
+            path: ext_path,
+        } => resolve_external_link(&ext_file, &ext_path, source_dir),
     }
-    Err(OxiH5Error::NotFound(name.to_string()))
 }
 
 /// Open an external HDF5 file and navigate to the dataset at `ext_path`.

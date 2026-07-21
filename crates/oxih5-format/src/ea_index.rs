@@ -29,7 +29,7 @@ pub fn parse_extensible_array(
     let base = header_address as usize;
 
     // -----------------------------------------------------------------------
-    // EA Header layout ("EAHD"):
+    // EA Header layout ("EAHD"), with size-of-lengths = size-of-offsets = 8:
     //  0  4   Signature "EAHD"
     //  4  1   Version (must be 0)
     //  5  1   Client ID
@@ -39,15 +39,27 @@ pub fn parse_extensible_array(
     //  9  1   data_blk_min_elmts
     // 10  1   secondary_blk_min_data_block_pointers
     // 11  1   max_dblk_page_nelmts_bits
-    // 12  8   num_created_blks
-    // 20  8   num_realized_blks
-    // 28  8   index_block_address
-    // 36  4   Checksum
-    // Total: 40 bytes minimum
+    // 12  8   Number of secondary blocks
+    // 20  8   Secondary block size
+    // 28  8   Number of data blocks
+    // 36  8   Data block size
+    // 44  8   Max index set
+    // 52  8   Number of elements
+    // 60  8   Index block address
+    // 68  4   Checksum
+    // Total: 72 bytes
+    //
+    // NOTE: the six 8-byte counters between the 1-byte creation parameters and
+    // the index block address are easy to overlook — omitting them puts the
+    // index block address at offset 28 and makes every real libhdf5 extensible
+    // array decode against whatever happens to sit there.
     // -----------------------------------------------------------------------
 
+    const EA_HEADER_LEN: usize = 72;
+    const EA_INDEX_BLOCK_ADDR_OFF: usize = 60;
+
     let hdr_end = base
-        .checked_add(40)
+        .checked_add(EA_HEADER_LEN)
         .ok_or_else(|| OxiH5Error::Format("EA: header address overflow".into()))?;
     if hdr_end > file_data.len() {
         return Err(OxiH5Error::Format(format!(
@@ -75,8 +87,31 @@ pub fn parse_extensible_array(
     // secondary_blk_min_data_block_pointers: informational; used by EASB parsing
     let _sbmin = file_data[base + 10] as usize;
 
+    // This parser treats every array element as a self-describing chunk record
+    // — address (8) + size (4) + filter mask (4) + one 8-byte offset per
+    // dimension.  Real libhdf5 extensible arrays do not store elements that
+    // way: an unfiltered dataset stores a bare 8-byte chunk address, and a
+    // filtered one stores address + a *variable-width* stored size + filter
+    // mask (element size 8 + n + 4).  In both cases a chunk's position comes
+    // from its linear index in the array combined with the dataset's chunk
+    // shape, which this function is not given.
+    //
+    // Rather than decode those bytes as if they were records — which yields
+    // silent zeros — report the gap precisely.  Completing this requires
+    // threading the chunk geometry in (as `parse_fixed_array_v4_with_dataset_dims`
+    // does for the fixed array) and deriving offsets from the element index
+    // across the index block, data blocks and secondary blocks.
+    let expected_record_size = 16 + ndims.saturating_mul(8);
+    if element_size != expected_record_size {
+        return Err(OxiH5Error::NotImplemented(format!(
+            "extensible array chunk index: element size {element_size} is a bare chunk address \
+             (or address + stored size + filter mask), not a self-describing {expected_record_size}-byte \
+             record; decoding it needs the dataset's chunk geometry, which is not yet plumbed through"
+        )));
+    }
+
     let idx_blk_addr = u64::from_le_bytes(
-        file_data[base + 28..base + 36]
+        file_data[base + EA_INDEX_BLOCK_ADDR_OFF..base + EA_INDEX_BLOCK_ADDR_OFF + 8]
             .try_into()
             .map_err(|_| OxiH5Error::Format("EA: index block addr slice".into()))?,
     );
@@ -460,7 +495,8 @@ mod tests {
     use super::*;
 
     fn build_ea_header(idx_blk_addr: u64, element_size: u8, idx_blk_elmts: u8) -> Vec<u8> {
-        let mut buf = vec![0u8; 64];
+        // 72 bytes: the real EAHD size for 8-byte offsets/lengths.
+        let mut buf = vec![0u8; 72];
         buf[0..4].copy_from_slice(b"EAHD");
         buf[4] = 0; // version
         buf[5] = 0; // client_id
@@ -474,9 +510,9 @@ mod tests {
         buf[12..20].copy_from_slice(&1u64.to_le_bytes());
         // num_realized_blks at 20 (8 bytes)
         buf[20..28].copy_from_slice(&1u64.to_le_bytes());
-        // index_block_address at 28 (8 bytes)
-        buf[28..36].copy_from_slice(&idx_blk_addr.to_le_bytes());
-        // checksum at 36 (4 bytes)
+        // index_block_address at 60 (8 bytes), matching the real EAHD layout
+        buf[60..68].copy_from_slice(&idx_blk_addr.to_le_bytes());
+        // checksum at 68 (4 bytes)
         buf
     }
 
@@ -500,8 +536,8 @@ mod tests {
         let element_size: u8 = 24;
         let idx_blk_elmts: u8 = 1;
 
-        // Index block will be placed at offset 64 in the buffer.
-        let ib_addr: u64 = 64;
+        // Index block placed clear of the 72-byte header.
+        let ib_addr: u64 = 80;
 
         let mut buf = vec![0u8; 256];
         // Header at 0.
@@ -671,7 +707,7 @@ mod tests {
         // Two inline elements, first has address = UNDEF (empty slot).
         let element_size: u8 = 24;
         let idx_blk_elmts: u8 = 2;
-        let ib_addr: u64 = 64;
+        let ib_addr: u64 = 80;
 
         let mut buf = vec![0u8; 256];
         let hdr = build_ea_header(ib_addr, element_size, idx_blk_elmts);
