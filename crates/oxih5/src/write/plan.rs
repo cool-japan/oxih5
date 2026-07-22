@@ -261,6 +261,14 @@ fn plan_dataset<'a>(
     } else {
         chunked::layout_chunk_dims(&chunk_shape, ds.elem_type.byte_size())?
     };
+    // Refuse an over-cap chunk count from the geometry alone, before
+    // `payload::build` cuts and compresses a single tile.  The chunk index caps
+    // the count too, but only after every chunk is already materialised — so a
+    // pathological request would spend gigabytes reaching a guard that fires in
+    // microseconds here.
+    if !chunk_shape.is_empty() {
+        chunked::chunk_count(&ds.shape, &chunk_shape)?;
+    }
     let payload = payload::build(ds, &chunk_shape)?;
 
     let oh_addr = *current;
@@ -269,7 +277,8 @@ fn plan_dataset<'a>(
 
     let chunk_tree = match &payload {
         Payload::Chunked(images) => {
-            let mut tree = chunked::ChunkTree::plan(ds.shape.len(), images.len())?;
+            let mut tree =
+                chunked::ChunkTree::plan(ds.shape.len(), images.len(), ds.elem_type.byte_size())?;
             tree.assign(*current);
             *current += tree.bytes();
             Some(tree)
@@ -417,6 +426,43 @@ impl<'a> GroupPlan<'a> {
             grp.register_vlen_strings(gcol);
         }
     }
+
+    /// Register the global-heap payload of every vlen-object-reference attribute
+    /// in this subtree with the shared collection writer `gcol`.
+    ///
+    /// Mirrors [`Self::fill_obj_refs`]'s recursion (group attrs, each dataset's
+    /// attrs, then child groups) and must run **after** `fill_obj_refs` (so the
+    /// resolved addresses that form each payload exist) and **before**
+    /// [`oxih5_format::GlobalHeapWriter::build_collections`].
+    pub(super) fn register_vlen_objref_attrs(&mut self, gcol: &mut oxih5_format::GlobalHeapWriter) {
+        elem::register_vlen_objref_heap(&mut self.attrs, gcol);
+        for ds in &mut self.datasets {
+            elem::register_vlen_objref_heap(&mut ds.attrs, gcol);
+        }
+        for grp in &mut self.groups {
+            grp.register_vlen_objref_attrs(gcol);
+        }
+    }
+
+    /// Resolve the heap ordinals recorded by [`Self::register_vlen_objref_attrs`]
+    /// into the absolute collection address and 1-based local index each sequence
+    /// landed at, across this subtree.
+    ///
+    /// Must run **after** the collections are laid out (so `collection_addrs` and
+    /// `locations` are known).
+    pub(super) fn fill_vlen_objref_locs(
+        &mut self,
+        collection_addrs: &[u64],
+        locations: &[oxih5_format::HeapObjectLocation],
+    ) {
+        elem::fill_vlen_objref_locs(&mut self.attrs, collection_addrs, locations);
+        for ds in &mut self.datasets {
+            elem::fill_vlen_objref_locs(&mut ds.attrs, collection_addrs, locations);
+        }
+        for grp in &mut self.groups {
+            grp.fill_vlen_objref_locs(collection_addrs, locations);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -450,7 +496,10 @@ mod tests {
                 chunk_shape: Vec::new(),
                 unlimited_dim0: false,
             },
-            filter: Some(Filter::Deflate { level: 6 }),
+            filter: Some(Filter {
+                deflate: Some(6),
+                ..Filter::default()
+            }),
             vlen_strings: None,
         }
     }

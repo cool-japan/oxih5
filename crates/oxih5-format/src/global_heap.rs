@@ -159,10 +159,24 @@ impl GlobalHeap {
                 .to_vec();
             objects.insert(idx, data);
 
-            // Advance to next object (8-byte aligned)
-            pos = data_end;
-            // Align pos to 8-byte boundary
-            pos = pos.saturating_add(7) & !7;
+            // Advance to the next object.  HDF5 aligns each heap object on an
+            // 8-byte boundary *relative to the collection's start* — the
+            // collection itself is not guaranteed to begin at an 8-byte file
+            // offset (libhdf5 / netCDF-C routinely place a GCOL at an odd file
+            // address, e.g. 4763).  Aligning the absolute file position instead
+            // of the collection-relative offset silently truncated every object
+            // after the first whenever `base % 8 != 0`, so a multi-object
+            // collection reported "object N not found" for N >= 2.
+            let rel = data_end.checked_sub(base).ok_or_else(|| {
+                OxiH5Error::Corrupted("GlobalHeap: object end precedes collection base".into())
+            })?;
+            let rel_aligned = rel
+                .checked_add(7)
+                .ok_or_else(|| OxiH5Error::Corrupted("GlobalHeap: alignment overflows".into()))?
+                & !7usize;
+            pos = base.checked_add(rel_aligned).ok_or_else(|| {
+                OxiH5Error::Corrupted("GlobalHeap: aligned position overflows".into())
+            })?;
         }
 
         Ok(Self { objects })
@@ -223,5 +237,95 @@ mod tests {
         buf.extend_from_slice(&gcol);
         let heap = GlobalHeap::parse(&buf, 16).unwrap();
         assert_eq!(heap.object(1).unwrap(), b"offset_test");
+    }
+
+    /// Build a libhdf5-conformant collection (B001/B002 layout): objects, then a
+    /// real free-space object at index 0 whose size is `declared - offset`, then
+    /// zero padding up to `declared` (>= 4096).
+    fn build_gcol_new_format(objects: &[(u16, &[u8])], declared: usize) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GCOL");
+        data.push(1);
+        data.extend_from_slice(&[0u8; 3]);
+        data.extend_from_slice(&(declared as u64).to_le_bytes());
+        for (idx, obj) in objects {
+            data.extend_from_slice(&idx.to_le_bytes());
+            data.extend_from_slice(&1u16.to_le_bytes()); // ref_count
+            data.extend_from_slice(&[0u8; 4]);
+            data.extend_from_slice(&(obj.len() as u64).to_le_bytes());
+            data.extend_from_slice(obj);
+            let pad = (8 - (data.len() % 8)) % 8;
+            data.extend(std::iter::repeat(0u8).take(pad));
+        }
+        let free_off = data.len();
+        let leftover = declared - free_off;
+        if leftover >= 16 {
+            data.extend_from_slice(&0u16.to_le_bytes()); // index 0 = free space
+            data.extend_from_slice(&0u16.to_le_bytes()); // ref_count 0
+            data.extend_from_slice(&[0u8; 4]);
+            data.extend_from_slice(&(leftover as u64).to_le_bytes());
+        }
+        data.resize(declared, 0u8);
+        data
+    }
+
+    /// B002 reader compat: a collection whose leftover is a real (non-zero)
+    /// free-space object must read its real objects and stop at index 0 — not
+    /// hang or mistake the free space for data.
+    #[test]
+    fn reads_new_format_with_real_free_space_object() {
+        let gcol = build_gcol_new_format(&[(1, b"alpha"), (2, b"beta"), (3, b"gamma")], 4096);
+        assert_eq!(gcol.len(), 4096);
+        let heap = GlobalHeap::parse(&gcol, 0).unwrap();
+        assert_eq!(heap.object(1).unwrap(), b"alpha");
+        assert_eq!(heap.object(2).unwrap(), b"beta");
+        assert_eq!(heap.object(3).unwrap(), b"gamma");
+        assert!(heap.object(4).is_err());
+    }
+
+    /// A completely-full collection carries no free-space object at all; the
+    /// reader must stop when it reaches the declared end.
+    #[test]
+    fn reads_full_collection_without_free_object() {
+        // 16 header + align8(16+2)=24 -> content_end 40; declare exactly 40.
+        let gcol = build_gcol_new_format(&[(1, b"ab")], 40);
+        assert_eq!(gcol.len(), 40);
+        // No index-0 object present.
+        let heap = GlobalHeap::parse(&gcol, 0).unwrap();
+        assert_eq!(heap.object(1).unwrap(), b"ab");
+        assert!(heap.object(2).is_err());
+    }
+
+    /// B009 reader compat: 0.2.1-era heaps store strings with a trailing NUL and
+    /// a size-0 terminator; the reader must still return the raw stored bytes so
+    /// the string layer can trim the terminator.
+    #[test]
+    fn reads_old_format_nul_terminated_objects() {
+        let gcol = build_gcol(&[(1, b"hello\0"), (2, b"world\0")]);
+        let heap = GlobalHeap::parse(&gcol, 0).unwrap();
+        assert_eq!(heap.object(1).unwrap(), b"hello\0");
+        assert_eq!(heap.object(2).unwrap(), b"world\0");
+    }
+
+    /// W3 regression: HDF5 aligns heap objects on an 8-byte boundary *relative
+    /// to the collection start*, and the collection is not guaranteed to begin
+    /// at an 8-byte file offset.  netCDF-C, for example, places a multi-object
+    /// GCOL at file offset 4763 (`% 8 == 3`); aligning the absolute file
+    /// position dropped every object after the first ("object 2 not found").
+    /// Placing the same collection at a `% 8 != 0` file offset must still read
+    /// objects 2 and 3.
+    #[test]
+    fn reads_multi_object_collection_at_unaligned_base() {
+        let gcol = build_gcol(&[(1, b"time-axis"), (2, "café温度".as_bytes()), (3, b"z")]);
+        // Prepend 3 pad bytes so the collection base is not 8-byte aligned.
+        for pad in [1usize, 3, 5, 7] {
+            let mut buf = vec![0u8; pad];
+            buf.extend_from_slice(&gcol);
+            let heap = GlobalHeap::parse(&buf, pad as u64)
+                .unwrap_or_else(|e| panic!("parse at base {pad}: {e}"));
+            assert_eq!(heap.object(1).unwrap(), b"time-axis", "base {pad}");
+            assert_eq!(heap.object(2).unwrap(), "café温度".as_bytes(), "base {pad}");
+            assert_eq!(heap.object(3).unwrap(), b"z", "base {pad}");
+        }
     }
 }

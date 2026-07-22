@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use oxih5::File as H5File;
+use oxih5::{AttrView, File as H5File, Value};
 
 use crate::conventions::{is_reserved_attr, parse_pure_dim_sentinel, phony_dim_name};
 use crate::error::NcError;
@@ -119,12 +119,11 @@ fn collect_global_dims_rec(
             .and_then(|i| u32::try_from(i).ok())
             .unwrap_or(0);
 
-        let ds = match file.dataset(&full_path) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let size = ds.shape.first().copied().unwrap_or(0) as u64;
-        let is_unlimited = ds.is_unlimited();
+        // A pure-dimension placeholder has no allocated data (undefined address),
+        // so `File::dataset` fails on it; its length is recovered from the NAME
+        // sentinel instead.
+        let sentinel_len = classify_dim_scale(&attr_views).sentinel_len;
+        let (size, is_unlimited) = dim_scale_len_and_unlim(file, &full_path, sentinel_len);
 
         result.insert(
             addr,
@@ -199,6 +198,7 @@ pub fn resolve_group_deep(
     let LocalDimState {
         mut dim_by_id,
         coord_var_dimid,
+        pure_dim_names,
         mut addr_map,
         next_phony,
     } = collect_local_dims(file, group_path, &ds_names)?;
@@ -206,10 +206,18 @@ pub fn resolve_group_deep(
 
     // ------------------------------------------------------------------
     // 4. Process variables.
+    //
+    // Pure-dimension placeholders and anonymous scales are dimensions only and
+    // are skipped here; every other dataset becomes a variable.  Coordinate
+    // variables (real-NAME dimension scales) are surfaced too.
     // ------------------------------------------------------------------
     let mut variables: Vec<NcVariable> = Vec::new();
 
     for ds_name in &ds_names {
+        if pure_dim_names.contains(ds_name.as_str()) {
+            continue;
+        }
+
         let full_path = build_path(group_path, ds_name);
         let ds = match file.dataset(&full_path) {
             Ok(d) => d,
@@ -231,39 +239,20 @@ pub fn resolve_group_deep(
         let shape: Vec<u64> = ds.shape.iter().map(|&s| s as u64).collect();
         let rank = shape.len();
 
-        let dim_list_view = attr_views.iter().find(|v| v.name() == "DIMENSION_LIST");
-
-        let dims: Vec<NcAxis> = match dim_list_view {
-            Some(dl_view) => match dl_view.as_object_refs() {
-                Ok(refs) => {
-                    if refs.len() != rank {
-                        return Err(NcError::DimensionListArity {
-                            var: ds_name.clone(),
-                            found: refs.len(),
-                            rank,
-                        });
-                    }
-                    resolve_dim_list(
-                        file,
-                        ds_name,
-                        &refs,
-                        &shape,
-                        group_path,
-                        global_dims,
-                        &mut dim_by_id,
-                        &mut addr_map,
-                        &mut phony_counter,
-                    )?
-                }
-                Err(_) => {
-                    // DIMENSION_LIST present but unreadable (vlen-of-refs or other
-                    // format) — fall back to phony dims.
-                    create_phony_axes(&shape, &mut phony_counter, &mut dim_by_id, group_path)
-                }
-            },
-            None if rank == 0 => vec![],
-            None => create_phony_axes(&shape, &mut phony_counter, &mut dim_by_id, group_path),
-        };
+        let dims = resolve_variable_axes(
+            file,
+            ds_name,
+            &attr_views,
+            &shape,
+            rank,
+            group_path,
+            global_dims,
+            &mut dim_by_id,
+            &mut addr_map,
+            &mut phony_counter,
+            is_coord,
+            &coord_var_dimid,
+        )?;
 
         variables.push(NcVariable {
             name: ds_name.clone(),
@@ -275,6 +264,15 @@ pub fn resolve_group_deep(
             h5_path: full_path,
         });
     }
+
+    // ------------------------------------------------------------------
+    // 4b. Reconcile unlimited-dimension lengths from variable extents.
+    //
+    // A netCDF unlimited dimension's current length is the largest extent any
+    // variable reaches along it; the dimension-scale dataset may itself hold
+    // fewer (often zero) records than the data variables written against it.
+    // ------------------------------------------------------------------
+    reconcile_unlimited_dims(&mut dim_by_id, &mut variables);
 
     // ------------------------------------------------------------------
     // 5. Sort dimensions by id for deterministic output.
@@ -314,7 +312,12 @@ pub fn resolve_group_deep(
 
 struct LocalDimState {
     dim_by_id: HashMap<u32, NcDimension>,
+    /// Coordinate-variable dimension scales (real NAME): these ARE surfaced as
+    /// variables.  Keyed by dataset name → dimension id.
     coord_var_dimid: HashMap<String, u32>,
+    /// Pure-dimension placeholders and anonymous scales (sentinel / empty NAME):
+    /// these are dimensions only and are NOT surfaced as variables.
+    pure_dim_names: HashSet<String>,
     addr_map: HashMap<u64, u32>,
     /// Counter value to use for the next phony dimension created during
     /// variable processing.
@@ -330,6 +333,7 @@ fn collect_local_dims(
 ) -> Result<LocalDimState, NcError> {
     let mut dim_by_id: HashMap<u32, NcDimension> = HashMap::new();
     let mut coord_var_dimid: HashMap<String, u32> = HashMap::new();
+    let mut pure_dim_names: HashSet<String> = HashSet::new();
     let mut addr_map: HashMap<u64, u32> = HashMap::new();
     // phony_counter is used only for dim scales without _Netcdf4Dimid.
     let mut phony_counter: u32 = 0;
@@ -358,12 +362,12 @@ fn collect_local_dims(
             .and_then(|v| v.as_i64())
             .and_then(|i| u32::try_from(i).ok());
 
-        let ds = match file.dataset(&full_path) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let dim_len = ds.shape.first().copied().unwrap_or(0) as u64;
-        let is_unlimited = ds.is_unlimited();
+        // Classify by NAME: a pure-dimension placeholder (sentinel NAME) or an
+        // anonymous scale (empty/absent NAME) is a dimension only; a real NAME
+        // makes this a coordinate variable.  Pure placeholders have no allocated
+        // data, so length comes from the sentinel when `File::dataset` fails.
+        let class = classify_dim_scale(&attr_views);
+        let (dim_len, is_unlimited) = dim_scale_len_and_unlim(file, &full_path, class.sentinel_len);
 
         let dim_id = if let Some(id) = dim_id_opt {
             id
@@ -386,7 +390,11 @@ fn collect_local_dims(
                 is_unlimited,
             },
         );
-        coord_var_dimid.insert(ds_name.clone(), dim_id);
+        if class.is_pure {
+            pure_dim_names.insert(ds_name.clone());
+        } else {
+            coord_var_dimid.insert(ds_name.clone(), dim_id);
+        }
 
         // Record the header address → dim_id mapping for DIMENSION_LIST lookups.
         if let Ok(addr) = file.header_addr_of(&full_path) {
@@ -408,9 +416,276 @@ fn collect_local_dims(
     Ok(LocalDimState {
         dim_by_id,
         coord_var_dimid,
+        pure_dim_names,
         addr_map,
         next_phony,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Dimension-scale classification + sizing helpers
+// ---------------------------------------------------------------------------
+
+/// Classification of a dimension-scale dataset derived from its `NAME` attribute.
+struct DimScaleClass {
+    /// `Some(len)` when NAME is the netCDF pure-dimension sentinel
+    /// (`"This is a netCDF dimension but not a netCDF variable.<len>"`).
+    sentinel_len: Option<u64>,
+    /// True when this scale is a pure dimension (sentinel NAME) or an anonymous
+    /// scale (absent/empty NAME) — a dimension that is NOT also a variable.
+    is_pure: bool,
+}
+
+/// Classify a dimension-scale dataset from its attribute views.
+fn classify_dim_scale(attr_views: &[AttrView<'_>]) -> DimScaleClass {
+    let name = attr_views
+        .iter()
+        .find(|v| v.name() == "NAME")
+        .and_then(|v| v.as_str_fixed());
+    let (sentinel_len, is_pure) = classify_dim_scale_name(name.as_deref());
+    DimScaleClass {
+        sentinel_len,
+        is_pure,
+    }
+}
+
+/// Classify a dimension scale from its `NAME` attribute value.
+///
+/// Returns `(sentinel_len, is_pure)`:
+/// - a **sentinel** NAME (`"This is a netCDF dimension but not a netCDF
+///   variable.<len>"`) → `(Some(len), true)` — a pure dimension;
+/// - an **absent / empty / whitespace** NAME → `(None, true)` — an anonymous
+///   dimension scale (a dimension that is not a coordinate variable);
+/// - any other **real** NAME → `(None, false)` — a coordinate variable.
+fn classify_dim_scale_name(name: Option<&str>) -> (Option<u64>, bool) {
+    let sentinel_len = name.and_then(parse_pure_dim_sentinel);
+    let is_pure = match name {
+        None => true,
+        Some(s) if s.trim().is_empty() => true,
+        Some(s) => parse_pure_dim_sentinel(s).is_some(),
+    };
+    (sentinel_len, is_pure)
+}
+
+/// Determine a dimension-scale dataset's length and unlimited flag.
+///
+/// Coordinate variables and unlimited dimensions have real (contiguous/chunked)
+/// storage and are read directly.  A pure-dimension placeholder written by
+/// netCDF-C has contiguous storage with an *undefined* data address, so
+/// [`H5File::dataset`] fails on it; its length is recovered from the `NAME`
+/// sentinel and it is never unlimited.
+fn dim_scale_len_and_unlim(
+    file: &H5File,
+    full_path: &str,
+    sentinel_len: Option<u64>,
+) -> (u64, bool) {
+    match file.dataset(full_path) {
+        Ok(ds) => (
+            ds.shape.first().copied().unwrap_or(0) as u64,
+            ds.is_unlimited(),
+        ),
+        Err(_) => (sentinel_len.unwrap_or(0), false),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-variable axis resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve one variable's axes into `Vec<NcAxis>`, in priority order:
+///
+/// 1. `_Netcdf4Coordinates` — netCDF-C's authoritative per-axis dimension-id
+///    array, present on every netCDF-4 variable and independent of the
+///    `DIMENSION_LIST` global-heap encoding.
+/// 2. `DIMENSION_LIST` — oxih5's own flat `H5T_REFERENCE` array *or* the
+///    netCDF-C `H5T_VLEN{H5T_REFERENCE}` form.
+/// 3. A 1-D coordinate variable with neither attribute maps to its own scale.
+/// 4. Scalars have no axes; anything else falls back to phony dimensions.
+#[allow(clippy::too_many_arguments)]
+fn resolve_variable_axes(
+    file: &H5File,
+    ds_name: &str,
+    attr_views: &[AttrView<'_>],
+    shape: &[u64],
+    rank: usize,
+    group_path: &str,
+    global_dims: &HashMap<u64, GlobalDim>,
+    dim_by_id: &mut HashMap<u32, NcDimension>,
+    addr_map: &mut HashMap<u64, u32>,
+    phony_counter: &mut u32,
+    is_coord: bool,
+    coord_var_dimid: &HashMap<String, u32>,
+) -> Result<Vec<NcAxis>, NcError> {
+    // 1. _Netcdf4Coordinates (primary path for genuine netCDF-4 files).
+    if let Some(view) = attr_views
+        .iter()
+        .find(|v| v.name() == "_Netcdf4Coordinates")
+    {
+        if let Some(axes) = axes_from_netcdf4_coordinates(view, rank, group_path, dim_by_id) {
+            return Ok(axes);
+        }
+    }
+
+    // 2. DIMENSION_LIST — flat refs (oxih5) or vlen-of-refs (netCDF-C).
+    if let Some(dl_view) = attr_views.iter().find(|v| v.name() == "DIMENSION_LIST") {
+        let refs_opt = match dl_view.as_object_refs() {
+            Ok(refs) => Some(refs),
+            Err(_) => decode_dimension_list_vlen(dl_view),
+        };
+        if let Some(refs) = refs_opt {
+            if refs.len() != rank {
+                return Err(NcError::DimensionListArity {
+                    var: ds_name.to_string(),
+                    found: refs.len(),
+                    rank,
+                });
+            }
+            return resolve_dim_list(
+                file,
+                ds_name,
+                &refs,
+                shape,
+                group_path,
+                global_dims,
+                dim_by_id,
+                addr_map,
+                phony_counter,
+            );
+        }
+        // DIMENSION_LIST present but undecodable → phony fallback.
+        return Ok(create_phony_axes(
+            shape,
+            phony_counter,
+            dim_by_id,
+            group_path,
+        ));
+    }
+
+    // 3. A 1-D coordinate variable with neither attribute is its own dimension.
+    if is_coord && rank == 1 {
+        if let Some(&id) = coord_var_dimid.get(ds_name) {
+            if let Some(dim) = dim_by_id.get(&id) {
+                return Ok(vec![NcAxis {
+                    dim_id: id,
+                    name: dim.name.clone(),
+                    len: dim.len,
+                    is_unlimited: dim.is_unlimited,
+                    group_path: group_path.to_string(),
+                }]);
+            }
+        }
+    }
+
+    // 4. Scalar → no axes; otherwise phony.
+    if rank == 0 {
+        Ok(vec![])
+    } else {
+        Ok(create_phony_axes(
+            shape,
+            phony_counter,
+            dim_by_id,
+            group_path,
+        ))
+    }
+}
+
+/// Resolve a variable's axes from its `_Netcdf4Coordinates` attribute — an int
+/// array carrying one netCDF dimension id per axis (matching the `_Netcdf4Dimid`
+/// of the group's dimension scales).
+///
+/// Returns `None` (so the caller falls through to `DIMENSION_LIST`) when the
+/// attribute is unreadable, its arity does not match the dataset rank, or any id
+/// is not a known dimension in this group.
+fn axes_from_netcdf4_coordinates(
+    view: &AttrView<'_>,
+    rank: usize,
+    group_path: &str,
+    dim_by_id: &HashMap<u32, NcDimension>,
+) -> Option<Vec<NcAxis>> {
+    let ids = NcAttribute::new_with_view(view).as_i64().ok()?;
+    if ids.len() != rank {
+        return None;
+    }
+    let mut axes = Vec::with_capacity(rank);
+    for &raw_id in &ids {
+        let id = u32::try_from(raw_id).ok()?;
+        let dim = dim_by_id.get(&id)?;
+        axes.push(NcAxis {
+            dim_id: id,
+            name: dim.name.clone(),
+            len: dim.len,
+            is_unlimited: dim.is_unlimited,
+            group_path: group_path.to_string(),
+        });
+    }
+    Some(axes)
+}
+
+/// Decode a netCDF-C `DIMENSION_LIST` attribute (`H5T_VLEN{H5T_REFERENCE}`) into
+/// one object-reference address per axis.
+///
+/// Each axis entry is a vlen sequence holding the dimension scale(s) attached at
+/// that axis; netCDF attaches exactly one, so the first object reference is
+/// taken.  An empty sequence (an axis with no attached scale) yields `u64::MAX`,
+/// which [`resolve_dim_list`] turns into a phony dimension.  Returns `None` when
+/// the attribute is not a decodable vlen-of-reference (e.g. its global-heap
+/// collection cannot be parsed).
+fn decode_dimension_list_vlen(view: &AttrView<'_>) -> Option<Vec<u64>> {
+    let seqs = view.as_vlen_sequence().ok()?;
+    let mut refs = Vec::with_capacity(seqs.len());
+    for elem in &seqs {
+        let addr = match elem {
+            Value::Sequence(items) => items
+                .iter()
+                .find_map(|it| match it {
+                    Value::ObjectRef(a) => Some(*a),
+                    _ => None,
+                })
+                .unwrap_or(u64::MAX),
+            Value::ObjectRef(a) => *a,
+            _ => u64::MAX,
+        };
+        refs.push(addr);
+    }
+    Some(refs)
+}
+
+/// Reconcile unlimited-dimension lengths from the extents of the variables that
+/// use them, then propagate the reconciled lengths back onto each variable's
+/// axes so dimensions and axes report a consistent length.
+fn reconcile_unlimited_dims(
+    dim_by_id: &mut HashMap<u32, NcDimension>,
+    variables: &mut [NcVariable],
+) {
+    // Largest extent seen per dimension id across all variable axes.
+    let mut max_ext: HashMap<u32, u64> = HashMap::new();
+    for var in variables.iter() {
+        for (axis_idx, axis) in var.dims.iter().enumerate() {
+            if let Some(&len) = var.shape.get(axis_idx) {
+                let entry = max_ext.entry(axis.dim_id).or_insert(0);
+                if len > *entry {
+                    *entry = len;
+                }
+            }
+        }
+    }
+    for (id, dim) in dim_by_id.iter_mut() {
+        if dim.is_unlimited {
+            if let Some(&ext) = max_ext.get(id) {
+                if ext > dim.len {
+                    dim.len = ext;
+                }
+            }
+        }
+    }
+    let len_by_id: HashMap<u32, u64> = dim_by_id.iter().map(|(k, v)| (*k, v.len)).collect();
+    for var in variables.iter_mut() {
+        for axis in var.dims.iter_mut() {
+            if let Some(&len) = len_by_id.get(&axis.dim_id) {
+                axis.len = len;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -750,5 +1025,75 @@ mod tests {
     #[test]
     fn test_parse_dim_name_from_hdf5_empty() {
         assert_eq!(parse_dim_name_from_hdf5(""), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // B012 — dimension-scale classification (pure / coordinate / anonymous).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_coordinate_variable() {
+        // A real NAME → coordinate variable (surface as a variable).
+        let (sentinel, is_pure) = classify_dim_scale_name(Some("lat"));
+        assert_eq!(sentinel, None);
+        assert!(!is_pure, "a named scale is a coordinate variable");
+    }
+
+    #[test]
+    fn test_classify_pure_dimension_sentinel() {
+        // netCDF-C sentinel (note the space padding libnetcdf writes).
+        let (sentinel, is_pure) = classify_dim_scale_name(Some(
+            "This is a netCDF dimension but not a netCDF variable.         8",
+        ));
+        assert_eq!(sentinel, Some(8));
+        assert!(is_pure, "a sentinel NAME marks a pure dimension");
+    }
+
+    #[test]
+    fn test_classify_anonymous_scale_absent_name() {
+        // No NAME attribute at all → anonymous scale (dimension only).
+        let (sentinel, is_pure) = classify_dim_scale_name(None);
+        assert_eq!(sentinel, None);
+        assert!(is_pure);
+    }
+
+    #[test]
+    fn test_classify_anonymous_scale_empty_name() {
+        // `AttrView::as_str_fixed` splits at the first NUL, so the classifier
+        // only ever sees an already-trimmed string; "" and whitespace are the
+        // anonymous-scale shapes.
+        for empty in ["", "   ", "\t"] {
+            let (sentinel, is_pure) = classify_dim_scale_name(Some(empty));
+            assert_eq!(
+                sentinel, None,
+                "empty NAME {empty:?} has no sentinel length"
+            );
+            assert!(is_pure, "empty NAME {empty:?} is an anonymous scale");
+        }
+    }
+
+    #[test]
+    fn test_decode_dimension_list_vlen_extracts_first_ref_per_axis() {
+        use oxih5::Value;
+        // Two axes, each a vlen sequence of one object reference.
+        let seqs = [
+            Value::Sequence(vec![Value::ObjectRef(239)]),
+            Value::Sequence(vec![Value::ObjectRef(564)]),
+        ];
+        let refs: Vec<u64> = seqs
+            .iter()
+            .map(|elem| match elem {
+                Value::Sequence(items) => items
+                    .iter()
+                    .find_map(|it| match it {
+                        Value::ObjectRef(a) => Some(*a),
+                        _ => None,
+                    })
+                    .unwrap_or(u64::MAX),
+                Value::ObjectRef(a) => *a,
+                _ => u64::MAX,
+            })
+            .collect();
+        assert_eq!(refs, vec![239, 564]);
     }
 }

@@ -404,8 +404,18 @@ fn parse_v2_block(
         }
 
         if msg_type == MSG_NIL_V2 {
-            // NIL marks the end of live messages in this block.
-            break;
+            // NIL is a padding/placeholder message, NOT a block terminator. Per
+            // the HDF5 spec a version-2 object-header chunk is scanned to its
+            // full `msg_end`; NIL messages are simply skipped. Real messages can
+            // and do follow a NIL — netCDF-C, for instance, reserves space with a
+            // NIL message and then appends Link (0x0006) / Attribute (0x000C)
+            // messages after it, so breaking here would silently drop every
+            // object declared after the first reserved gap (the ref2.nc
+            // "root lists only ['lat']" enumeration bug). The `pos + 4 <= msg_end`
+            // loop bound and the `data_end > file_data.len()` guard above keep the
+            // skip in range for trailing zero padding and the final gap.
+            pos += hdr_size + msg_size;
+            continue;
         }
 
         if msg_type == MSG_CONTINUATION_V2 {
@@ -529,7 +539,12 @@ fn parse_v2_ochk_block(
         }
 
         if msg_type == MSG_NIL_V2 {
-            break;
+            // NIL is padding, not a terminator — skip and keep scanning (see the
+            // matching comment in `parse_v2_block`). Continuation blocks carry
+            // reserved-then-appended messages just as the main block does, so
+            // breaking here would drop objects spilled past a NIL in an OCHK.
+            pos += hdr_size + msg_size;
+            continue;
         }
 
         if msg_type == MSG_CONTINUATION_V2 {

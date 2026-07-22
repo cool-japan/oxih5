@@ -17,11 +17,137 @@
 
 use std::collections::HashSet;
 
-use oxih5::File as H5File;
+use oxih5::{Dataset, Dtype, File as H5File, OxiH5Error};
 
 use crate::error::NcError;
 use crate::model::{apply_fill_mask, NcGroup, NcVariable};
 use crate::resolver::{collect_global_dims, resolve_group_deep};
+
+// ---------------------------------------------------------------------------
+// Numeric widening helpers
+// ---------------------------------------------------------------------------
+//
+// netCDF-4 stores variables in their declared on-disk width — `f4` (float32),
+// `i4` (int32), `i2`, `u1`, ... — which is frequently narrower than the 8-byte
+// element type that [`Dataset::as_f64`] / [`Dataset::as_i64`] accept on their
+// own. Reading such a variable through the 8-byte accessor alone fails with a
+// type mismatch even though the metadata is correct. These helpers route each
+// on-disk width through the matching [`Dataset`] typed accessor (the oxih5-core
+// conversion machinery) and widen the result, so an `f4`/`i4`/`i2`/`u1` variable
+// reads its exact stored values.
+
+/// Widen any fixed-width numeric HDF5 dataset to `f64`.
+///
+/// Handles every fixed-width float (`f2`/`f4`/`f8`) and integer (`i1`..`i8`,
+/// `u1`..`u8`) on-disk type, widening each to `f64`. Integers up to 32 bits and
+/// floats up to 32 bits widen losslessly; 64-bit integers use a value cast.
+/// Non-numeric datatypes (strings, compounds, vlen sequences, references) return
+/// [`OxiH5Error::TypeMismatch`].
+fn dataset_as_f64_widened(ds: &Dataset) -> Result<Vec<f64>, OxiH5Error> {
+    match &ds.dtype {
+        Dtype::Float { size: 8, .. } => ds.as_f64(),
+        Dtype::Float { size: 4, .. } => Ok(ds.as_f32()?.into_iter().map(f64::from).collect()),
+        Dtype::Float { size: 2, .. } => Ok(ds.as_f16()?.into_iter().map(f64::from).collect()),
+        Dtype::Int {
+            size: 8,
+            signed: true,
+            ..
+        } => Ok(ds.as_i64()?.into_iter().map(|v| v as f64).collect()),
+        Dtype::Int {
+            size: 8,
+            signed: false,
+            ..
+        } => Ok(ds.as_u64()?.into_iter().map(|v| v as f64).collect()),
+        Dtype::Int {
+            size: 4,
+            signed: true,
+            ..
+        } => Ok(ds.as_i32()?.into_iter().map(f64::from).collect()),
+        Dtype::Int {
+            size: 4,
+            signed: false,
+            ..
+        } => Ok(ds.as_u32()?.into_iter().map(f64::from).collect()),
+        Dtype::Int {
+            size: 2,
+            signed: true,
+            ..
+        } => Ok(ds.as_i16()?.into_iter().map(f64::from).collect()),
+        Dtype::Int {
+            size: 2,
+            signed: false,
+            ..
+        } => Ok(ds.as_u16()?.into_iter().map(f64::from).collect()),
+        Dtype::Int {
+            size: 1,
+            signed: true,
+            ..
+        } => Ok(ds.as_i8()?.into_iter().map(f64::from).collect()),
+        Dtype::Int {
+            size: 1,
+            signed: false,
+            ..
+        } => Ok(ds.as_u8()?.into_iter().map(f64::from).collect()),
+        _ => Err(OxiH5Error::TypeMismatch),
+    }
+}
+
+/// Widen any fixed-width integer HDF5 dataset to `i64`.
+///
+/// Handles every fixed-width integer on-disk type: `i1`..`i8` and `u1`..`u4`
+/// widen losslessly. `u8` (`NC_UINT64`) is widened with a checked conversion and
+/// reports [`OxiH5Error::TypeMismatch`] if any value exceeds `i64::MAX`. Float
+/// and non-numeric datatypes return [`OxiH5Error::TypeMismatch`] (use
+/// [`NcVariable::read_f64`] for floats).
+fn dataset_as_i64_widened(ds: &Dataset) -> Result<Vec<i64>, OxiH5Error> {
+    match &ds.dtype {
+        Dtype::Int {
+            size: 8,
+            signed: true,
+            ..
+        } => ds.as_i64(),
+        Dtype::Int {
+            size: 8,
+            signed: false,
+            ..
+        } => ds
+            .as_u64()?
+            .into_iter()
+            .map(|v| i64::try_from(v).map_err(|_| OxiH5Error::TypeMismatch))
+            .collect(),
+        Dtype::Int {
+            size: 4,
+            signed: true,
+            ..
+        } => Ok(ds.as_i32()?.into_iter().map(i64::from).collect()),
+        Dtype::Int {
+            size: 4,
+            signed: false,
+            ..
+        } => Ok(ds.as_u32()?.into_iter().map(i64::from).collect()),
+        Dtype::Int {
+            size: 2,
+            signed: true,
+            ..
+        } => Ok(ds.as_i16()?.into_iter().map(i64::from).collect()),
+        Dtype::Int {
+            size: 2,
+            signed: false,
+            ..
+        } => Ok(ds.as_u16()?.into_iter().map(i64::from).collect()),
+        Dtype::Int {
+            size: 1,
+            signed: true,
+            ..
+        } => Ok(ds.as_i8()?.into_iter().map(i64::from).collect()),
+        Dtype::Int {
+            size: 1,
+            signed: false,
+            ..
+        } => Ok(ds.as_u8()?.into_iter().map(i64::from).collect()),
+        _ => Err(OxiH5Error::TypeMismatch),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -80,22 +206,104 @@ impl NcFile {
 // ---------------------------------------------------------------------------
 
 impl NcVariable {
-    /// Read the variable's data as a flat `Vec<f64>`.
+    /// Read the variable's data as a flat `Vec<f64>`, widening narrower on-disk
+    /// types.
     ///
-    /// Returns `NcError::ReadError` if the variable's dtype is not float64.
+    /// netCDF-4 variables are commonly stored as `f4` (float32), `i4` (int32),
+    /// `i2`, `u1`, ... — narrower than the 8-byte element type. This reads any
+    /// fixed-width float or integer variable and widens each value to `f64`, so
+    /// an `f4`/`i4` variable round-trips its exact stored values instead of
+    /// failing with a type mismatch. Use [`NcVariable::read_f32`] to read a
+    /// 32-bit float variable at its native width.
+    ///
+    /// Returns `NcError::ReadError` if the variable's dtype is not a fixed-width
+    /// numeric type (e.g. a string, compound, or vlen variable).
     pub fn read_f64(&self, nc: &NcFile) -> Result<Vec<f64>, NcError> {
         let ds = nc.h5().dataset(&self.h5_path)?;
-        ds.as_f64()
+        dataset_as_f64_widened(&ds)
             .map_err(|e| NcError::ReadError(format!("read_f64 '{name}': {e}", name = self.name)))
     }
 
-    /// Read the variable's data as a flat `Vec<i64>`.
+    /// Read the variable's data as a flat `Vec<i64>`, widening narrower on-disk
+    /// integer types.
     ///
-    /// Returns `NcError::ReadError` if the variable's dtype is not an integer.
+    /// Reads any fixed-width integer variable (`i1`..`i8`, `u1`..`u4`, and `u8`
+    /// values that fit in `i64`) and widens each value to `i64`, so an
+    /// `i4`/`i2`/`u1` variable round-trips its exact stored values. Use
+    /// [`NcVariable::read_i32`] to read a 32-bit integer variable at its native
+    /// width.
+    ///
+    /// Returns `NcError::ReadError` if the variable's dtype is not an integer
+    /// (or is a `u8` value that overflows `i64`).
     pub fn read_i64(&self, nc: &NcFile) -> Result<Vec<i64>, NcError> {
         let ds = nc.h5().dataset(&self.h5_path)?;
-        ds.as_i64()
+        dataset_as_i64_widened(&ds)
             .map_err(|e| NcError::ReadError(format!("read_i64 '{name}': {e}", name = self.name)))
+    }
+
+    /// Read the variable's data as a flat `Vec<f32>` at native 32-bit width.
+    ///
+    /// Reads an `f4` (float32) variable verbatim and widens an `f2` (half)
+    /// variable exactly to `f32`. Returns `NcError::ReadError` for 64-bit float,
+    /// integer, or non-numeric variables — use [`NcVariable::read_f64`] to widen
+    /// those to `f64`.
+    pub fn read_f32(&self, nc: &NcFile) -> Result<Vec<f32>, NcError> {
+        let ds = nc.h5().dataset(&self.h5_path)?;
+        let out = match &ds.dtype {
+            Dtype::Float { size: 4, .. } => ds.as_f32(),
+            Dtype::Float { size: 2, .. } => ds.as_f16(),
+            _ => {
+                return Err(NcError::ReadError(format!(
+                    "read_f32 '{name}': not a 2- or 4-byte float variable",
+                    name = self.name
+                )))
+            }
+        };
+        out.map_err(|e| NcError::ReadError(format!("read_f32 '{name}': {e}", name = self.name)))
+    }
+
+    /// Read the variable's data as a flat `Vec<i32>` at native 32-bit width.
+    ///
+    /// Reads an `i4` (int32) variable verbatim and widens the smaller signed and
+    /// unsigned integer types (`i1`, `i2`, `u1`, `u2`) exactly to `i32`. Returns
+    /// `NcError::ReadError` for `u4`/64-bit or non-integer variables (which would
+    /// not fit losslessly) — use [`NcVariable::read_i64`] for those.
+    pub fn read_i32(&self, nc: &NcFile) -> Result<Vec<i32>, NcError> {
+        let ds = nc.h5().dataset(&self.h5_path)?;
+        let out: Result<Vec<i32>, OxiH5Error> = match &ds.dtype {
+            Dtype::Int {
+                size: 4,
+                signed: true,
+                ..
+            } => ds.as_i32(),
+            Dtype::Int {
+                size: 2,
+                signed: true,
+                ..
+            } => ds.as_i16().map(|v| v.into_iter().map(i32::from).collect()),
+            Dtype::Int {
+                size: 2,
+                signed: false,
+                ..
+            } => ds.as_u16().map(|v| v.into_iter().map(i32::from).collect()),
+            Dtype::Int {
+                size: 1,
+                signed: true,
+                ..
+            } => ds.as_i8().map(|v| v.into_iter().map(i32::from).collect()),
+            Dtype::Int {
+                size: 1,
+                signed: false,
+                ..
+            } => ds.as_u8().map(|v| v.into_iter().map(i32::from).collect()),
+            _ => {
+                return Err(NcError::ReadError(format!(
+                "read_i32 '{name}': not a signed <=32-bit or unsigned <=16-bit integer variable",
+                name = self.name
+            )))
+            }
+        };
+        out.map_err(|e| NcError::ReadError(format!("read_i32 '{name}': {e}", name = self.name)))
     }
 
     /// Read a vlen-string variable's data as `Vec<String>` (B6 NC_STRING).
@@ -258,22 +466,122 @@ mod tests {
         assert_eq!(masked, vec![1.0, 2.0, 3.0]);
     }
 
+    /// Build an in-memory HDF5 file with a single dataset of the given writer
+    /// closure, returning its bytes. Keeps the widening tests terse.
+    fn h5_bytes(name: &str, f: impl FnOnce(&mut FileWriter)) -> Vec<u8> {
+        let tmp = std::env::temp_dir().join(format!("oxinc_widen_{name}.h5"));
+        let mut w = FileWriter::new();
+        f(&mut w);
+        w.build(&tmp).unwrap();
+        std::fs::read(&tmp).unwrap()
+    }
+
     #[test]
-    fn test_read_f64_masked_type_error_on_non_float() {
-        // FileWriter writes float64; this sanity-checks the error path for
-        // non-float variables by writing an integer dataset.
-        let tmp = std::env::temp_dir().join("oxinc_file_int_masked.h5");
-        FileWriter::new()
-            .write_dataset_i32("int_data", &[1i32, 2, 3], &[3])
-            .unwrap()
-            .build(&tmp)
-            .unwrap();
-        let bytes = std::fs::read(&tmp).unwrap();
+    fn test_read_f64_widens_int32() {
+        // read_f64 now widens narrower on-disk integer/float types to f64 so that
+        // netCDF-4 i4/f4 variables are readable through it (item 3). An int32
+        // dataset reads back as exact f64 values rather than erroring.
+        let bytes = h5_bytes("i32_to_f64", |w| {
+            w.write_dataset_i32("int_data", &[1i32, -2, 3], &[3])
+                .unwrap();
+        });
         let nc = NcFile::open_from_bytes(&bytes).unwrap();
         let root = nc.root_group().unwrap();
         let var = root.variable("int_data").unwrap();
-        // read_f64 on an int32 variable should return an error.
-        assert!(var.read_f64(&nc).is_err());
+        assert_eq!(var.read_f64(&nc).unwrap(), vec![1.0, -2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_read_f64_widens_f32_exact() {
+        // f32 values that are exactly representable widen to identical f64s.
+        let bytes = h5_bytes("f32_to_f64", |w| {
+            w.write_dataset_f32("v", &[1.5f32, -3.25, 4.125], &[3])
+                .unwrap();
+        });
+        let nc = NcFile::open_from_bytes(&bytes).unwrap();
+        let root = nc.root_group().unwrap();
+        let var = root.variable("v").unwrap();
+        assert_eq!(var.read_f64(&nc).unwrap(), vec![1.5, -3.25, 4.125]);
+    }
+
+    #[test]
+    fn test_read_i64_widens_i32_i16_u8() {
+        for (name, expect) in [("i32v", vec![10i64, -20, 30]), ("i16v", vec![1, 2, 3])] {
+            let bytes = h5_bytes(name, |w| match name {
+                "i32v" => {
+                    w.write_dataset_i32("v", &[10i32, -20, 30], &[3]).unwrap();
+                }
+                _ => {
+                    w.write_dataset_i16("v", &[1i16, 2, 3], &[3]).unwrap();
+                }
+            });
+            let nc = NcFile::open_from_bytes(&bytes).unwrap();
+            let root = nc.root_group().unwrap();
+            let var = root.variable("v").unwrap();
+            assert_eq!(var.read_i64(&nc).unwrap(), expect, "{name}");
+        }
+        // u8 widens too.
+        let bytes = h5_bytes("u8v", |w| {
+            w.write_dataset_u8("v", &[200u8, 100, 50], &[3]).unwrap();
+        });
+        let nc = NcFile::open_from_bytes(&bytes).unwrap();
+        let root = nc.root_group().unwrap();
+        let var = root.variable("v").unwrap();
+        assert_eq!(var.read_i64(&nc).unwrap(), vec![200i64, 100, 50]);
+    }
+
+    #[test]
+    fn test_read_f32_native_and_read_i32_native_and_widen() {
+        // read_f32 reads a native f32 variable exactly.
+        let bytes = h5_bytes("native_f32", |w| {
+            w.write_dataset_f32("v", &[2.5f32, -7.5], &[2]).unwrap();
+        });
+        let nc = NcFile::open_from_bytes(&bytes).unwrap();
+        let root = nc.root_group().unwrap();
+        assert_eq!(
+            root.variable("v").unwrap().read_f32(&nc).unwrap(),
+            vec![2.5f32, -7.5]
+        );
+
+        // read_i32 reads a native i32 variable exactly and widens i16.
+        let bytes = h5_bytes("native_i32", |w| {
+            w.write_dataset_i32("a", &[7i32, -8], &[2]).unwrap();
+            w.write_dataset_i16("b", &[3i16, -4], &[2]).unwrap();
+        });
+        let nc = NcFile::open_from_bytes(&bytes).unwrap();
+        let root = nc.root_group().unwrap();
+        assert_eq!(
+            root.variable("a").unwrap().read_i32(&nc).unwrap(),
+            vec![7, -8]
+        );
+        assert_eq!(
+            root.variable("b").unwrap().read_i32(&nc).unwrap(),
+            vec![3, -4]
+        );
+    }
+
+    #[test]
+    fn test_read_f32_rejects_f64_and_read_i32_rejects_i64() {
+        // read_f32 must not silently narrow an f64 variable.
+        let bytes = h5_bytes("f64_var", |w| {
+            w.write_dataset_f64("v", &[1.0, 2.0], &[2]).unwrap();
+        });
+        let nc = NcFile::open_from_bytes(&bytes).unwrap();
+        let root = nc.root_group().unwrap();
+        assert!(root.variable("v").unwrap().read_f32(&nc).is_err());
+
+        // read_i32 must not silently narrow an i64 variable.
+        let bytes = h5_bytes("i64_var", |w| {
+            w.write_dataset_i64("v", &[1i64, 2], &[2]).unwrap();
+        });
+        let nc = NcFile::open_from_bytes(&bytes).unwrap();
+        let root = nc.root_group().unwrap();
+        assert!(root.variable("v").unwrap().read_i32(&nc).is_err());
+        // ...but read_i64 reads it fine.
+        assert_eq!(
+            root.variable("v").unwrap().read_i64(&nc).unwrap(),
+            vec![1i64, 2]
+        );
     }
 
     #[test]

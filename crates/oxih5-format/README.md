@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/oxih5-format.svg)](https://crates.io/crates/oxih5-format)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**252 tests passing** (`cargo nextest run -p oxih5-format --all-features`; 246 with default features) · zero clippy / rustdoc warnings
+**275 tests passing** (`cargo nextest run -p oxih5-format --all-features`; 269 with default features) · 2 doc tests · zero clippy / rustdoc warnings
 
 `oxih5-format` is the binary-parsing layer of **OxiH5**, the COOLJAPAN Pure-Rust HDF5 reader/writer. It turns raw HDF5 file bytes — exactly as produced by h5py / libhdf5 — into the typed data model from [`oxih5-core`]. Every standard structure of the HDF5 file format is decoded here: the superblock (versions 0, 1, 2, and 3, including the v2/v3 superblock extension), object headers (v1 and v2), all standard header messages, local/global/fractal heaps, B-tree v1 and v2 nodes, the extensible- and fixed-array chunk indices, the filter pipeline, full chunked-dataset assembly, and Virtual Dataset (VDS) mapping-block parsing.
 
@@ -13,10 +13,10 @@ This crate sits between [`oxih5-core`] (the data model) and the [`oxih5`] facade
 
 ```toml
 [dependencies]
-oxih5-format = "0.2.1"
+oxih5-format = "0.2.2"
 
 # Optional: rayon-parallel chunk assembly
-oxih5-format = { version = "0.2.1", features = ["parallel"] }
+oxih5-format = { version = "0.2.2", features = ["parallel"] }
 ```
 
 ## Quick Start

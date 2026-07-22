@@ -59,19 +59,37 @@ pub(crate) enum Storage {
     },
 }
 
-/// A filter applied to every chunk on its way to disk.
+/// The filter pipeline applied to every chunk on its way to disk.
 ///
-/// One variant today; the enum exists so that the *pipeline* — a filter list
-/// with an order that has to be inverted on read — has somewhere to grow into
-/// without another round of `Option<bool>` fields.
-#[derive(Clone, Copy)]
-pub(crate) enum Filter {
-    /// zlib DEFLATE, HDF5 filter id 1, at the given level (`0..=9`).
-    Deflate {
-        /// zlib compression level, recorded in the pipeline message's client
-        /// data exactly as libhdf5 records it.
-        level: u8,
-    },
+/// HDF5 records filters as an *ordered list* that a reader inverts in reverse.
+/// This writer composes that list from three independent entry points —
+/// [`super::FileWriter::set_shuffle`], [`super::FileWriter::set_deflate`] and
+/// [`super::FileWriter::set_fletcher32`], callable in any order — so it stores
+/// the *choice* of each filter here and lets [`super::pipeline`] lay them down
+/// in the one canonical order libhdf5/h5py write: shuffle, then deflate, then
+/// fletcher32.  A `Filter` with nothing set is never stored — the field it
+/// lives behind is `None` for an unfiltered dataset.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Filter {
+    /// Byte-transpose (shuffle, HDF5 filter id 2), applied first.
+    pub(crate) shuffle: bool,
+    /// zlib DEFLATE (HDF5 filter id 1) at this level (`0..=9`); `None` for no
+    /// compression.  Recorded in the pipeline message's client data exactly as
+    /// libhdf5 records it.
+    pub(crate) deflate: Option<u8>,
+    /// Fletcher-32 per-chunk checksum (HDF5 filter id 3), appended last.
+    pub(crate) fletcher32: bool,
+}
+
+impl Filter {
+    /// Does this pipeline carry at least one filter?
+    ///
+    /// A `Filter` is only ever stored once a `set_*` call has turned something
+    /// on, so this is `true` for every stored pipeline; it exists so the emitter
+    /// can refuse to write an empty pipeline message rather than assume.
+    pub(crate) fn is_active(&self) -> bool {
+        self.shuffle || self.deflate.is_some() || self.fletcher32
+    }
 }
 
 /// One dataset, as the caller described it.
@@ -192,8 +210,10 @@ pub(super) fn name_taken(node: &GroupNode, name: &str) -> bool {
 /// Returns `OxiH5Error::Format` if a component is empty (`"a//b"`, `"a/"`,
 /// `"//a"`), if a component is `"."` or `".."` — the writer has no notion of a
 /// current or parent directory and silently treating them as names would create
-/// links no reader can address — or if the path is deeper than
-/// [`MAX_PATH_DEPTH`].
+/// links no reader can address — if a component contains a NUL byte, which
+/// libhdf5 stores C-string-terminated so an interior NUL silently truncates the
+/// on-disk name and collapses distinct links into duplicates, or if the path is
+/// deeper than [`MAX_PATH_DEPTH`].
 pub(super) fn split_path(path: &str) -> Result<Vec<&str>, OxiH5Error> {
     // Exactly one leading separator is stripped, so `"//a"` still carries an
     // empty component and is rejected below rather than silently accepted.
@@ -218,6 +238,16 @@ pub(super) fn split_path(path: &str) -> Result<Vec<&str>, OxiH5Error> {
         if *segment == "." || *segment == ".." {
             return Err(OxiH5Error::Format(format!(
                 "path '{path}' has a '{segment}' component, which the writer does not resolve"
+            )));
+        }
+        if segment.contains('\0') {
+            // libhdf5 stores each link name NUL-terminated, so an interior NUL
+            // truncates the on-disk name: two distinct requests ("a\0b", "a\0c")
+            // would both become the link "a" — a duplicate the format cannot
+            // represent. Reject it here, at the one seam every entry point uses.
+            return Err(OxiH5Error::Format(format!(
+                "path '{path}' has a component containing a NUL byte, \
+                 which an HDF5 link name may not contain"
             )));
         }
     }
@@ -420,6 +450,23 @@ mod tests {
                 "'{path}' should have been rejected"
             );
         }
+    }
+
+    #[test]
+    fn a_component_containing_a_nul_is_rejected() {
+        // B015: libhdf5 truncates a link name at an interior NUL, so "a\0b" and
+        // "a\0c" would both collapse to the link "a" — a silent duplicate. The
+        // one path seam must reject a NUL in any component, at any depth.
+        for path in ["a\0b", "a\0c", "/a\0b", "g/a\0b", "a\0b/c", "\0"] {
+            let err = split_path(path).expect_err("NUL component must be rejected");
+            assert!(
+                matches!(err, OxiH5Error::Format(_)) && format!("{err}").contains("NUL"),
+                "{err}"
+            );
+        }
+        // A NUL is the *only* new rejection: ordinary names with dots or spaces,
+        // which libhdf5 accepts, must still split cleanly.
+        assert_eq!(split_path("a.b/c d").expect("ordinary"), vec!["a.b", "c d"]);
     }
 
     #[test]

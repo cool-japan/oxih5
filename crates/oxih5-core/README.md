@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/oxih5-core.svg)](https://crates.io/crates/oxih5-core)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**30 tests passing** (`cargo test -p oxih5-core --all-features`) · zero clippy / rustdoc warnings
+**30 tests passing** (`cargo nextest run -p oxih5-core --all-features`; 18 with default features) · 1 doc test · zero clippy / rustdoc warnings
 
 `oxih5-core` defines the shared, parser-agnostic data model for **OxiH5**, the COOLJAPAN Pure-Rust HDF5 reader/writer. It contains the in-memory representations of an HDF5 file's contents — datatypes, datasets, attributes, groups, links, filter pipelines — plus the crate-wide [`OxiH5Error`] error enum. It deliberately contains **no binary-parsing logic**: the on-disk format readers live in `oxih5-format`, and the user-facing file API lives in the `oxih5` facade.
 
@@ -13,10 +13,10 @@ The headline type is [`Dataset`], a fully-decoded N-dimensional array (raw bytes
 
 ```toml
 [dependencies]
-oxih5-core = "0.2.1"
+oxih5-core = "0.2.2"
 
 # Optional: enable the ndarray bridge (Dataset::to_array_* — full numeric coverage)
-oxih5-core = { version = "0.2.1", features = ["ndarray"] }
+oxih5-core = { version = "0.2.2", features = ["ndarray"] }
 ```
 
 ## Quick Start

@@ -43,12 +43,27 @@ fn copy_into(buf: &mut [u8], addr: usize, src: &[u8]) -> usize {
     src.len()
 }
 
+/// Addresses and per-object placement of the file's global-heap collections.
+///
+/// A vlen-string dataset's data area holds one 16-byte reference per string;
+/// each reference must name the collection *address* and 1-based *object index*
+/// of the collection that actually stores that string.  Because the writer
+/// splits objects across [`oxih5_format::H5HG_MAXSIZE`]-capped collections,
+/// that mapping is per-object rather than a single shared address.
+#[derive(Clone, Copy)]
+struct GheapLayout<'a> {
+    /// Absolute file address of each collection, in ordinal order.
+    collection_addrs: &'a [u64],
+    /// Where each heap object landed, indexed by 0-based global ordinal.
+    locations: &'a [oxih5_format::HeapObjectLocation],
+}
+
 /// Write a 16-byte HDF5 on-disk vlen reference at `offset`.
 ///
 /// Matches `H5T__vlen_disk_write` with `size_of_offsets = 8`:
 ///
 /// ```text
-/// [0..4]   sequence length (u32 LE), including the NUL terminator
+/// [0..4]   sequence length (u32 LE) = strlen (no NUL terminator)
 /// [4..12]  global-heap collection address (u64 LE)
 /// [12..16] global-heap object index (u32 LE)
 /// ```
@@ -60,25 +75,54 @@ fn write_vlen_ref(buf: &mut [u8], offset: usize, seq_len: u32, obj_idx: u32, hea
 
 /// Fill a vlen-string dataset's data area with global-heap references; returns
 /// bytes written.
+///
+/// `obj_ordinals` holds the 1-based *global* heap ordinal of each string (as
+/// handed back by [`oxih5_format::GlobalHeapWriter::write_string`]); the layout
+/// resolves each ordinal to the collection address and local index that
+/// actually store it.  The sequence length is `strlen` — no NUL terminator —
+/// matching libhdf5 (`H5T__vlen_disk_write`).
+///
+/// # Errors
+///
+/// Returns `OxiH5Error::Format` if an ordinal falls outside the heap layout,
+/// which would mean pass one and pass two disagree about the global heap.
 fn write_vlen_refs(
     buf: &mut [u8],
     base: usize,
     strings: &[String],
-    obj_idx: &[u32],
-    gcol_addr: u64,
-) -> usize {
+    obj_ordinals: &[u32],
+    gheap: GheapLayout<'_>,
+) -> Result<usize, OxiH5Error> {
     let mut wrote = 0usize;
-    for (i, (s, &idx)) in strings.iter().zip(obj_idx.iter()).enumerate() {
+    for (i, (s, &ordinal)) in strings.iter().zip(obj_ordinals.iter()).enumerate() {
+        let loc = ordinal
+            .checked_sub(1)
+            .and_then(|z| gheap.locations.get(z as usize))
+            .ok_or_else(|| {
+                OxiH5Error::Format(format!(
+                    "internal writer error: vlen string ordinal {ordinal} has no global-heap location"
+                ))
+            })?;
+        let heap_addr = gheap
+            .collection_addrs
+            .get(loc.collection as usize)
+            .copied()
+            .ok_or_else(|| {
+                OxiH5Error::Format(format!(
+                    "internal writer error: global-heap collection {} was never placed",
+                    loc.collection
+                ))
+            })?;
         write_vlen_ref(
             buf,
             base + i * VLEN_REF_SIZE,
-            s.len() as u32 + 1,
-            idx,
-            gcol_addr,
+            s.len() as u32,
+            loc.index,
+            heap_addr,
         );
         wrote += VLEN_REF_SIZE;
     }
-    wrote
+    Ok(wrote)
 }
 
 /// Emit one dataset's data area, and the chunk index that addresses it.
@@ -94,7 +138,11 @@ fn write_vlen_refs(
 /// bytes than pass one reserved for it, if the plan and the payload disagree
 /// about how many chunks there are, or if a chunk is too long for the 32-bit
 /// length field in its B-tree key.
-fn emit_payload(buf: &mut [u8], plan: &DatasetPlan<'_>, gcol_addr: u64) -> Result<(), OxiH5Error> {
+fn emit_payload(
+    buf: &mut [u8],
+    plan: &DatasetPlan<'_>,
+    gheap: GheapLayout<'_>,
+) -> Result<(), OxiH5Error> {
     let ds: &DatasetDesc = plan.desc;
     match &plan.payload {
         Payload::Raw(bytes) => check_size(
@@ -107,7 +155,7 @@ fn emit_payload(buf: &mut [u8], plan: &DatasetPlan<'_>, gcol_addr: u64) -> Resul
             let strings = ds.vlen_strings.as_deref().unwrap_or(&[]);
             check_size(
                 "vlen reference area",
-                write_vlen_refs(buf, plan.data_addr, strings, &plan.vlen_obj_idx, gcol_addr),
+                write_vlen_refs(buf, plan.data_addr, strings, &plan.vlen_obj_idx, gheap)?,
                 ds.data_len(),
             )
         }
@@ -164,7 +212,11 @@ fn emit_payload(buf: &mut [u8], plan: &DatasetPlan<'_>, gcol_addr: u64) -> Resul
 ///
 /// Returns `OxiH5Error::Format` if any structure writes a different number of
 /// bytes than pass one reserved for it.
-fn emit_dataset(buf: &mut [u8], plan: &DatasetPlan<'_>, gcol_addr: u64) -> Result<(), OxiH5Error> {
+fn emit_dataset(
+    buf: &mut [u8],
+    plan: &DatasetPlan<'_>,
+    gheap: GheapLayout<'_>,
+) -> Result<(), OxiH5Error> {
     let msgs = oh::dataset_oh_msgs(plan.desc, &plan.chunk_dims, &plan.attrs);
     let addrs = OhAddrs {
         btree: plan.btree_addr as u64,
@@ -177,7 +229,7 @@ fn emit_dataset(buf: &mut [u8], plan: &DatasetPlan<'_>, gcol_addr: u64) -> Resul
         plan.oh_size,
     )?;
 
-    emit_payload(buf, plan, gcol_addr)
+    emit_payload(buf, plan, gheap)
 }
 
 /// Resolve a group's sorted links into symbol table entries.
@@ -279,7 +331,11 @@ fn emit_sym_table(
 ///
 /// Returns `OxiH5Error::Format` if any structure writes a different number of
 /// bytes than pass one reserved for it.
-fn emit_group(buf: &mut [u8], plan: &GroupPlan<'_>, gcol_addr: u64) -> Result<(), OxiH5Error> {
+fn emit_group(
+    buf: &mut [u8],
+    plan: &GroupPlan<'_>,
+    gheap: GheapLayout<'_>,
+) -> Result<(), OxiH5Error> {
     let what = if plan.node.name.is_empty() {
         "root group"
     } else {
@@ -307,10 +363,10 @@ fn emit_group(buf: &mut [u8], plan: &GroupPlan<'_>, gcol_addr: u64) -> Result<()
     emit_sym_table(buf, what, &plan.sym, &entries)?;
 
     for ds in &plan.datasets {
-        emit_dataset(buf, ds, gcol_addr)?;
+        emit_dataset(buf, ds, gheap)?;
     }
     for grp in &plan.groups {
-        emit_group(buf, grp, gcol_addr)?;
+        emit_group(buf, grp, gheap)?;
     }
     Ok(())
 }
@@ -331,21 +387,44 @@ pub(super) fn build_bytes(writer: &FileWriter) -> Result<Vec<u8>, OxiH5Error> {
     let mut current = format::ROOT_OH_ADDR;
     let mut root_plan = plan::plan_group(writer.root_node(), &mut current)?;
 
-    // -- Global heap collection, shared by every vlen-string dataset. ---------
-    let mut gcol = oxih5_format::GlobalHeapWriter::new();
-    root_plan.register_vlen_strings(&mut gcol);
-    let gcol_bytes = if gcol.is_empty() {
-        Vec::new()
-    } else {
-        gcol.build()
-    };
-    let gcol_addr = current;
-    let eof_addr = current + gcol_bytes.len();
-
     // -- Now that object-header addresses exist, fill in object references. ---
+    // This runs BEFORE the global-heap block on purpose: a vlen-object-reference
+    // attribute's heap payload *is* its resolved target addresses, so those must
+    // be settled before `register_vlen_objref_attrs` serializes them.
     let mut path_to_addr: HashMap<String, u64> = HashMap::new();
     root_plan.collect_addresses("", &mut path_to_addr);
     root_plan.fill_obj_refs(&path_to_addr)?;
+
+    // -- Global heap collections, shared by every vlen-string dataset. --------
+    // The writer splits objects into libhdf5-conformant collections (each padded
+    // to at least 4096 bytes and capped at 65536); each vlen reference names the
+    // collection that actually holds its string, so the collections are laid out
+    // at consecutive addresses and their placement recorded per object.
+    let mut gcol = oxih5_format::GlobalHeapWriter::new();
+    root_plan.register_vlen_strings(&mut gcol);
+    // vlen-object-reference attributes (e.g. netCDF-4 DIMENSION_LIST) store their
+    // resolved target addresses as one heap object per sequence, in the same
+    // shared collection set.
+    root_plan.register_vlen_objref_attrs(&mut gcol);
+    let (gcol_collections, gcol_locations) = if gcol.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        gcol.build_collections()
+    };
+    let mut collection_addrs: Vec<u64> = Vec::with_capacity(gcol_collections.len());
+    let mut gcol_cursor = current;
+    for collection in &gcol_collections {
+        collection_addrs.push(gcol_cursor as u64);
+        gcol_cursor += collection.len();
+    }
+    let eof_addr = gcol_cursor;
+    // Resolve each vlen-objref sequence's heap ordinal into a concrete
+    // (collection address, local index) now that the collections are laid out.
+    root_plan.fill_vlen_objref_locs(&collection_addrs, &gcol_locations);
+    let gheap = GheapLayout {
+        collection_addrs: &collection_addrs,
+        locations: &gcol_locations,
+    };
 
     // -- Pass two: emit. -----------------------------------------------------
     let mut buf = vec![0u8; eof_addr];
@@ -361,13 +440,13 @@ pub(super) fn build_bytes(writer: &FileWriter) -> Result<Vec<u8>, OxiH5Error> {
         );
     check_size("file prefix", prefix, format::ROOT_OH_ADDR)?;
 
-    emit_group(&mut buf, &root_plan, gcol_addr as u64)?;
+    emit_group(&mut buf, &root_plan, gheap)?;
 
-    if !gcol_bytes.is_empty() {
+    for (collection, &addr) in gcol_collections.iter().zip(&collection_addrs) {
         check_size(
             "global heap collection",
-            copy_into(&mut buf, gcol_addr, &gcol_bytes),
-            gcol_bytes.len(),
+            copy_into(&mut buf, addr as usize, collection),
+            collection.len(),
         )?;
     }
 

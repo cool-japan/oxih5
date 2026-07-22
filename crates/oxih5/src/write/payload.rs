@@ -113,13 +113,49 @@ pub(super) fn build<'a>(
         };
         let bytes = match ds.filter {
             None => tile,
-            Some(Filter::Deflate { level }) => {
-                Cow::Owned(oxih5_format::filters::deflate_compress(&tile, level)?)
-            }
+            Some(filter) => Cow::Owned(apply_write_pipeline(&tile, &filter, elem_size)?),
         };
         images.push(ChunkImage { offsets, bytes });
     }
     Ok(Payload::Chunked(images))
+}
+
+/// Run one tile through the dataset's filter pipeline, in the order libhdf5
+/// applies filters on write — shuffle, then deflate, then fletcher32.
+///
+/// That order is not a preference: a reader inverts a pipeline in the reverse
+/// of the order the message lists it, so the bytes a filter produces here must
+/// be the bytes the *next* filter in the message reads.  It is also the exact
+/// order h5py records (shuffle id 2, deflate id 1, fletcher32 id 3), so a file
+/// this produces reads back the same values in h5py and in oxih5's own reader.
+/// fletcher32 comes last so its checksum covers the compressed bytes actually
+/// stored on disk, which is what lets a reader detect corruption before it
+/// spends work decompressing.
+///
+/// # Errors
+///
+/// Returns `OxiH5Error::Format` if the shuffle element size does not divide the
+/// tile or the deflate level is out of range, and `OxiH5Error::Corrupted` if
+/// the deflate encoder itself fails — all straight from `oxih5_format::filters`.
+fn apply_write_pipeline(
+    tile: &[u8],
+    filter: &Filter,
+    elem_size: usize,
+) -> Result<Vec<u8>, OxiH5Error> {
+    use oxih5_format::filters;
+
+    let mut data = if filter.shuffle {
+        filters::shuffle(tile, elem_size)?
+    } else {
+        tile.to_vec()
+    };
+    if let Some(level) = filter.deflate {
+        data = filters::deflate_compress(&data, level)?;
+    }
+    if filter.fletcher32 {
+        data = filters::append_fletcher32(&data);
+    }
+    Ok(data)
 }
 
 /// Reserve the payload's file space, advancing `current` past it; returns the
@@ -218,6 +254,14 @@ mod tests {
         }
     }
 
+    /// A deflate-only pipeline at `level`.
+    fn deflate(level: u8) -> Filter {
+        Filter {
+            deflate: Some(level),
+            ..Filter::default()
+        }
+    }
+
     fn chunked_desc(shape: &[usize], raw: Vec<u8>, filter: Option<Filter>) -> DatasetDesc {
         dataset(
             shape,
@@ -312,7 +356,7 @@ mod tests {
     fn compression_happens_before_anything_is_sized() {
         // Highly compressible: 4 KiB of one repeated byte.
         let raw = vec![0x5Au8; 4096];
-        let ds = chunked_desc(&[4096], raw.clone(), Some(Filter::Deflate { level: 6 }));
+        let ds = chunked_desc(&[4096], raw.clone(), Some(deflate(6)));
         let payload = build(&ds, &[4096]).expect("build");
         let Payload::Chunked(images) = &payload else {
             panic!("filtered storage must be chunked");
@@ -334,9 +378,100 @@ mod tests {
         assert_eq!(back, raw);
     }
 
+    /// The write pipeline applies filters in the order the message lists them,
+    /// so the read side — which inverts that order in reverse — recovers the
+    /// tile exactly, for every subset of {shuffle, deflate, fletcher32}.
+    #[test]
+    fn the_write_pipeline_is_inverted_by_the_read_pipeline() {
+        use oxih5_core::{FilterInfo, FilterPipeline};
+        let elem_size = 4usize;
+        // 8 i32 values, varied so a wrong element size or dropped filter shows.
+        let tile: Vec<u8> = (0..8i32).flat_map(|v| (v * 7 - 3).to_le_bytes()).collect();
+
+        for &(shuffle, deflate, fletcher32) in &[
+            (true, None, false),
+            (false, Some(6u8), false),
+            (false, None, true),
+            (true, Some(6), false),
+            (true, None, true),
+            (false, Some(9), true),
+            (true, Some(6), true),
+        ] {
+            let filter = Filter {
+                shuffle,
+                deflate,
+                fletcher32,
+            };
+            let stored = apply_write_pipeline(&tile, &filter, elem_size).expect("write pipeline");
+
+            // Build the matching forward-order pipeline the reader expects.
+            let mut filters = Vec::new();
+            if shuffle {
+                filters.push(FilterInfo {
+                    id: 2,
+                    name: Some("shuffle".into()),
+                    flags: 1,
+                    client_data: vec![elem_size as u32],
+                });
+            }
+            if let Some(level) = deflate {
+                filters.push(FilterInfo {
+                    id: 1,
+                    name: Some("deflate".into()),
+                    flags: 1,
+                    client_data: vec![u32::from(level)],
+                });
+            }
+            if fletcher32 {
+                filters.push(FilterInfo {
+                    id: 3,
+                    name: Some("fletcher32".into()),
+                    flags: 0,
+                    client_data: vec![],
+                });
+            }
+            let pipeline = FilterPipeline { filters };
+            let back = oxih5_format::filters::apply_pipeline(&stored, &pipeline, 0, elem_size)
+                .expect("read pipeline");
+            assert_eq!(
+                back, tile,
+                "shuffle={shuffle} deflate={deflate:?} fletcher32={fletcher32}"
+            );
+        }
+    }
+
+    /// fletcher32 is applied *after* deflate, so the stored bytes are the
+    /// compressed stream plus a 4-byte checksum — not a checksum over the raw
+    /// tile that a compressor then mangles.
+    #[test]
+    fn fletcher32_checksums_the_compressed_bytes() {
+        let raw = vec![0x5Au8; 4096];
+        let ds = chunked_desc(
+            &[4096],
+            raw,
+            Some(Filter {
+                deflate: Some(6),
+                fletcher32: true,
+                ..Filter::default()
+            }),
+        );
+        let Payload::Chunked(images) = build(&ds, &[4096]).expect("build") else {
+            panic!("chunked");
+        };
+        let stored = images[0].bytes.as_ref();
+        // Strip+verify the checksum, and what remains must be a zlib stream.
+        let compressed = oxih5_format::filters::verify_fletcher32(stored).expect("checksum valid");
+        assert!(
+            compressed.len() < 4096,
+            "the checksummed bytes are compressed"
+        );
+        let back = oxih5_format::filters::inflate_deflate(&compressed).expect("inflate");
+        assert_eq!(back, vec![0x5Au8; 4096]);
+    }
+
     #[test]
     fn an_out_of_range_level_is_reported_not_clamped() {
-        let ds = chunked_desc(&[4], vec![0u8; 4], Some(Filter::Deflate { level: 10 }));
+        let ds = chunked_desc(&[4], vec![0u8; 4], Some(deflate(10)));
         assert!(build(&ds, &[4]).is_err());
     }
 
@@ -344,7 +479,7 @@ mod tests {
     /// nothing, so its B-tree has no entries to key.
     #[test]
     fn a_zero_length_dataset_reserves_nothing() {
-        let ds = chunked_desc(&[0], Vec::new(), Some(Filter::Deflate { level: 6 }));
+        let ds = chunked_desc(&[0], Vec::new(), Some(deflate(6)));
         let payload = build(&ds, &[1]).expect("build");
         let Payload::Chunked(images) = &payload else {
             panic!("chunked");

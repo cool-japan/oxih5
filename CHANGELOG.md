@@ -7,6 +7,195 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.2.2] - 2026-07-22
+
+Every file `FileWriter` and `NcFileWriter` produce is now verified byte-openable
+by **h5py 3.16 (libhdf5 2.0.0)** *and* **netCDF4-python 1.7.4** — not merely by
+OxiH5's own reader, which had been masking a class of defects where a file this
+library accepted was rejected, or silently misread, by libhdf5 or crashed
+netCDF-C. The release is the product of a 44-agent differential interop audit:
+each agent wrote a permutation of datatype, layout, filter and attribute, opened
+the result with both h5py and netCDF4-python, and bisected every divergence to a
+minimal reproducer. That audit yielded 33 confirmed conformance defects and 19
+capability gaps; this release fixes all 33 defects and closes 9 of the gaps
+(the remainder are on the 0.2.3+ roadmap in `TODO.md`).
+
+### Added
+
+- **Shuffle and Fletcher32 filters on write, and true multi-filter pipelines.**
+  `FileWriter::set_shuffle(path)` and `set_fletcher32(path)` join `set_deflate`,
+  and they compose: a single dataset can carry `shuffle → deflate → fletcher32`
+  in one pipeline message, applied in that order on write and inverted in the
+  reverse order on read, exactly as h5py's
+  `shuffle=True, compression='gzip', fletcher32=True` does. `oxih5_format::filters`
+  gained the forward transforms `shuffle` (the exact inverse of the existing
+  `unshuffle`) and `append_fletcher32` (the 4-byte little-endian trailer libhdf5
+  appends per chunk, byte-for-byte `H5_checksum_fletcher32`). Verified both ways
+  against h5py 3.16: any combination of the three filters reads back exactly, and
+  a chunk with a corrupted Fletcher-32 trailer makes h5py raise as it should.
+  (G001, G007)
+- **Fixed-maxshape tiling.** `FileWriter::set_chunking(path, chunk_shape)` tiles a
+  dataset of *bounded* shape without promoting dimension 0 to unlimited — the
+  earlier `create_dataset_unlimited` path always declared `maxshape[0] = ∞`. A
+  `set_chunking` dataset reports its real bounded maxshape to h5py, and a chunk
+  extent larger than the corresponding fixed dimension is rejected, leaving the
+  writer untouched on error. (G010)
+- **Variable-length-reference and compound attributes.** `write_vlen_obj_ref_attr`
+  writes an `H5T_VLEN{H5T_REFERENCE}` attribute — the true datatype of a netCDF
+  `DIMENSION_LIST` — placing each reference in the global heap;
+  `write_ref_index_list_attr` writes the compound
+  `{ dataset: object-reference, dimension: u32 }` array a netCDF `REFERENCE_LIST`
+  is. h5py reads both back as their named members. (B005, B018)
+- **Widened attribute types.** The attribute writers went from four scalar types
+  to the full fixed-width set — `write_{i8,i16,i32,i64,u8,u16,u32,u64,f32,f64}_attr`
+  — each with a 1-D `_array_attr` sibling (`write_i64_array_attr`,
+  `write_f64_array_attr`, `write_string_array_attr`, and the rest), plus
+  `write_string_attr_nullterm` for the `H5T_STR_NULLTERM` fixed-string form. A CF
+  `valid_range` (i16/u32), a `scale_factor` (f32) or a `flag_values` list now each
+  have an encoding where before only i32/i64/f64/string scalars did. (G006)
+- **Custom fill values.** `set_fill_value_{f32,f64,i8,i16,i32,i64,u8,u16,u32,u64}(path, value)`
+  writes a version-2 fill-value message carrying the caller's value — which h5py
+  reports as `dataset.fillvalue` and reads into unwritten/hole elements — where the
+  fill-value message had always been the defined-but-zero-length default; a value
+  whose type does not match the dataset element type is rejected. (G014)
+- **Fixed-length string datasets.** `create_fixed_string_dataset(path, values, shape, width)`
+  writes an `H5T_STRING` dataset of fixed width (numpy `S<n>` / netCDF `NC_CHAR`),
+  NUL-padded, which h5py reads back at the declared `S`-width; an over-width
+  element or a zero width is a typed error. (G003)
+- **Boolean datasets.** `write_dataset_bool(path, values, shape)` stores a numpy
+  `bool` array the way libhdf5 does — a class-8 enumeration `{ FALSE = 0, TRUE = 1 }`
+  over `int8`, byte-pinned against h5py's own `H5Tencode` — so h5py reads it back
+  as a `bool` array rather than as `int8`. (G009)
+- **Compact-layout datasets.** `set_compact(path)` stores a small dataset's data
+  inline in its object header (HDF5 compact layout, class 0) instead of at a
+  separate contiguous address; it is idempotent, and rejected for chunked, vlen or
+  oversized datasets. (G017)
+- **netCDF coordinate variables and conformant dimension linkage.**
+  `NcFileWriter` now writes a **coordinate variable** — a dimension and a variable
+  sharing one name — as a single dimension-scale dataset carrying its own
+  coordinate values, `_Netcdf4Dimid`, `_Netcdf4Coordinates` and the
+  `REFERENCE_LIST` of the data variables attached to it, instead of fabricating a
+  phantom `[0, 1, …, n−1]` int32 coordinate for every dimension. `DIMENSION_LIST`
+  is emitted as `H5T_VLEN{H5T_REFERENCE}` rather than a plain `H5T_REFERENCE`
+  array (which segfaulted netCDF-C on open), `REFERENCE_LIST` is written on every
+  dimension scale, `_Netcdf4Coordinates` on every multidimensional variable, and
+  undefined variable data reads as the netCDF default fill rather than 0. Files
+  open cleanly in netCDF4-python 1.7.4 and round-trip through the reader.
+  (B005, B010, B011, B018, B019, B020, G002)
+- **netCDF reader completeness.** The reader now enumerates every member of an
+  old-style group that spans multiple symbol-table nodes, resolves vlen strings
+  and sequences across multiple global-heap collections and objects, and sizes
+  each decoded array from the dataspace rather than from the raw byte length —
+  which had invented a phantom trailing element on padded scalar or odd-length
+  integer attributes. Genuine netCDF-4 files, including those written by
+  netCDF-C, now round-trip their variables, dimensions and coordinate axes.
+  (B012, B013, B014)
+
+### Fixed
+
+**Global heap — libhdf5 conformance**
+
+- **Every small variable-length dataset was unreadable by libhdf5.**
+  `GlobalHeapWriter` sized each GCOL collection exactly to its contents (as little
+  as 56 bytes), but `H5HG__cache_heap_deserialize` rejects any collection whose
+  declared size is below `H5HG_MINSIZE` (4096) *before* it deserialises — so h5py
+  raised `OSError: global heap size is too small` on every vlen-string dataset
+  under ~4 KB, meaning all `create_vlen_string_dataset` output and every netCDF
+  station-name / label array. Collections are now floored at 4096, rounded up to a
+  power of two and capped at 65536. (B001)
+- **The collection's free space was a size-0 terminator object**, which hangs
+  libhdf5's deserializer because it advances its parse cursor by the object's own
+  size; the padding is now a real index-0 free-space object whose size spans the
+  rest of the collection. (B002)
+- **The on-disk object index was truncated with `as u16` / saturating add**,
+  corrupting any vlen dataset past a collection's 16-bit slot space; indices are
+  32-bit throughout and objects that would overflow a collection start a new one.
+  (B008)
+- **Vlen-string lengths included the NUL terminator** (`strlen + 1`) where libhdf5
+  uses `strlen`, so every string read back one byte long and mis-terminated;
+  strings are now stored raw at `strlen`. (B009)
+
+**Attribute encoding**
+
+- **An empty scalar fixed-string attribute emitted a size-0 datatype**, which made
+  libhdf5 unable to read *any* attribute on that object; it now carries a
+  one-byte width. (B003)
+- **Variable-length string datatypes declared ASCII charset** where the data was
+  UTF-8 (B017), and **fixed strings used `H5T_STR_NULLTERM` with no room for the
+  terminator** where libhdf5 uses `NULLPAD` (B022). Both corrected.
+- A duplicate attribute name (B021), an empty attribute name (R004) and a user
+  attribute colliding with an auto-generated `DIMENSION_LIST` (R005) are now
+  rejected rather than producing an object whose attributes libhdf5 cannot
+  iterate; the misleading comments in the float/string dtype encoders were
+  corrected (R009).
+
+**Object header**
+
+- **A zero-length contiguous dataset wrote a *defined* data address with size 0**,
+  which libhdf5 reports as corruption; an empty dataset now writes the
+  undefined-address sentinel, which libhdf5 reads as "empty". (B004)
+- Chunked datasets used a fill-value space-allocation time of `Late(2)` where
+  libhdf5 uses `Incremental(3)` for chunked storage (B023); `set_deflate` on a
+  scalar dataset, which had deferred an error to `build()`, is now rejected up
+  front (R008); and `create_dataset` / `create_dataset_unlimited` use checked
+  arithmetic instead of panicking (debug) or silently accepting an inconsistent
+  shape (release) on a shape / byte-size overflow (R001, R002).
+
+**Chunk index**
+
+- The terminal B-tree v1 chunk key deviated from libhdf5 — a trailing
+  element-dimension of 0 instead of the element size, with the multi-dimensional
+  real dimensions differing as well (B016); the writer accepted a chunk extent
+  larger than a fixed non-dim-0 dimension, producing `chunk[d] > maxdim[d]`
+  (B024); the `MAX_CHUNKS` guard ran only *after* every chunk had already been
+  materialised and compressed (R003); and `create_dataset_unlimited` silently
+  truncated a `chunk_shape` carrying more dimensions than the dataset (R007). All
+  corrected.
+
+**Reader**
+
+- The full chunked read ignored the fill-value message, so sparse chunks read back
+  as 0 instead of the declared fill value (B007); `parse_attribute_v1` folded
+  object-header alignment padding into `Attribute.data` — the 0.2.1 attr-padding
+  reader regression — now trimmed (B013); `oxinetcdf`'s scalar accessors returned
+  a phantom trailing element on padded scalar / odd-length integer attributes
+  (B014); and names with an embedded NUL were accepted, truncating link names in
+  the local heap into duplicate or renamed links (B015). All corrected.
+- **Variable-length string attributes had no scalar accessor, and multi-object
+  global-heap collections at an unaligned file offset dropped every object after
+  the first.** A scalar vlen string attribute — the form h5py writes for
+  `dset.attrs['units'] = 'm'` and netCDF-C's `setncattr_string` (HDF5 datatype
+  class 9) — returned `None` from `AttrView::as_str_fixed`; the new
+  `AttrView::as_str` resolves the global-heap reference and returns the string
+  for both fixed and vlen scalar forms, and `NcAttribute::as_text` surfaces the
+  same. The global-heap reader also aligned each object on an 8-byte boundary
+  relative to the *file* rather than to the *collection start*, so a GCOL placed
+  at a non-8-aligned address (netCDF-C uses e.g. 4763) reported "object N not
+  found" for N ≥ 2 — every multi-byte or multi-attribute vlen string past the
+  first. Both corrected. (W3)
+
+**netCDF**
+
+- Fabricated int32 coordinate variables surfaced as phantom coordinate variables
+  (B010); multiple variables sharing one unlimited dimension could not be written,
+  the shared counter over-growing the dimension (B011); a fixed dimension of size 0
+  produced a corrupt, unreadable dataset (R006); and `oxinetcdf`'s build allocated
+  coordinate arrays from an unchecked shape product, risking OOM / hang or a debug
+  panic (R010). All corrected — see *Added* for the positive-side conventions
+  (B005 / B018 / B019 / B020) these repairs enabled.
+
+### Known limitations
+
+- Unchanged from 0.2.1 and still read-side: extensible-array chunk indexes are
+  reported, not decoded (typed `NotImplemented`), and hyperslab selections with
+  `block > 1` drop elements on chunked datasets.
+- Deferred to the 0.2.3+ write-path roadmap (`TODO.md`): compound, big-endian,
+  float16, virtual (VDS), region-reference and non-string vlen-sequence datasets;
+  array / opaque / bitfield datasets; arbitrary (non-bool) enumerations;
+  scaleoffset / nbit / szip filters on write; append / resize and
+  modify-existing-file modes; soft / external / hard-alias link creation; and
+  new-style (link-message) groups with creation-order preservation.
+
 ## [0.2.1] - 2026-07-21
 
 ### Added
@@ -329,6 +518,7 @@ message.rs          — decode all standard message types
 
 ---
 
+[0.2.2]: https://github.com/cool-japan/oxih5/releases/tag/v0.2.2
 [0.2.1]: https://github.com/cool-japan/oxih5/releases/tag/v0.2.1
 [0.2.0]: https://github.com/cool-japan/oxih5/releases/tag/v0.2.0
 [0.1.4]: https://github.com/cool-japan/oxih5/releases/tag/v0.1.4

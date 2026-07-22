@@ -330,6 +330,49 @@ fn decode_szip(
     Ok(decoded)
 }
 
+/// Shuffle bytes: the HDF5 shuffle filter's **forward** transform.
+///
+/// The exact inverse of [`unshuffle`].  It groups the *i*-th byte of every
+/// element together, which clusters the high-order bytes — often equal across
+/// neighbouring samples — so a following compressor sees longer runs:
+/// ```text
+/// original: [elem[0] bytes, elem[1] bytes, ...]
+/// shuffled: [byte[0] of every elem, then byte[1] of every elem, ...]
+/// ```
+///
+/// This is the transform a writer applies before DEFLATE to reproduce
+/// `shuffle=True, compression='gzip'`; the pair is encoded as two filter
+/// descriptions (shuffle then deflate) in the pipeline message.
+///
+/// `elem_size` is the element width in bytes; it must be `> 0` and divide
+/// `data.len()` — a chunk always holds a whole number of elements.
+///
+/// # Errors
+/// Returns [`OxiH5Error::Format`] if `elem_size` is 0 or does not divide
+/// `data.len()`.
+pub fn shuffle(data: &[u8], elem_size: usize) -> Result<Vec<u8>, OxiH5Error> {
+    if elem_size == 0 {
+        return Err(OxiH5Error::Format(
+            "shuffle: element size must be > 0".into(),
+        ));
+    }
+    if data.len() % elem_size != 0 {
+        return Err(OxiH5Error::Format(format!(
+            "shuffle: data length {} not divisible by element size {}",
+            data.len(),
+            elem_size
+        )));
+    }
+    let n_elems = data.len() / elem_size;
+    let mut out = vec![0u8; data.len()];
+    for byte_pos in 0..elem_size {
+        for elem_idx in 0..n_elems {
+            out[byte_pos * n_elems + elem_idx] = data[elem_idx * elem_size + byte_pos];
+        }
+    }
+    Ok(out)
+}
+
 /// Un-shuffle bytes: reverses the HDF5 shuffle filter.
 ///
 /// The shuffle filter reorders bytes so that the i-th byte of each element
@@ -366,6 +409,22 @@ pub fn unshuffle(data: &[u8], elem_size: usize) -> Result<Vec<u8>, OxiH5Error> {
     Ok(out)
 }
 
+/// Append a Fletcher-32 checksum: the HDF5 fletcher32 filter's **forward**
+/// transform.
+///
+/// Returns `data` followed by its 4-byte little-endian Fletcher-32 checksum,
+/// exactly as libhdf5 stores a fletcher32-filtered chunk (`H5Zfletcher32.c`
+/// appends the checksum with a little-endian `UINT32ENCODE`).  [`verify_fletcher32`]
+/// is the inverse, and h5py verifies the checksum natively when it reads the
+/// chunk, so a wrong checksum makes the reference reader error.
+pub fn append_fletcher32(data: &[u8]) -> Vec<u8> {
+    let checksum = fletcher32_compute(data);
+    let mut out = Vec::with_capacity(data.len() + 4);
+    out.extend_from_slice(data);
+    out.extend_from_slice(&checksum.to_le_bytes());
+    out
+}
+
 /// Verify and strip the Fletcher-32 checksum from chunk data.
 ///
 /// The last 4 bytes of `data` are the stored checksum (little-endian).
@@ -393,27 +452,46 @@ pub fn verify_fletcher32(data: &[u8]) -> Result<Vec<u8>, OxiH5Error> {
     Ok(payload.to_vec())
 }
 
-/// Compute the Fletcher-32 checksum over `data`.
+/// Compute the Fletcher-32 checksum over `data`, byte-for-byte as libhdf5 does.
 ///
-/// Fletcher-32 operates on 16-bit words (big-endian interpretation of each pair).
-/// If the data length is odd, the last byte is treated as a 16-bit word padded
-/// on the right with a zero byte.
+/// This reproduces `H5_checksum_fletcher32` (H5checksum.c) exactly, not the
+/// textbook `mod 65535` form: each 16-bit word is read big-endian
+/// (`(data[0] << 8) | data[1]`), the two accumulators are 32-bit and wrap like
+/// C's `uint32_t`, and the reduction is the deferred-carry fold
+/// `(x & 0xffff) + (x >> 16)` applied every 360 words (the largest block for
+/// which `sum2` cannot overflow 32 bits) and once more at the end.  The two
+/// forms agree on almost all inputs but differ where a partial sum lands on
+/// exactly `0xffff`, so matching libhdf5's variant is what keeps an
+/// oxih5-written fletcher32 chunk verifiable by h5py.
+///
+/// A trailing odd byte is the high half of a 16-bit word, the low half zero.
 fn fletcher32_compute(data: &[u8]) -> u32 {
     let mut sum1: u32 = 0;
     let mut sum2: u32 = 0;
-    let mut i = 0;
-    while i + 1 < data.len() {
-        let word = u16::from_be_bytes([data[i], data[i + 1]]) as u32;
-        sum1 = (sum1 + word) % 65535;
-        sum2 = (sum2 + sum1) % 65535;
-        i += 2;
+    let mut words = data.len() / 2;
+    let mut i = 0usize;
+    while words > 0 {
+        let mut block = words.min(360);
+        words -= block;
+        while block > 0 {
+            let word = (u32::from(data[i]) << 8) | u32::from(data[i + 1]);
+            sum1 = sum1.wrapping_add(word);
+            i += 2;
+            sum2 = sum2.wrapping_add(sum1);
+            block -= 1;
+        }
+        sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+        sum2 = (sum2 & 0xffff) + (sum2 >> 16);
     }
-    if i < data.len() {
-        // Odd byte: treat as high byte of a 16-bit word, low byte = 0.
-        let word = (data[i] as u32) << 8;
-        sum1 = (sum1 + word) % 65535;
-        sum2 = (sum2 + sum1) % 65535;
+    if data.len() % 2 == 1 {
+        sum1 = sum1.wrapping_add(u32::from(data[i]) << 8);
+        sum2 = sum2.wrapping_add(sum1);
+        sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+        sum2 = (sum2 & 0xffff) + (sum2 >> 16);
     }
+    // Second reduction step so both sums are back inside 16 bits.
+    sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+    sum2 = (sum2 & 0xffff) + (sum2 >> 16);
     (sum2 << 16) | sum1
 }
 
@@ -667,7 +745,7 @@ mod tests {
             3, 0, 0, 0,
         ];
         // Apply shuffle, then compress the shuffled bytes.
-        let shuffled = shuffle_for_test(&original, elem_size);
+        let shuffled = shuffle(&original, elem_size).expect("shuffle");
         let compressed = oxiarc_deflate::zlib_compress(&shuffled, 6).expect("compress");
 
         let pipeline = FilterPipeline {
@@ -723,16 +801,87 @@ mod tests {
         ));
     }
 
-    /// Forward shuffle (inverse of `unshuffle`) — test helper only.
-    fn shuffle_for_test(data: &[u8], elem_size: usize) -> Vec<u8> {
-        let n_elems = data.len() / elem_size;
-        let mut out = vec![0u8; data.len()];
-        for byte_pos in 0..elem_size {
-            for elem_idx in 0..n_elems {
-                out[byte_pos * n_elems + elem_idx] = data[elem_idx * elem_size + byte_pos];
-            }
+    #[test]
+    fn test_shuffle_is_the_inverse_of_unshuffle() {
+        // Every element width a real dataset uses, over a chunk that is not a
+        // whole multiple of the width in element *count* but is in bytes.
+        for elem_size in [1usize, 2, 4, 8] {
+            let data: Vec<u8> = (0..elem_size as u32 * 13)
+                .map(|i| (i.wrapping_mul(37).wrapping_add(5) & 0xff) as u8)
+                .collect();
+            let shuffled = shuffle(&data, elem_size).expect("shuffle");
+            let back = unshuffle(&shuffled, elem_size).expect("unshuffle");
+            assert_eq!(
+                back, data,
+                "shuffle∘unshuffle must be identity (es={elem_size})"
+            );
         }
-        out
+    }
+
+    #[test]
+    fn test_shuffle_matches_hdf5_byte_layout() {
+        // 3 four-byte elements 0x01020304, 0x05060708, 0x090a0b0c (big-endian
+        // spelling), so byte position 0 groups {01,05,09}, position 1 {02,06,0a}…
+        // This is the exact layout an h5py `shuffle=True` chunk stores.
+        let data = vec![
+            0x01u8, 0x02, 0x03, 0x04, //
+            0x05, 0x06, 0x07, 0x08, //
+            0x09, 0x0a, 0x0b, 0x0c,
+        ];
+        let expected = vec![
+            0x01u8, 0x05, 0x09, // byte 0 of each element
+            0x02, 0x06, 0x0a, // byte 1
+            0x03, 0x07, 0x0b, // byte 2
+            0x04, 0x08, 0x0c, // byte 3
+        ];
+        assert_eq!(shuffle(&data, 4).expect("shuffle"), expected);
+    }
+
+    #[test]
+    fn test_shuffle_elem_size_1_is_identity() {
+        let data = vec![9u8, 8, 7, 6, 5];
+        assert_eq!(shuffle(&data, 1).expect("shuffle"), data);
+    }
+
+    #[test]
+    fn test_shuffle_rejects_zero_and_misaligned() {
+        assert!(shuffle(&[1u8, 2, 3, 4], 0).is_err());
+        assert!(shuffle(&[1u8, 2, 3, 4, 5], 4).is_err());
+    }
+
+    #[test]
+    fn test_append_fletcher32_roundtrips_through_verify() {
+        for len in [0usize, 1, 2, 3, 45, 148, 1000] {
+            let payload: Vec<u8> = (0..len as u32)
+                .map(|i| (i.wrapping_mul(131).wrapping_add(7) & 0xff) as u8)
+                .collect();
+            let with_checksum = append_fletcher32(&payload);
+            assert_eq!(with_checksum.len(), payload.len() + 4);
+            assert_eq!(
+                verify_fletcher32(&with_checksum).expect("verify"),
+                payload,
+                "append then verify must recover the payload (len={len})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fletcher32_matches_libhdf5_known_answers() {
+        // Both vectors were checksummed by libhdf5 2.0.0 (h5py 3.16, fletcher32
+        // filter) and the stored little-endian trailer read straight out of the
+        // file — so these pin oxih5's checksum to the reference implementation,
+        // odd-byte path included.
+        let even: Vec<u8> = (0..37u32)
+            .flat_map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes())
+            .collect();
+        assert_eq!(even.len(), 148);
+        assert_eq!(fletcher32_compute(&even), 0xe017_de32);
+
+        let odd: Vec<u8> = (0..45u32)
+            .map(|i| (i.wrapping_mul(131).wrapping_add(7) & 0xff) as u8)
+            .collect();
+        assert_eq!(odd.len(), 45);
+        assert_eq!(fletcher32_compute(&odd), 0xba61_9e4c);
     }
 
     #[test]

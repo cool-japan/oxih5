@@ -13,13 +13,15 @@
 
 use oxih5_core::OxiH5Error;
 
-use super::elem::{write_datatype_body, ElemType, ResolvedAttr};
+use super::elem::{
+    compact_layout_data, fill_value_bytes, write_datatype_body, ElemType, ResolvedAttr,
+};
 use super::format::{
     fill_zero, write_msg_header, write_u16_le, write_u32_le, write_u64_le, MSG_HDR_SIZE,
 };
 use super::pipeline;
-use super::tree::Filter;
-use super::{check_size, narrow, pad8, DatasetDesc};
+use super::tree::{DatasetDesc, Filter};
+use super::{check_size, narrow, pad8};
 
 /// Size of the v1 object-header prefix.
 const OH_PREFIX: usize = 16;
@@ -32,8 +34,22 @@ const FILL_VALUE_BODY: usize = 8;
 const LAYOUT_CONTIGUOUS_BODY: usize = 24;
 /// Fixed part of a v3 chunked data layout message, before the chunk dimensions.
 const LAYOUT_CHUNKED_PREFIX: usize = 11;
+/// Fixed part of a v3 compact data layout message, before the inline data:
+/// version, layout class, and a 16-bit inline-size field.
+const LAYOUT_COMPACT_PREFIX: usize = 4;
 /// Fixed part of a v1 dataspace message body, before the dimension vectors.
 const DATASPACE_PREFIX: usize = 8;
+
+/// The HDF5 "undefined address" sentinel (`H5_ADDR_UNDEF`, all bits set).
+///
+/// A contiguous dataset with no elements has no allocated raw-data storage, so
+/// its layout message must carry this sentinel rather than a concrete file
+/// offset: libhdf5 reads an undefined address paired with size 0 as "empty
+/// dataset", but reads a *defined* address paired with size 0 as "invalid
+/// dataset size, likely file corruption".  The previous writer left the write
+/// cursor in the address field, which for a 0-byte payload aliases the next
+/// object in the file.
+const UNDEFINED_ADDRESS: u64 = u64::MAX;
 
 /// Total bytes one message occupies: header plus body padded to 8 bytes.
 ///
@@ -75,7 +91,20 @@ pub(super) enum OhMsg<'a> {
     /// 0x0003 — datatype.
     Datatype(ElemType),
     /// 0x0005 — fill value.
-    FillValue,
+    FillValue {
+        /// Space-allocation time recorded in the message: libhdf5 uses
+        /// `Incremental` (3) for chunked layouts, which allocate chunk storage
+        /// lazily, and `Late` (2) for contiguous layouts.  Matching it keeps the
+        /// message byte-identical to libhdf5 for each layout kind.
+        incremental: bool,
+        /// The custom fill value's little-endian bytes, or `None` for the
+        /// historic "defined, zero-length" default.  When present, the message
+        /// declares a defined fill value of these bytes — the version-2 form
+        /// libhdf5 writes for `h5py`'s `fillvalue=`, which the reader honours in
+        /// a chunked dataset's unwritten regions.  When `None`, the message is
+        /// byte-for-byte what the writer emitted before custom fills existed.
+        value: Option<&'a [u8]>,
+    },
     /// 0x0008 — contiguous data layout.
     LayoutContiguous {
         /// Size of the raw data area in bytes.
@@ -87,10 +116,19 @@ pub(super) enum OhMsg<'a> {
         /// exactly the vector HDF5 stores.
         chunk_dims: &'a [u32],
     },
-    /// 0x000B — filter pipeline holding a single DEFLATE filter.
-    FilterDeflate {
-        /// zlib compression level, recorded as the filter's client data.
-        level: u8,
+    /// 0x0008 — compact data layout: the data is inlined in the object header
+    /// rather than addressed elsewhere.
+    LayoutCompact {
+        /// The raw little-endian data, stored inline; at most 64 KiB.
+        data: &'a [u8],
+    },
+    /// 0x000B — filter pipeline, one to three of shuffle / deflate / fletcher32.
+    FilterPipeline {
+        /// Which filters the dataset's chunks pass through, in choice form; the
+        /// canonical on-disk order is applied by [`pipeline`].
+        filter: Filter,
+        /// Element size in bytes, the shuffle filter's client-data value.
+        elem_size: usize,
     },
     /// 0x000C — attribute, v1.
     Attr(&'a ResolvedAttr<'a>),
@@ -103,9 +141,11 @@ impl OhMsg<'_> {
             OhMsg::SymbolTable => 0x0011,
             OhMsg::Dataspace { .. } => 0x0001,
             OhMsg::Datatype(_) => 0x0003,
-            OhMsg::FillValue => 0x0005,
-            OhMsg::LayoutContiguous { .. } | OhMsg::LayoutChunked { .. } => 0x0008,
-            OhMsg::FilterDeflate { .. } => 0x000B,
+            OhMsg::FillValue { .. } => 0x0005,
+            OhMsg::LayoutContiguous { .. }
+            | OhMsg::LayoutChunked { .. }
+            | OhMsg::LayoutCompact { .. } => 0x0008,
+            OhMsg::FilterPipeline { .. } => 0x000B,
             OhMsg::Attr(_) => 0x000C,
         }
     }
@@ -118,7 +158,7 @@ impl OhMsg<'_> {
             // is also how libhdf5 writes all three.  A pipeline that could be
             // rewritten in place would let a reader disagree with the chunk
             // lengths already recorded in the B-tree keys.
-            OhMsg::Datatype(_) | OhMsg::FillValue | OhMsg::FilterDeflate { .. } => 0x01,
+            OhMsg::Datatype(_) | OhMsg::FillValue { .. } | OhMsg::FilterPipeline { .. } => 0x01,
             _ => 0x00,
         }
     }
@@ -129,10 +169,11 @@ impl OhMsg<'_> {
             OhMsg::SymbolTable => "symbol table message",
             OhMsg::Dataspace { .. } => "dataspace message",
             OhMsg::Datatype(_) => "datatype message",
-            OhMsg::FillValue => "fill value message",
+            OhMsg::FillValue { .. } => "fill value message",
             OhMsg::LayoutContiguous { .. } => "contiguous layout message",
             OhMsg::LayoutChunked { .. } => "chunked layout message",
-            OhMsg::FilterDeflate { .. } => "filter pipeline message",
+            OhMsg::LayoutCompact { .. } => "compact layout message",
+            OhMsg::FilterPipeline { .. } => "filter pipeline message",
             OhMsg::Attr(_) => "attribute message",
         }
     }
@@ -144,10 +185,13 @@ impl OhMsg<'_> {
             // Dimension vector plus max-dimension vector.
             OhMsg::Dataspace { dims, .. } => DATASPACE_PREFIX + dims.len() * 8 * 2,
             OhMsg::Datatype(elem_type) => elem_type.dt_body_size(),
-            OhMsg::FillValue => FILL_VALUE_BODY,
+            // 4 fixed header bytes + a 4-byte size field + the value bytes; the
+            // default (`None`) is size 0 and no value, i.e. the historic 8.
+            OhMsg::FillValue { value, .. } => FILL_VALUE_BODY + value.map_or(0, <[u8]>::len),
             OhMsg::LayoutContiguous { .. } => LAYOUT_CONTIGUOUS_BODY,
             OhMsg::LayoutChunked { chunk_dims } => LAYOUT_CHUNKED_PREFIX + chunk_dims.len() * 4,
-            OhMsg::FilterDeflate { .. } => pipeline::deflate_body_size(),
+            OhMsg::LayoutCompact { data } => LAYOUT_COMPACT_PREFIX + data.len(),
+            OhMsg::FilterPipeline { filter, .. } => pipeline::body_size(filter),
             OhMsg::Attr(attr) => attr.body_size(),
         }
     }
@@ -200,20 +244,39 @@ impl OhMsg<'_> {
 
             OhMsg::Datatype(elem_type) => write_datatype_body(buf, start, *elem_type),
 
-            OhMsg::FillValue => {
-                fill_zero(buf, start, FILL_VALUE_BODY);
+            OhMsg::FillValue { incremental, value } => {
+                let body = self.body_size();
+                fill_zero(buf, start, body);
                 buf[start] = 0x02; // version = 2
-                buf[start + 1] = 0x02; // space allocation time = late
+                                   // Space allocation time: chunked storage is
+                                   // allocated incrementally (3), contiguous late
+                                   // (2) — matching libhdf5 for each layout kind.
+                buf[start + 1] = if *incremental { 0x03 } else { 0x02 };
                 buf[start + 2] = 0x02; // fill write time = never
-                buf[start + 3] = 0x01; // fill value defined, zero-length
-                Ok(FILL_VALUE_BODY)
+                buf[start + 3] = 0x01; // fill value defined
+                let value = value.unwrap_or(&[]);
+                // Size 0 with no value bytes is the historic zero-length default;
+                // a non-empty value is the typed sentinel `set_fill_value_*` set.
+                write_u32_le(buf, start + 4, narrow("fill value size", value.len())?);
+                buf[start + 8..start + 8 + value.len()].copy_from_slice(value);
+                Ok(body)
             }
 
             OhMsg::LayoutContiguous { size } => {
                 fill_zero(buf, start, LAYOUT_CONTIGUOUS_BODY);
                 buf[start] = 0x03; // version = 3
                 buf[start + 1] = 0x01; // class = 1 (contiguous)
-                write_u64_le(buf, start + 2, addrs.data);
+                                       // An empty contiguous dataset has no raw
+                                       // storage: write the undefined address so
+                                       // libhdf5 does not read the (aliasing)
+                                       // write cursor as a defined size-0 extent
+                                       // and reject the file as corrupt.
+                let data_addr = if *size == 0 {
+                    UNDEFINED_ADDRESS
+                } else {
+                    addrs.data
+                };
+                write_u64_le(buf, start + 2, data_addr);
                 write_u64_le(buf, start + 10, *size);
                 Ok(LAYOUT_CONTIGUOUS_BODY)
             }
@@ -231,7 +294,22 @@ impl OhMsg<'_> {
                 Ok(body)
             }
 
-            OhMsg::FilterDeflate { level } => Ok(pipeline::write_deflate_body(buf, start, *level)),
+            OhMsg::LayoutCompact { data } => {
+                let body = self.body_size();
+                fill_zero(buf, start, body);
+                buf[start] = 0x03; // version = 3
+                buf[start + 1] = 0x00; // class = 0 (compact)
+                                       // 16-bit inline-size field; the data
+                                       // immediately follows the 4-byte prefix.
+                write_u16_le(buf, start + 2, narrow("compact layout size", data.len())?);
+                buf[start + LAYOUT_COMPACT_PREFIX..start + LAYOUT_COMPACT_PREFIX + data.len()]
+                    .copy_from_slice(data);
+                Ok(body)
+            }
+
+            OhMsg::FilterPipeline { filter, elem_size } => {
+                Ok(pipeline::write_body(buf, start, filter, *elem_size))
+            }
 
             OhMsg::Attr(attr) => attr.write_body(buf, start),
         }
@@ -349,23 +427,41 @@ pub(super) fn dataset_oh_msgs<'a>(
     chunk_dims: &'a [u32],
     attrs: &'a [ResolvedAttr<'a>],
 ) -> Vec<OhMsg<'a>> {
+    let is_chunked = ds.chunked().is_some();
     let mut msgs = Vec::with_capacity(5 + attrs.len());
     msgs.push(OhMsg::Dataspace {
         dims: &ds.shape,
         unlimited_dim0: ds.unlimited_dim0(),
     });
     msgs.push(OhMsg::Datatype(ds.elem_type));
-    msgs.push(OhMsg::FillValue);
-    match ds.filter {
-        None => {}
-        Some(Filter::Deflate { level }) => msgs.push(OhMsg::FilterDeflate { level }),
+    // Chunked storage is allocated incrementally by libhdf5; contiguous late.
+    // A custom fill value, if one was set, rides the dataset's attribute list as
+    // a sentinel; folding it in here (rather than emitting it as an attribute)
+    // is what turns `set_fill_value_*` into the defined fill-value message the
+    // reader and h5py honour.
+    msgs.push(OhMsg::FillValue {
+        incremental: is_chunked,
+        value: fill_value_bytes(&ds.attrs),
+    });
+    // A stored filter always carries at least one active stage (the `set_*`
+    // entry points never store an empty one), so an empty pipeline message is
+    // never emitted.
+    if let Some(filter) = ds.filter.filter(Filter::is_active) {
+        msgs.push(OhMsg::FilterPipeline {
+            filter,
+            elem_size: ds.elem_type.byte_size(),
+        });
     }
-    msgs.push(if ds.chunked().is_some() {
-        OhMsg::LayoutChunked { chunk_dims }
-    } else {
-        OhMsg::LayoutContiguous {
+    // A compact request wins over the default contiguous layout: the data was
+    // moved onto the attribute list as a sentinel, so it is inlined here and no
+    // separate data area is reserved.  Compact and chunked are mutually
+    // exclusive (`set_compact` refuses a chunked dataset).
+    msgs.push(match (compact_layout_data(&ds.attrs), is_chunked) {
+        (Some(data), _) => OhMsg::LayoutCompact { data },
+        (None, true) => OhMsg::LayoutChunked { chunk_dims },
+        (None, false) => OhMsg::LayoutContiguous {
             size: ds.data_len() as u64,
-        }
+        },
     });
     msgs.extend(attrs.iter().map(OhMsg::Attr));
     msgs
@@ -464,6 +560,78 @@ mod tests {
             };
             assert_eq!(msg.body_size(), 11 + (ndims + 1) * 4);
         }
+    }
+
+    /// A custom fill value is the version-2 defined message h5py writes for
+    /// `fillvalue=`, byte-pinned against `h5py`'s object header: `02 <alloc> 02
+    /// 01 <size u32> <value LE>`.  `None` stays the historic zero-length default.
+    #[test]
+    fn fill_value_message_matches_h5py() {
+        // Contiguous f64 fillvalue=-999.0: `02 02 02 01 08 00 00 00 <-999 LE>`.
+        let neg999 = (-999.0f64).to_le_bytes();
+        let msg = OhMsg::FillValue {
+            incremental: false,
+            value: Some(&neg999),
+        };
+        assert_eq!(msg.body_size(), 16, "4 header + 4 size + 8 value");
+        let mut buf = vec![0xAAu8; 16];
+        assert_eq!(
+            msg.write_body(&mut buf, 0, &OhAddrs::default())
+                .expect("write"),
+            16
+        );
+        let mut want = vec![0x02, 0x02, 0x02, 0x01, 0x08, 0x00, 0x00, 0x00];
+        want.extend_from_slice(&neg999);
+        assert_eq!(buf, want, "contiguous -999.0 f64");
+
+        // Chunked i32 fillvalue=-7: alloc time 3, size 4, value `f9 ff ff ff`.
+        let neg7 = (-7i32).to_le_bytes();
+        let msg = OhMsg::FillValue {
+            incremental: true,
+            value: Some(&neg7),
+        };
+        assert_eq!(msg.body_size(), 12, "4 header + 4 size + 4 value");
+        let mut buf = vec![0u8; 12];
+        msg.write_body(&mut buf, 0, &OhAddrs::default())
+            .expect("write");
+        assert_eq!(
+            buf,
+            vec![0x02, 0x03, 0x02, 0x01, 0x04, 0x00, 0x00, 0x00, 0xf9, 0xff, 0xff, 0xff],
+            "chunked -7 i32"
+        );
+
+        // The default (no custom value) is the historic 8-byte zero-length form.
+        let msg = OhMsg::FillValue {
+            incremental: false,
+            value: None,
+        };
+        assert_eq!(msg.body_size(), 8, "default fill message is unchanged");
+        let mut buf = vec![0xAAu8; 8];
+        msg.write_body(&mut buf, 0, &OhAddrs::default())
+            .expect("write");
+        assert_eq!(buf, vec![0x02, 0x02, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00]);
+    }
+
+    /// The compact layout message inlines the data behind a 4-byte prefix,
+    /// byte-pinned against h5py: `03 00 <size u16> <data>` (version 3, class 0).
+    #[test]
+    fn compact_layout_message_matches_h5py() {
+        // Six little-endian i32 [0..6], as h5py's compact `d` stores them.
+        let data: Vec<u8> = (0..6i32).flat_map(|v| v.to_le_bytes()).collect();
+        let msg = OhMsg::LayoutCompact { data: &data };
+        assert_eq!(msg.body_size(), 4 + 24, "4 prefix + 24 data");
+        let mut buf = vec![0xAAu8; 4 + 24];
+        assert_eq!(
+            msg.write_body(&mut buf, 0, &OhAddrs::default())
+                .expect("write"),
+            28
+        );
+        let mut want = vec![0x03, 0x00, 0x18, 0x00]; // v3, compact, inline size 24
+        want.extend_from_slice(&data);
+        assert_eq!(buf, want);
+        // The message is flagged 0 (rewritable), like every other layout message.
+        assert_eq!(msg.flags(), 0x00);
+        assert_eq!(msg.msg_type(), 0x0008);
     }
 
     #[test]

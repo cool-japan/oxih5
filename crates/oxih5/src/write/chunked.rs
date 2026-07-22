@@ -82,19 +82,41 @@ pub(super) const fn chunk_node_size(ndims: usize) -> usize {
 /// so twelve of the fifteen values read back as zero, from a file that opened
 /// without complaint.
 ///
+/// The rank seam runs both ways.  A request with **fewer** dimensions than the
+/// dataspace is completed as above; a request with **more** is a caller error —
+/// there is no dimension for the extra extent to tile — and is rejected rather
+/// than silently dropped (which read back a lower-rank chunking than asked for).
+///
 /// # Errors
 ///
 /// Returns `OxiH5Error::Format` if the dataset has no dimensions — HDF5 has no
-/// chunked scalar dataspace — or if a chunk extent is 0, which HDF5 forbids and
-/// which divides by zero in every chunk-index reader.
+/// chunked scalar dataspace — if the request carries more dimensions than the
+/// dataspace, if a chunk extent is 0, which HDF5 forbids and which divides by
+/// zero in every chunk-index reader, or if a chunk extent exceeds a **fixed**
+/// (non-growable) dimension's extent, which libhdf5 rejects at create time
+/// (`chunk size must be <= maximum dimension size for fixed-sized dimensions`).
+/// Dimension 0 is exempt **only while it is unlimited** — the writer's growth
+/// dimension, where a chunk wider than the current extent is a whole-dataset
+/// tile with fill in the overhang, not a violation.  A fixed dimension 0 (a
+/// tiled dataset created with a bounded maxshape) is policed like any other, so
+/// a chunk cannot outgrow a maximum it can never reach.
 pub(super) fn chunk_shape_of(ds: &DatasetDesc) -> Result<Vec<usize>, OxiH5Error> {
-    let Some((requested, _)) = ds.chunked() else {
+    let Some((requested, unlimited_dim0)) = ds.chunked() else {
         return Ok(Vec::new());
     };
     if ds.shape.is_empty() {
         return Err(OxiH5Error::Format(format!(
             "dataset '{}': chunked storage needs at least one dimension",
             ds.name
+        )));
+    }
+    if requested.len() > ds.shape.len() {
+        return Err(OxiH5Error::Format(format!(
+            "dataset '{}': chunk shape has {} dimensions but the dataspace has {}; \
+             a chunk cannot tile more dimensions than the dataset has",
+            ds.name,
+            requested.len(),
+            ds.shape.len()
         )));
     }
 
@@ -108,6 +130,19 @@ pub(super) fn chunk_shape_of(ds: &DatasetDesc) -> Result<Vec<usize>, OxiH5Error>
         if chunk == 0 {
             return Err(OxiH5Error::Format(format!(
                 "dataset '{}': chunk dimension {d} is 0",
+                ds.name
+            )));
+        }
+        // A chunk may exceed the growth dimension (dimension 0 only while it is
+        // unlimited) but not a fixed dimension whose extent can never rise to
+        // meet it — libhdf5 rejects that on `H5Dcreate`.  A zero-length fixed
+        // dimension holds no chunks, so its formal extent of 1 is not a real
+        // bound to police.
+        let is_growth_dim = d == 0 && unlimited_dim0;
+        if !is_growth_dim && extent > 0 && chunk > extent {
+            return Err(OxiH5Error::Format(format!(
+                "dataset '{}': chunk extent {chunk} on fixed dimension {d} exceeds its \
+                 size {extent}; libhdf5 rejects a chunk larger than a fixed dimension",
                 ds.name
             )));
         }
@@ -146,20 +181,118 @@ fn chunk_counts(shape: &[usize], chunk_shape: &[usize]) -> Vec<usize> {
         .collect()
 }
 
-/// The dataset extent rounded **up** to a chunk boundary: the terminal B-tree
-/// key.
+/// The real-dimension offsets of the terminal B-tree key — the exclusive upper
+/// bound that closes the rightmost node of every level.
 ///
 /// `H5B_find` binary-searches with `cmp3(key[i], wanted, key[i+1])`, which
-/// reports "found" only while `wanted < key[i+1]`.  The key past the last child
-/// is therefore an exclusive upper bound over the whole node, and it has to sit
-/// on a chunk boundary because `H5D__btree_decode_key` divides every offset it
-/// reads by the chunk extent to recover a scaled coordinate.
+/// reports "found" only while `wanted < key[i+1]`, so the key past the last
+/// child must be a strict upper bound over the node, sitting on a chunk
+/// boundary (`H5D__btree_decode_key` divides every offset by the chunk extent).
+/// The rounded-up extent (`count × chunk`) is one such bound and is what oxih5
+/// emitted through 0.2.1 — libhdf5 accepts it, but it is **not** the key
+/// libhdf5 itself writes, so a strict validator (h5check) flags the deviation.
+///
+/// libhdf5's terminal key is an artifact of how it inserts chunks, and this
+/// reproduces it exactly.  `H5D__btree_new_node` seeds the right key at the
+/// first chunk's scaled coordinate **plus one in every dimension**; each later
+/// chunk, offered in row-major (dimension-0-slowest) order, advances the right
+/// key to *its* coordinate plus one only when it already sorts at or past that
+/// bound.  Replaying that walk gives the scaled terminal, which this scales back
+/// to elements.  It matches h5py (libver='earliest') byte for byte across 1-D,
+/// single-chunk, ragged and divisible multi-dimensional grids.
+///
+/// A zero-length dimension yields no chunks; that node is empty and its terminal
+/// key is never read, so the rounded extent (0 in the empty dimension) is
+/// returned unchanged for it.
 pub(super) fn end_offsets(shape: &[usize], chunk_shape: &[usize]) -> Vec<u64> {
-    chunk_counts(shape, chunk_shape)
-        .iter()
+    let counts = chunk_counts(shape, chunk_shape);
+    if counts.contains(&0) {
+        return counts
+            .iter()
+            .zip(chunk_shape)
+            .map(|(&count, &chunk)| (count * chunk) as u64)
+            .collect();
+    }
+
+    let ndims = counts.len();
+    // `rt` is the right key in scaled (chunk-grid) coordinates.  It starts at
+    // the first chunk's grid position `[0, …, 0]` plus one in every dimension.
+    let mut rt = vec![1u64; ndims];
+    let mut grid = vec![0usize; ndims];
+    loop {
+        // Advance the odometer to the next chunk in row-major order; the last
+        // dimension varies fastest.  Stop once it wraps past the final chunk.
+        let mut d = ndims;
+        let done = loop {
+            if d == 0 {
+                break true;
+            }
+            d -= 1;
+            grid[d] += 1;
+            if grid[d] < counts[d] {
+                break false;
+            }
+            grid[d] = 0;
+        };
+        if done {
+            break;
+        }
+        // libhdf5 advances the right key only for a chunk that sorts at or past
+        // it, and then sets it to that chunk's coordinate plus one everywhere.
+        let advance = grid
+            .iter()
+            .zip(&rt)
+            .find_map(|(&g, &bound)| match (g as u64).cmp(&bound) {
+                std::cmp::Ordering::Greater => Some(true),
+                std::cmp::Ordering::Less => Some(false),
+                std::cmp::Ordering::Equal => None,
+            });
+        if advance == Some(true) {
+            for (slot, &g) in rt.iter_mut().zip(&grid) {
+                *slot = g as u64 + 1;
+            }
+        }
+    }
+
+    rt.iter()
         .zip(chunk_shape)
-        .map(|(&count, &chunk)| (count * chunk) as u64)
+        .map(|(&scaled, &chunk)| scaled * chunk as u64)
         .collect()
+}
+
+/// Number of chunks a dataset of `shape` holds when tiled by `chunk_shape`,
+/// rejecting a request whose chunk count exceeds [`MAX_CHUNKS`] **before** any
+/// chunk is materialised.
+///
+/// The chunk index caps the chunk count at [`MAX_CHUNKS`] as well, but only
+/// inside [`ChunkTree::plan`], which runs *after* `payload::build` has cut and
+/// compressed every tile — so a pathological request would already have spent
+/// gigabytes and seconds before the cap spoke.  Called from the layout pass up
+/// front, this refuses in microseconds instead.
+///
+/// # Errors
+///
+/// Returns `OxiH5Error::Format` if the chunk count is over [`MAX_CHUNKS`], or
+/// would overflow while being computed — either way, far more than the writer
+/// will index.
+pub(super) fn chunk_count(shape: &[usize], chunk_shape: &[usize]) -> Result<usize, OxiH5Error> {
+    let counts = chunk_counts(shape, chunk_shape);
+    if counts.contains(&0) {
+        return Ok(0);
+    }
+    // A wide `u128` running product with an early cap: no genuine dataset comes
+    // near `MAX_CHUNKS`, so the exact overflowing total is never needed — only
+    // that it is too large.
+    let mut total: u128 = 1;
+    for &count in &counts {
+        total = total.saturating_mul(count as u128);
+        if total > MAX_CHUNKS as u128 {
+            return Err(OxiH5Error::Format(format!(
+                "dataset needs at least {total} chunks, over the writer's limit of {MAX_CHUNKS}"
+            )));
+        }
+    }
+    Ok(total as usize)
 }
 
 /// Every chunk origin, in elements, in the order the B-tree stores them.
@@ -222,19 +355,32 @@ struct NodeKey<'a> {
     filter_mask: u32,
     /// Chunk origin in elements, one entry per dataspace dimension.
     offsets: &'a [u64],
+    /// The trailing element-pseudo-dimension offset.
+    ///
+    /// 0 for a data chunk and for the boundary key *between* two nodes, exactly
+    /// as libhdf5 writes them.  The terminal key that closes the rightmost node
+    /// of every level carries `elem_size` here instead: libhdf5 seeds that key
+    /// from the first chunk's scaled coordinate **plus one in every dimension,
+    /// the element dimension included**, so the element offset becomes
+    /// `1 × elem_size`.  It is what keeps the terminal a strict upper bound over
+    /// a chunk whose real offsets equal it (the divisible-grid corner chunk),
+    /// where the real dimensions alone would tie.
+    elem_offset: u64,
 }
 
 /// Write one chunk key at `at`.
 ///
-/// The trailing element-offset dimension is left at 0, which is what libhdf5
-/// writes for a data chunk and what it decodes to a scaled coordinate of 0 for
-/// a boundary key as well.
+/// The trailing element-offset dimension carries [`NodeKey::elem_offset`] — 0
+/// for a data chunk, `elem_size` for a rightmost-node terminal — matching
+/// libhdf5 byte for byte.
 fn write_key(buf: &mut [u8], at: usize, key: NodeKey<'_>) {
     write_u32_le(buf, at, key.nbytes);
     write_u32_le(buf, at + 4, key.filter_mask);
     for (d, &offset) in key.offsets.iter().enumerate() {
         write_u64_le(buf, at + 8 + d * 8, offset);
     }
+    // The element pseudo-dimension sits immediately after the real offsets.
+    write_u64_le(buf, at + 8 + key.offsets.len() * 8, key.elem_offset);
 }
 
 /// Write one chunk B-tree node at `addr`; returns bytes written, always
@@ -339,6 +485,8 @@ const MAX_CHUNKS: usize = 1 << 24;
 pub(super) struct ChunkTree {
     /// Real dataset rank; the key width follows from it.
     ndims: usize,
+    /// Element size in bytes; the terminal key's element pseudo-dimension.
+    elem_size: usize,
     /// Number of chunks the tree indexes.
     n_chunks: usize,
     /// Node count of each level, leaves first; the last is always 1.
@@ -361,7 +509,16 @@ impl ChunkTree {
     ///
     /// Returns `OxiH5Error::Format` if `n_chunks` exceeds [`MAX_CHUNKS`] or the
     /// tree would be deeper than [`MAX_CHUNK_LEVELS`].
-    pub(super) fn plan(ndims: usize, n_chunks: usize) -> Result<Self, OxiH5Error> {
+    ///
+    /// `elem_size` is the dataset element size, carried only so that
+    /// [`ChunkTree::write`] can set the terminal key's element pseudo-dimension
+    /// to it — the one field that lets an even-grid corner chunk still sort
+    /// below the bound that closes its node.
+    pub(super) fn plan(
+        ndims: usize,
+        n_chunks: usize,
+        elem_size: usize,
+    ) -> Result<Self, OxiH5Error> {
         if n_chunks > MAX_CHUNKS {
             return Err(OxiH5Error::Format(format!(
                 "dataset needs {n_chunks} chunks, over the writer's limit of {MAX_CHUNKS}"
@@ -380,6 +537,7 @@ impl ChunkTree {
         }
         Ok(Self {
             ndims,
+            elem_size,
             n_chunks,
             level_addr: vec![0; levels.len()],
             levels,
@@ -449,10 +607,14 @@ impl ChunkTree {
         }
 
         let node_size = chunk_node_size(self.ndims);
+        // The bound that closes the rightmost node of every level: real offsets
+        // from `end_offsets`, and the element pseudo-dimension set to the
+        // element size the way libhdf5 seeds its right key.
         let bound = NodeKey {
             nbytes: 0,
             filter_mask: 0,
             offsets: end_offsets,
+            elem_offset: self.elem_size as u64,
         };
 
         // Level 0's children are the chunks themselves; each level above folds
@@ -464,6 +626,9 @@ impl ChunkTree {
                 nbytes: entry.nbytes,
                 filter_mask: entry.filter_mask,
                 offsets: &entry.offsets,
+                // A data chunk's element pseudo-dimension is always 0; only a
+                // rightmost terminal carries `elem_size`.
+                elem_offset: 0,
             })
             .collect();
 
@@ -509,11 +674,13 @@ impl ChunkTree {
 
                 next_children.push(addr as u64);
                 // A node's own lower bound is its first child's: every chunk
-                // beneath it is at or after that origin.
+                // beneath it is at or after that origin.  A lower bound is a
+                // chunk-side key, so its element pseudo-dimension is 0.
                 next_keys.push(NodeKey {
                     nbytes: 0,
                     filter_mask: 0,
                     offsets: keys.get(lo).map_or(end_offsets, |key| key.offsets),
+                    elem_offset: 0,
                 });
             }
 
@@ -531,6 +698,12 @@ mod tests {
     use crate::write::tree::Storage;
 
     fn chunked(shape: &[usize], chunk_shape: &[usize]) -> DatasetDesc {
+        chunked_with(shape, chunk_shape, true)
+    }
+
+    /// A chunked dataset whose dimension-0 growth flag is chosen explicitly, so
+    /// the fixed-maxshape path can be exercised beside the unlimited one.
+    fn chunked_with(shape: &[usize], chunk_shape: &[usize], unlimited_dim0: bool) -> DatasetDesc {
         DatasetDesc {
             name: "ds".to_string(),
             raw: Vec::new(),
@@ -539,7 +712,7 @@ mod tests {
             attrs: Vec::new(),
             storage: Storage::Chunked {
                 chunk_shape: chunk_shape.to_vec(),
-                unlimited_dim0: false,
+                unlimited_dim0,
             },
             filter: None,
             vlen_strings: None,
@@ -606,6 +779,33 @@ mod tests {
         );
     }
 
+    /// G010/B024: a fixed dimension 0 is policed like any other, so a chunk
+    /// wider than a bounded maxshape is refused — libhdf5 rejects the same
+    /// geometry — while the identical shape with an unlimited dimension 0 is a
+    /// whole-dataset growth tile and is allowed.
+    #[test]
+    fn a_fixed_dimension_zero_refuses_an_oversized_chunk() {
+        let err = chunk_shape_of(&chunked_with(&[4], &[8], false))
+            .expect_err("a chunk wider than a fixed dim0 is illegal");
+        assert!(format!("{err}").contains("fixed dimension 0"), "{err}");
+
+        // Unlimited dim0 keeps the whole-dataset-tile behaviour.
+        assert_eq!(
+            chunk_shape_of(&chunked_with(&[4], &[8], true)).expect("unlimited dim0"),
+            vec![8]
+        );
+        // A fixed dim0 whose chunk fits (or exactly equals the extent) is fine —
+        // this is the ordinary fixed-maxshape tiled dataset.
+        assert_eq!(
+            chunk_shape_of(&chunked_with(&[8], &[2], false)).expect("fixed tiled"),
+            vec![2]
+        );
+        assert_eq!(
+            chunk_shape_of(&chunked_with(&[8], &[8], false)).expect("fixed whole"),
+            vec![8]
+        );
+    }
+
     #[test]
     fn one_chunk_covers_a_whole_dataset() {
         assert_eq!(chunk_origins(&[5, 3], &[5, 3]), vec![vec![0u64, 0]]);
@@ -635,7 +835,20 @@ mod tests {
                 vec![4, 2],
             ]
         );
-        assert_eq!(end_offsets(&[5, 3], &[2, 2]), vec![6u64, 4]);
+        // The terminal reproduces libhdf5's insertion artifact, not the rounded
+        // extent [6, 4]: dimension 0 is ragged so its right key advances to 6,
+        // but dimension 1's never rises past the first chunk's `[…, 1]` seed, so
+        // it stays at one chunk extent — exactly the key h5py writes.
+        assert_eq!(end_offsets(&[5, 3], &[2, 2]), vec![6u64, 2]);
+        // A divisible grid keeps its corner chunk's own real offsets; only the
+        // element pseudo-dimension (added by the writer) makes the bound strict.
+        assert_eq!(end_offsets(&[4, 4], &[2, 2]), vec![2u64, 2]);
+        assert_eq!(end_offsets(&[4, 3, 2], &[2, 2, 2]), vec![2u64, 2, 2]);
+        // 1-D closed form: the last chunk triggers the final advance only when
+        // it lands on an even grid index, so an even chunk count stops one short.
+        assert_eq!(end_offsets(&[100], &[1]), vec![99u64]);
+        assert_eq!(end_offsets(&[3, 7], &[3, 3]), vec![3u64, 3]);
+        assert_eq!(end_offsets(&[7, 3], &[3, 3]), vec![9u64, 3]);
     }
 
     /// Nothing is allocated for a dataset with a zero-length dimension, and the
@@ -658,9 +871,15 @@ mod tests {
     }
 
     /// Plan, place and emit a whole index into a fresh buffer padded with
-    /// `0xAA`, so that a write past the tree is visible.
-    fn build_tree(ndims: usize, entries: &[ChunkEntry], end: &[u64]) -> (Vec<u8>, ChunkTree) {
-        let mut tree = ChunkTree::plan(ndims, entries.len()).expect("plan");
+    /// `0xAA`, so that a write past the tree is visible.  `elem` is the element
+    /// size the terminal key's pseudo-dimension is set to.
+    fn build_tree(
+        ndims: usize,
+        elem: usize,
+        entries: &[ChunkEntry],
+        end: &[u64],
+    ) -> (Vec<u8>, ChunkTree) {
+        let mut tree = ChunkTree::plan(ndims, entries.len(), elem).expect("plan");
         tree.assign(0);
         let mut buf = vec![0xAAu8; tree.bytes() + 16];
         assert_eq!(
@@ -675,7 +894,7 @@ mod tests {
     fn a_node_is_full_width_and_zero_filled_past_its_entries() {
         let ndims = 1usize;
         let total = chunk_node_size(ndims);
-        let (buf, tree) = build_tree(ndims, &[entry(&[0], 0xABCD, 256)], &[4]);
+        let (buf, tree) = build_tree(ndims, 8, &[entry(&[0], 0xABCD, 256)], &[4]);
         assert_eq!(tree.bytes(), total, "one chunk needs one node");
         assert_eq!(tree.root_addr(), 0);
 
@@ -691,7 +910,7 @@ mod tests {
         let key_size = chunk_key_size(ndims);
         assert_eq!(u32::from_le_bytes(buf[24..28].try_into().expect("4")), 256);
         assert_eq!(u64_at(32), 0, "chunk origin");
-        assert_eq!(u64_at(40), 0, "trailing element offset");
+        assert_eq!(u64_at(40), 0, "a data chunk's trailing element offset is 0");
         assert_eq!(u64_at(24 + key_size), 0xABCD, "child = chunk address");
         let terminal = 24 + key_size + CHILD_SIZE;
         assert_eq!(
@@ -699,7 +918,17 @@ mod tests {
             0,
             "the terminal key describes no chunk, so its byte count is 0"
         );
-        assert_eq!(u64_at(terminal + 8), 4, "terminal key = rounded-up extent");
+        assert_eq!(
+            u64_at(terminal + 8),
+            4,
+            "terminal real offset = the passed bound"
+        );
+        assert_eq!(
+            u64_at(terminal + 16),
+            8,
+            "the terminal's trailing element pseudo-dimension carries elem_size, \
+             the way libhdf5 seeds its right key — not 0"
+        );
 
         // Everything past the terminal key is zero, and nothing past the node
         // was touched.
@@ -716,7 +945,7 @@ mod tests {
     #[test]
     fn an_empty_node_carries_no_terminal_key() {
         let total = chunk_node_size(2);
-        let (buf, tree) = build_tree(2, &[], &[0, 0]);
+        let (buf, tree) = build_tree(2, 8, &[], &[0, 0]);
         assert_eq!(tree.bytes(), total, "an empty index is still one node");
         assert_eq!(u16::from_le_bytes([buf[6], buf[7]]), 0);
         assert!(
@@ -727,7 +956,7 @@ mod tests {
 
     #[test]
     fn mismatched_offset_vectors_are_refused() {
-        let mut tree = ChunkTree::plan(2, 1).expect("plan");
+        let mut tree = ChunkTree::plan(2, 1, 8).expect("plan");
         tree.assign(0);
         let mut buf = vec![0u8; tree.bytes()];
 
@@ -753,7 +982,7 @@ mod tests {
     /// wide at the top.
     #[test]
     fn tree_depth_follows_the_chunk_count() {
-        let levels = |n: usize| ChunkTree::plan(1, n).expect("plan").levels;
+        let levels = |n: usize| ChunkTree::plan(1, n, 4).expect("plan").levels;
         assert_eq!(levels(0), vec![1], "an empty index still owns a leaf");
         assert_eq!(levels(1), vec![1]);
         assert_eq!(levels(64), vec![1], "exactly one full leaf");
@@ -762,7 +991,7 @@ mod tests {
         assert_eq!(levels(4097), vec![65, 2, 1]);
 
         // Sizes and the root address follow from the level list.
-        let mut tree = ChunkTree::plan(1, 65).expect("plan");
+        let mut tree = ChunkTree::plan(1, 65, 4).expect("plan");
         tree.assign(1000);
         assert_eq!(tree.bytes(), 3 * chunk_node_size(1));
         assert_eq!(
@@ -771,7 +1000,7 @@ mod tests {
             "the root is the *last* level; pointing the layout message at the \
              first leaf would hide every chunk but the first 64"
         );
-        assert!(ChunkTree::plan(1, MAX_CHUNKS + 1).is_err());
+        assert!(ChunkTree::plan(1, MAX_CHUNKS + 1, 4).is_err());
     }
 
     /// A two-level tree's keys must bracket its children correctly.
@@ -785,7 +1014,7 @@ mod tests {
         let entries: Vec<ChunkEntry> = (0..100u64)
             .map(|i| entry(&[i], 10_000 + i * 8, 8))
             .collect();
-        let (buf, tree) = build_tree(1, &entries, &[100]);
+        let (buf, tree) = build_tree(1, 8, &entries, &[100]);
         assert_eq!(tree.bytes(), 3 * chunk_node_size(1));
 
         let node_size = chunk_node_size(1);
@@ -917,7 +1146,12 @@ mod tests {
             "the terminal key must be the dataset extent, not [0, 0] — an empty \
              search range is what made libhdf5 report the chunk as missing"
         );
-        assert_eq!(u64_at(key1 + 24), 0, "the trailing element offset stays 0");
+        assert_eq!(
+            u64_at(key1 + 24),
+            4,
+            "the terminal key's trailing element pseudo-dimension is elem_size \
+             (i32 = 4 bytes), exactly as libhdf5 writes it — not 0"
+        );
 
         // The chunk really is where its child pointer says, and the node
         // occupies the full width libhdf5 will read.
@@ -972,6 +1206,7 @@ mod tests {
                 nbytes: e.nbytes,
                 filter_mask: e.filter_mask,
                 offsets: &e.offsets,
+                elem_offset: 0,
             })
             .collect();
         let children = vec![0u64; over.len()];
@@ -992,7 +1227,7 @@ mod tests {
         );
 
         // Through the tree, the same 65 chunks simply gain a level.
-        let (_, tree) = build_tree(1, &over, &[65]);
+        let (_, tree) = build_tree(1, 8, &over, &[65]);
         assert_eq!(tree.bytes(), 3 * chunk_node_size(1));
     }
 }

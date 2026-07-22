@@ -2,6 +2,7 @@ use crate::cf;
 use crate::error::NcError;
 use crate::types::NcType;
 use oxih5::{AttrView, Attribute, ByteOrder, Dtype};
+use oxih5_core::Dataspace;
 
 /// A NetCDF dimension (resolved from an HDF5 dimension-scale dataset).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,17 +222,18 @@ impl NcAttribute {
     }
 
     /// Decode this attribute as a vector of f64 values.
+    ///
+    /// The element count is taken from the attribute's **declared dataspace**,
+    /// never from `data.len()`.  An attribute's
+    /// on-disk payload is padded to an 8-byte boundary, so a scalar `f32`
+    /// attribute (4 real bytes, 4 padding bytes) would otherwise decode as two
+    /// elements — a phantom trailing `0.0`.  Sizing from the dataspace decodes
+    /// exactly the declared elements (B014).
     pub fn as_f64(&self) -> Result<Vec<f64>, NcError> {
+        let n = self.n_elems();
         match &self.inner.dtype {
             Dtype::Float { size: 8, order } => {
-                let data = &self.inner.data;
-                if data.len() % 8 != 0 {
-                    return Err(NcError::BadConventionAttribute {
-                        owner: String::new(),
-                        attr: self.name.clone(),
-                        reason: "f64 data length not multiple of 8".into(),
-                    });
-                }
+                let data = self.declared_bytes(n, 8)?;
                 let name = self.name.as_str();
                 match order {
                     ByteOrder::Little => data
@@ -245,14 +247,7 @@ impl NcAttribute {
                 }
             }
             Dtype::Float { size: 4, order } => {
-                let data = &self.inner.data;
-                if data.len() % 4 != 0 {
-                    return Err(NcError::BadConventionAttribute {
-                        owner: String::new(),
-                        attr: self.name.clone(),
-                        reason: "f32 data length not multiple of 4".into(),
-                    });
-                }
+                let data = self.declared_bytes(n, 4)?;
                 let name = self.name.as_str();
                 match order {
                     ByteOrder::Little => data
@@ -274,18 +269,28 @@ impl NcAttribute {
     }
 
     /// Decode this attribute as a vector of i64 values.
+    ///
+    /// The element count is taken from the attribute's **declared dataspace**,
+    /// never from `data.len()`.  Because an
+    /// attribute's payload is padded to an 8-byte boundary, a scalar/odd-count
+    /// integer attribute carries trailing padding bytes; decoding the whole
+    /// buffer (`data.len() / size` chunks) invents phantom elements — e.g. a
+    /// scalar `int32` `_FillValue` (4 real + 4 padding bytes) would yield
+    /// `[value, 0]` instead of `[value]` (B014).  Sizing from the dataspace
+    /// decodes exactly the declared elements.
     pub fn as_i64(&self) -> Result<Vec<i64>, NcError> {
         match &self.inner.dtype {
             Dtype::Int { size, order, .. } => {
                 let sz = *size;
-                let data = &self.inner.data;
-                if sz == 0 || data.len() % sz != 0 {
+                if sz == 0 {
                     return Err(NcError::BadConventionAttribute {
                         owner: String::new(),
                         attr: self.name.clone(),
-                        reason: "int data length not multiple of element size".into(),
+                        reason: "integer element size is zero".into(),
                     });
                 }
+                let n = self.n_elems();
+                let data = self.declared_bytes(n, sz)?;
                 let name = self.name.as_str();
                 data.chunks_exact(sz)
                     .map(|c| decode_int_chunk(c, sz, order, name))
@@ -297,6 +302,45 @@ impl NcAttribute {
                 reason: "attribute dtype is not an integer".into(),
             }),
         }
+    }
+
+    /// Number of elements declared by this attribute's dataspace.
+    ///
+    /// This count — not `data.len()` — is authoritative for decoding.  HDF5 pads
+    /// an attribute's on-disk data payload out to an 8-byte boundary, so
+    /// `data.len()` routinely exceeds `n_elems * element_size`.  Any conversion
+    /// sized from the raw byte length invents phantom trailing elements
+    /// (the B013/B014 class of defect); sizing from the dataspace is correct.
+    fn n_elems(&self) -> usize {
+        match &self.inner.dataspace {
+            Dataspace::Scalar => 1,
+            Dataspace::Null => 0,
+            Dataspace::Simple { dims, .. } => dims.iter().product::<u64>() as usize,
+        }
+    }
+
+    /// Return exactly the first `n_elems * elem_size` bytes of the payload,
+    /// erroring if the declared element count would over-read the buffer.
+    fn declared_bytes(&self, n_elems: usize, elem_size: usize) -> Result<&[u8], NcError> {
+        let needed =
+            n_elems
+                .checked_mul(elem_size)
+                .ok_or_else(|| NcError::BadConventionAttribute {
+                    owner: String::new(),
+                    attr: self.name.clone(),
+                    reason: "attribute element count overflow".into(),
+                })?;
+        self.inner
+            .data
+            .get(..needed)
+            .ok_or_else(|| NcError::BadConventionAttribute {
+                owner: String::new(),
+                attr: self.name.clone(),
+                reason: format!(
+                    "attribute data ({} bytes) shorter than declared {n_elems} × {elem_size} = {needed}",
+                    self.inner.data.len()
+                ),
+            })
     }
 
     /// Return the underlying oxih5 Attribute for escape-hatch access.
@@ -708,5 +752,142 @@ mod tests {
             h5_path: "/count".to_string(),
         };
         assert_eq!(var.nc_type(), NcType::Int32);
+    }
+
+    // -----------------------------------------------------------------------
+    // B014 — as_i64 / as_f64 must decode exactly n_elems (declared dataspace),
+    // never `data.len() / element_size`.  These construct the padded buffers
+    // directly so they hold independently of the oxih5 B013 attr-trim fix
+    // (defense in depth at the model layer).
+    // -----------------------------------------------------------------------
+
+    fn int_attr(name: &str, size: usize, dataspace: Dataspace, data: Vec<u8>) -> NcAttribute {
+        NcAttribute::new(Attribute {
+            name: name.to_string(),
+            dtype: Dtype::Int {
+                size,
+                signed: true,
+                order: ByteOrder::Little,
+            },
+            dataspace,
+            data,
+        })
+    }
+
+    #[test]
+    fn test_as_i64_scalar_i32_padded_no_phantom() {
+        // Scalar int32 _FillValue = -9999 with 4 trailing padding bytes
+        // (the exact B013/B014 shape).  Must decode to a single element.
+        let mut data = (-9999i32).to_le_bytes().to_vec();
+        data.extend_from_slice(&[0, 0, 0, 0]); // 8-byte alignment padding
+        assert_eq!(data.len(), 8);
+        let attr = int_attr("_FillValue", 4, Dataspace::Scalar, data);
+        assert_eq!(
+            attr.as_i64().expect("decode"),
+            vec![-9999],
+            "scalar int32 must not gain a phantom trailing element"
+        );
+    }
+
+    #[test]
+    fn test_as_i64_scalar_i32_exact() {
+        let attr = int_attr(
+            "_FillValue",
+            4,
+            Dataspace::Scalar,
+            (-9999i32).to_le_bytes().to_vec(),
+        );
+        assert_eq!(attr.as_i64().expect("decode"), vec![-9999]);
+    }
+
+    #[test]
+    fn test_as_i64_three_i16_padded() {
+        // 3-element int16 array (6 real bytes) padded to 8 → must decode 3 elems.
+        let mut data = Vec::new();
+        for v in [1i16, 2, 3] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        data.extend_from_slice(&[0, 0]); // pad 6 → 8
+        let attr = int_attr(
+            "widths",
+            2,
+            Dataspace::Simple {
+                dims: vec![3],
+                max_dims: None,
+            },
+            data,
+        );
+        assert_eq!(attr.as_i64().expect("decode"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_as_i64_two_i32_netcdf4coordinates() {
+        // Models a variable's _Netcdf4Coordinates = [1, 2] (8 bytes, aligned).
+        let mut data = 1i32.to_le_bytes().to_vec();
+        data.extend_from_slice(&2i32.to_le_bytes());
+        let attr = int_attr(
+            "_Netcdf4Coordinates",
+            4,
+            Dataspace::Simple {
+                dims: vec![2],
+                max_dims: None,
+            },
+            data,
+        );
+        assert_eq!(attr.as_i64().expect("decode"), vec![1, 2]);
+    }
+
+    #[test]
+    fn test_as_i64_data_too_short_errors() {
+        // Declared 2 elems but only 4 bytes present → typed error, not a panic.
+        let attr = int_attr(
+            "bad",
+            4,
+            Dataspace::Simple {
+                dims: vec![2],
+                max_dims: None,
+            },
+            1i32.to_le_bytes().to_vec(),
+        );
+        assert!(matches!(
+            attr.as_i64(),
+            Err(NcError::BadConventionAttribute { .. })
+        ));
+    }
+
+    #[test]
+    fn test_as_f64_scalar_f32_padded_no_phantom() {
+        // Scalar f32 = 3.5 with 4 trailing padding bytes.  Because 8 % 4 == 0
+        // the old length-based decode returned [3.5, 0.0]; the declared-count
+        // decode returns exactly [3.5].
+        let mut data = 3.5f32.to_le_bytes().to_vec();
+        data.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(data.len(), 8);
+        let attr = NcAttribute::new(Attribute {
+            name: "add_offset".into(),
+            dtype: Dtype::Float {
+                size: 4,
+                order: ByteOrder::Little,
+            },
+            dataspace: Dataspace::Scalar,
+            data,
+        });
+        let got = attr.as_f64().expect("decode");
+        assert_eq!(got.len(), 1, "scalar f32 must decode to one element");
+        assert!((got[0] - 3.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_as_f64_scalar_f64_exact() {
+        let attr = NcAttribute::new(Attribute {
+            name: "add_offset".into(),
+            dtype: Dtype::Float {
+                size: 8,
+                order: ByteOrder::Little,
+            },
+            dataspace: Dataspace::Scalar,
+            data: 3.5f64.to_le_bytes().to_vec(),
+        });
+        assert_eq!(attr.as_f64().expect("decode"), vec![3.5]);
     }
 }

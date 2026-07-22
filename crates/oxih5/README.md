@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/oxih5.svg)](https://crates.io/crates/oxih5)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-`oxih5` is the top-level façade crate of **OxiH5**, the COOLJAPAN Pure-Rust HDF5 reader/writer. It reads real HDF5 files — exactly as written by h5py / libhdf5 — and provides a minimal write path for flat, contiguous datasets, all with **no libhdf5 FFI, no `*-sys` crates, and no C/Fortran dependencies**. It replaces `hdf5-sys` / `hdf5` / `netcdf-sys` on the read path.
+`oxih5` is the top-level façade crate of **OxiH5**, the COOLJAPAN Pure-Rust HDF5 reader/writer. It reads real HDF5 files — exactly as written by h5py / libhdf5 — and provides a full write path (contiguous, compact and chunked/tiled datasets; DEFLATE/shuffle/Fletcher32 filters; custom fill values; fixed-length/vlen strings; booleans; nested groups; the full attribute set), all with **no libhdf5 FFI, no `*-sys` crates, and no C/Fortran dependencies**. Writer output is verified against h5py 3.16 / libhdf5 2.0.0. It replaces `hdf5-sys` / `hdf5` / `netcdf-sys` on the read path.
 
 This crate is the recommended entry point: it wires together [`oxih5-core`] (the data model) and [`oxih5-format`] (the binary parsers) behind a small, ergonomic surface — `open`, `open_mmap`, `read_dataset`, the [`File`] and [`Group`] navigation handles, and the [`FileWriter`] builder. Production read paths are entirely safe Rust; memory-mapped opening uses one localized, audited `unsafe` block (see [`File::open_mmap`]).
 
@@ -11,16 +11,16 @@ This crate is the recommended entry point: it wires together [`oxih5-core`] (the
 
 ```toml
 [dependencies]
-oxih5 = "0.2.1"
+oxih5 = "0.2.2"
 
 # With the ndarray bridge (Dataset::to_array_f32 / _f64 / _i32):
-oxih5 = { version = "0.2.1", features = ["ndarray"] }
+oxih5 = { version = "0.2.2", features = ["ndarray"] }
 
 # With rayon-parallel chunk assembly:
-oxih5 = { version = "0.2.1", features = ["parallel"] }
+oxih5 = { version = "0.2.2", features = ["parallel"] }
 
 # With szip (compression id 4) chunk decoding:
-oxih5 = { version = "0.2.1", features = ["szip"] }
+oxih5 = { version = "0.2.2", features = ["szip"] }
 ```
 
 ## Quick Start

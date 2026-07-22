@@ -69,9 +69,38 @@ impl<'a> AttrView<'a> {
 
     /// Decode a fixed-length string attribute as a `String` (trims NUL padding).
     ///
-    /// Use `as_strings()` for vlen-string or mixed cases.
+    /// Returns `None` for variable-length (vlen) string attributes — the form
+    /// h5py writes by default for `dset.attrs['units'] = 'm'`.  Use
+    /// [`as_str`](Self::as_str) for the general scalar-string accessor that
+    /// handles both fixed-length and vlen strings, or [`as_strings`](Self::as_strings)
+    /// for the array case.
     pub fn as_str_fixed(&self) -> Option<String> {
         self.attr.as_str_fixed()
+    }
+
+    /// Decode a single-element string attribute as a `String`, handling **both**
+    /// fixed-length and variable-length (vlen) string datatypes.
+    ///
+    /// This is the general scalar-string accessor.  h5py writes scalar string
+    /// attributes (`dset.attrs['units'] = 'm'`) and netCDF-C's
+    /// `var.setncattr_string(...)` as *variable-length* strings (HDF5 datatype
+    /// class 9), for which [`as_str_fixed`](Self::as_str_fixed) returns `None`;
+    /// this method resolves the global-heap reference and returns the decoded
+    /// string.  Empty strings and multi-byte UTF-8 are handled.
+    ///
+    /// Returns `None` when the attribute is not a string datatype, or when its
+    /// dataspace holds more than one element (use [`as_strings`](Self::as_strings)
+    /// for arrays of strings).
+    pub fn as_str(&self) -> Option<String> {
+        match &self.attr.dtype {
+            Dtype::String { .. } => {
+                if self.n_elems() != 1 {
+                    return None;
+                }
+                self.as_strings().ok()?.into_iter().next()
+            }
+            _ => None,
+        }
     }
 
     /// Decode this attribute as a vector of strings.
@@ -184,6 +213,133 @@ impl std::fmt::Debug for AttrView<'_> {
 mod tests {
     use super::*;
     use oxih5_core::{ByteOrder, Charset, Dataspace};
+
+    /// Build a minimal `GCOL` global-heap collection holding `objects`
+    /// (index, bytes), starting at offset 0.  Mirrors the on-disk layout
+    /// libhdf5 writes: 16-byte header, then each object as a 16-byte header
+    /// (index, ref-count, reserved, size) followed by data padded to an 8-byte
+    /// boundary, terminated by an index-0 NIL object.
+    fn build_gcol(objects: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GCOL");
+        data.push(1);
+        data.extend_from_slice(&[0u8; 3]);
+        let size_pos = data.len();
+        data.extend_from_slice(&[0u8; 8]);
+        for (idx, obj) in objects {
+            data.extend_from_slice(&idx.to_le_bytes());
+            data.extend_from_slice(&1u16.to_le_bytes());
+            data.extend_from_slice(&[0u8; 4]);
+            data.extend_from_slice(&(obj.len() as u64).to_le_bytes());
+            data.extend_from_slice(obj);
+            let pad = (8 - (data.len() % 8)) % 8;
+            data.extend(std::iter::repeat(0u8).take(pad));
+        }
+        data.extend_from_slice(&[0u8; 16]);
+        let total = data.len() as u64;
+        data[size_pos..size_pos + 8].copy_from_slice(&total.to_le_bytes());
+        data
+    }
+
+    /// Build a 16-byte on-disk vlen-string reference (length, heap addr, index).
+    fn vlen_ref(seq_len: u32, heap_addr: u64, obj_idx: u32) -> Vec<u8> {
+        let mut r = Vec::with_capacity(16);
+        r.extend_from_slice(&seq_len.to_le_bytes());
+        r.extend_from_slice(&heap_addr.to_le_bytes());
+        r.extend_from_slice(&obj_idx.to_le_bytes());
+        r
+    }
+
+    fn vlen_string_attr(refs: Vec<u8>, n: u64) -> Attribute {
+        Attribute {
+            name: "units".into(),
+            dtype: Dtype::String {
+                fixed_len: None,
+                charset: Charset::Utf8,
+            },
+            dataspace: if n == 1 {
+                Dataspace::Scalar
+            } else {
+                Dataspace::Simple {
+                    dims: vec![n],
+                    max_dims: None,
+                }
+            },
+            data: refs,
+        }
+    }
+
+    #[test]
+    fn test_as_str_fixed_scalar() {
+        let attr = Attribute {
+            name: "units".into(),
+            dtype: Dtype::String {
+                fixed_len: Some(8),
+                charset: Charset::Ascii,
+            },
+            dataspace: Dataspace::Scalar,
+            data: b"meters\0\0".to_vec(),
+        };
+        let view = AttrView::new(attr, &[]);
+        assert_eq!(view.as_str(), Some("meters".to_string()));
+    }
+
+    #[test]
+    fn test_as_str_vlen_scalar() {
+        // h5py's default form for `dset.attrs['units'] = 'm'`: a scalar,
+        // variable-length string resolved through the global heap.
+        let heap = build_gcol(&[(1, b"m")]);
+        let attr = vlen_string_attr(vlen_ref(1, 0, 1), 1);
+        let view = AttrView::new(attr, &heap);
+        // as_str_fixed cannot decode a vlen string; as_str must.
+        assert_eq!(view.as_str_fixed(), None);
+        assert_eq!(view.as_str(), Some("m".to_string()));
+    }
+
+    #[test]
+    fn test_as_str_vlen_empty_and_utf8() {
+        let heap = build_gcol(&[(1, "café温度".as_bytes())]);
+        let attr = vlen_string_attr(vlen_ref(11, 0, 1), 1);
+        let view = AttrView::new(attr, &heap);
+        assert_eq!(view.as_str(), Some("café温度".to_string()));
+
+        // Empty vlen string: seq_len 0, no heap lookup.
+        let empty = vlen_string_attr(vlen_ref(0, 0, 0), 1);
+        let view = AttrView::new(empty, &[]);
+        assert_eq!(view.as_str(), Some(String::new()));
+    }
+
+    #[test]
+    fn test_as_str_multi_element_returns_none() {
+        // A 1-D array of vlen strings is not a scalar: as_str returns None,
+        // callers must use as_strings().
+        let heap = build_gcol(&[(1, b"a"), (2, b"bb")]);
+        let mut refs = vlen_ref(1, 0, 1);
+        refs.extend(vlen_ref(2, 0, 2));
+        let attr = vlen_string_attr(refs, 2);
+        let view = AttrView::new(attr, &heap);
+        assert_eq!(view.as_str(), None);
+        assert_eq!(
+            view.as_strings().unwrap(),
+            vec!["a".to_string(), "bb".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_as_str_non_string_returns_none() {
+        let attr = Attribute {
+            name: "count".into(),
+            dtype: Dtype::Int {
+                size: 4,
+                signed: true,
+                order: ByteOrder::Little,
+            },
+            dataspace: Dataspace::Scalar,
+            data: 7i32.to_le_bytes().to_vec(),
+        };
+        let view = AttrView::new(attr, &[]);
+        assert_eq!(view.as_str(), None);
+    }
 
     #[test]
     fn test_attr_view_fixed_strings() {

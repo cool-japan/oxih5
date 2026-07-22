@@ -1,9 +1,14 @@
 # OxiH5 Project TODO
 
-## Status — 0.2.1 (2026-07-21)
+## Status — 0.2.2 (2026-07-22)
 
-Functional read/write HDF5 library (~27.9 k SLOC Rust, 682 tests with
-`--all-features` / 661 with default features, all pass).
+Functional read/write HDF5 library (~26.7 k SLOC Rust in `crates/*/src`, 862
+tests with `--all-features` / 841 with default features + 15 doc tests, all
+pass; clippy `--workspace --all-features --all-targets` clean).
+Files written by `FileWriter` / `NcFileWriter` are verified byte-openable by
+**h5py 3.16 (libhdf5 2.0.0)** and **netCDF4-python 1.7.4** — 0.2.2 landed a
+44-agent differential interop audit (33 conformance defects fixed, 9 writer
+capability gaps closed; see `CHANGELOG.md` and the 0.2.3+ roadmap below).
 Supports superblock v0/v1/v2/v3 (+ v2/v3 superblock extension parsing:
 B-tree K values, shared message table, file space info, driver info via
 `File::superblock_extension()`), object header v1/v2 (+continuation, with
@@ -102,6 +107,92 @@ groups, 2-D partial-edge chunks.  Write support via `FileWriter`.
       rustdoc -D warnings clean; 494 tests pass (`--all-features`) / 473 with
       default features; cargo audit 0 vulnerabilities; cargo +nightly udeps
       0 unused dependencies
+
+### M10 — Write compression, tiling, nested groups (DONE, 0.2.1, 2026-07-21)
+- [x] `set_deflate` DEFLATE-on-write, real N-chunk tiling + per-chunk
+      compression, in-place overwrite (`write_dataset_in_place`), nested groups
+      at any depth, sub-group + non-string/array-valued attributes; 8 write-path
+      correctness bugs fixed (chunk B-tree `2×K` node width, 2-D unlimited
+      mostly-zero read, 9+-link groups unreadable, out-of-name-order links
+      invisible, dataset shadowing a group, dangling objref sentinel, old-style
+      soft links, layout-message v4 unsupported on read). See CHANGELOG 0.2.1.
+
+### M11 — h5py + netCDF4 interop conformance (DONE, 0.2.2, 2026-07-22)
+44-agent differential interop audit; every writer output verified against
+**h5py 3.16 (libhdf5 2.0.0)** and **netCDF4-python 1.7.4**. 33 confirmed
+conformance defects fixed and 9 writer capability gaps closed. 862 tests
+(`--all-features`) / 841 default + 15 doc tests pass; clippy clean.
+- [x] **Global heap (B001/B002/B008/B009):** `H5HG_MINSIZE`=4096 collection
+      floor (power-of-two, cap 65536), real index-0 free-space object (not a
+      size-0 terminator), 32-bit on-disk object index (was `as u16`), vlen
+      lengths `strlen` (were `strlen+1`).
+- [x] **Attribute encoding (B003/B017/B021/B022/R004/R005/R009):** empty scalar
+      fixed-string 1-byte width (was size-0 datatype), vlen strings UTF-8 (was
+      ASCII), fixed strings `NULLPAD` (was `NULLTERM` with no terminator room),
+      duplicate / empty / DIMENSION_LIST-colliding attr names rejected, dtype
+      encoder comments corrected.
+- [x] **Object header (B004/B007/B023/R001/R002/R008):** zero-length contiguous
+      writes the undefined-address sentinel (was defined addr + size 0),
+      fill-value message honoured on read, chunked fill allocation
+      `Incremental(3)` (was `Late(2)`), checked shape/byte arithmetic,
+      `set_deflate` on a scalar rejected up front.
+- [x] **Chunk index (B016/B024/R003/R007):** terminal B-tree v1 key = element
+      size (was 0), chunk extent > fixed dim rejected, `MAX_CHUNKS` guard before
+      materialisation, over-long `chunk_shape` rejected.
+- [x] **Reader (B012/B013/B014/B015):** attr-padding trim (0.2.1 regression),
+      no phantom trailing element (size from dataspace), embedded-NUL names
+      rejected, netCDF-4 (incl. netCDF-C-authored) full round-trip, multi-SNOD
+      + multi-collection vlen enumeration.
+- [x] **netCDF conventions (B005/B010/B011/B018/B019/B020/G002/R006/R010):**
+      `DIMENSION_LIST` as `H5T_VLEN{H5T_REFERENCE}` (was plain `H5T_REFERENCE`
+      array → netCDF-C segfault), `REFERENCE_LIST` on dimension scales,
+      `_Netcdf4Coordinates` on multidim vars, true coordinate variables (no
+      phantom fabricated int32 coords), shared-unlimited-dim vars, size-0 fixed
+      dim, default fill for undefined data, bounded coord allocation.
+- [x] **New writer capabilities (G001/G003/G006/G007/G009/G010/G014/G017):**
+      `set_shuffle` + `set_fletcher32` (+ multi-filter pipelines),
+      `create_fixed_string_dataset`, widened attr types + 1-D arrays +
+      `write_vlen_obj_ref_attr` + `write_ref_index_list_attr`,
+      `write_dataset_bool`, `set_chunking` (fixed-maxshape tiling),
+      `set_fill_value_*`, `set_compact`.
+
+### 0.2.3+ Roadmap — remaining capability gaps
+_All 862 `--all-features` tests pass (no remaining test failures). These are
+writer capability gaps surfaced by the 0.2.2 interop audit but deliberately not
+attempted in 0.2.2; each has a reader that already parses the corresponding
+feature, so round-trip fidelity is the target._
+- [ ] **G004 — compound (structured/record) datatype datasets.** New class-6
+      datatype encoder (member name+offset+inline type), an API to declare
+      fields and hand row bytes; backs pandas HDFStore tables and event records.
+- [ ] **G005 — resize/append after creation + modify-existing-file mode.**
+      `FileWriter` is build-once; `write_dataset_in_place` (0.2.1) covers only
+      same-size overwrite. Need extend-dataset and open-append.
+- [ ] **G007 (remainder) — scaleoffset / nbit / szip filters on write.**
+      Fletcher32 + shuffle + deflate shipped in 0.2.2; the other three read-side
+      filters still have no write path.
+- [ ] **G008 — big-endian datasets and attributes.** Writer is little-endian
+      only; the reader already decodes BE. Also covers ≥2-D and big-endian
+      *attributes* (the part of G006 not closed in 0.2.2).
+- [ ] **G009 (remainder) — arbitrary enum datatype datasets.** numpy `bool`
+      shipped in 0.2.2 as a class-8 enum; general enums (arbitrary member
+      name/value tables over any base type) remain.
+- [ ] **G011 — soft / external / hard-alias link creation on write.** The reader
+      resolves all three (incl. soft→external chains); no writer path exists.
+- [ ] **G012 — half-precision (float16) datasets.** `f16_to_f32` exists on read;
+      no `write_dataset_f16`.
+- [ ] **G013 — new-style (link-message) groups + creation-order / `track_order`
+      preservation on write.** Writer emits only old-style symbol-table groups.
+- [ ] **G015 — variable-length non-string (ragged) sequence datasets.** Reader
+      has `dataset_vlen_sequences`; no writer counterpart.
+- [ ] **G016 — array / opaque / bitfield datatype datasets.** Rejected at the
+      writer's catch-all arm; all three parse on read.
+- [ ] **G018 — virtual dataset (VDS) write.** VDS reads shipped in 0.1.4; no
+      write path for the mapping/global-heap block.
+- [ ] **G019 — region-reference datasets and attributes.** Object references
+      write; region references do not.
+- [ ] **Read-side known limitations (carried from 0.2.1):** extensible-array
+      chunk indexes decode to a typed `NotImplemented`; hyperslab selections
+      with `block > 1` drop elements on chunked datasets.
 
 ---
 

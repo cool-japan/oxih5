@@ -205,11 +205,22 @@ pub(crate) fn read_dataset_from_object_header(
     let mut datatype = None;
     let mut layout = None;
     let mut filter_pipeline = None;
+    let mut fill_value: Option<Vec<u8>> = None;
 
     for msg in &ds_messages {
         match msg.msg_type {
             0x0001 => dataspace = Some(message::parse_dataspace(&msg.data)?),
             0x0003 => datatype = Some(message::parse_datatype(&msg.data)?),
+            // The fill value is what a chunked dataset reads back in the gaps
+            // between allocated chunks; without it, sparse chunks would read as
+            // zeros instead of the declared fill.  The hyperslab read path
+            // (`slicing.rs`) already threads this through — parse it here too so
+            // the full read agrees.
+            0x0005 => {
+                if let Ok(fv) = message::parse_fill_value(&msg.data) {
+                    fill_value = fv;
+                }
+            }
             0x0008 => layout = Some(message::parse_layout(&msg.data)?),
             0x000B => filter_pipeline = Some(message::parse_filter_pipeline(&msg.data)?),
             _ => {}
@@ -232,15 +243,25 @@ pub(crate) fn read_dataset_from_object_header(
             data_address,
             data_size,
         } => {
-            let data_off = *data_address as usize;
             let data_sz = *data_size as usize;
-            if data_off + data_sz > file_data.len() {
-                return Err(OxiH5Error::Format(format!(
-                    "dataset '{name}': data at {data_off}+{data_sz} exceeds file size {}",
-                    file_data.len()
-                )));
+            // An empty contiguous dataset has no allocated storage: libhdf5 (and
+            // oxih5 since the B004 fix) records the undefined address
+            // (`u64::MAX`) with size 0.  Dereferencing that address would run off
+            // the file, so return an empty buffer without touching it.  This also
+            // keeps reading the older oxih5 files that stored a defined (aliasing)
+            // address with size 0.
+            if data_sz == 0 {
+                Vec::new()
+            } else {
+                let data_off = *data_address as usize;
+                if data_off + data_sz > file_data.len() {
+                    return Err(OxiH5Error::Format(format!(
+                        "dataset '{name}': data at {data_off}+{data_sz} exceeds file size {}",
+                        file_data.len()
+                    )));
+                }
+                file_data[data_off..data_off + data_sz].to_vec()
             }
-            file_data[data_off..data_off + data_sz].to_vec()
         }
         LayoutInfo::Compact { data } => data.clone(),
         LayoutInfo::Chunked { .. } => {
@@ -262,7 +283,7 @@ pub(crate) fn read_dataset_from_object_header(
                 &pipeline,
                 &dataset_dims,
                 elem_size,
-                None,
+                fill_value.as_deref(),
                 cache,
             )?
         }

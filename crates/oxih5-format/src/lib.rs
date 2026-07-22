@@ -67,5 +67,8 @@ pub mod vds;
 
 pub use chunked::ChunkIndexCache;
 pub use chunked_hyperslab::{gather_hyperslab_contiguous, read_chunked_hyperslab};
-pub use global_heap_writer::{GlobalHeapRef, GlobalHeapWriter};
+pub use global_heap_writer::{
+    GlobalHeapRef, GlobalHeapWriter, HeapObjectLocation, H5HG_MAXSIZE, H5HG_MINSIZE,
+    MAX_OBJECTS_PER_COLLECTION,
+};
 pub use hyperslab::{DimSelection, Hyperslab};

@@ -291,9 +291,15 @@ pub fn parse_layout(body: &[u8]) -> Result<LayoutInfo, OxiH5Error> {
             let data_address = read_u64_le(body, 2)?;
             let data_size = read_u64_le(body, 10)?;
 
-            if data_address == u64::MAX {
+            // An undefined address (`H5_ADDR_UNDEF`) paired with size 0 is the
+            // canonical libhdf5 encoding of an EMPTY contiguous dataset — accept
+            // it and let the reader return an empty buffer.  An undefined address
+            // with a non-zero size means storage was never allocated, which oxih5
+            // cannot materialise, so that stays an error.
+            if data_address == u64::MAX && data_size != 0 {
                 return Err(OxiH5Error::Format(
-                    "layout: data address is undefined (u64::MAX)".to_string(),
+                    "layout: data address is undefined (u64::MAX) for a non-empty dataset"
+                        .to_string(),
                 ));
             }
 
@@ -384,9 +390,12 @@ pub fn parse_layout(body: &[u8]) -> Result<LayoutInfo, OxiH5Error> {
             // V1 contiguous: data_address at body[8], data_size at body[16]
             let data_address = read_u64_le(body, 8)?;
             let data_size = read_u64_le(body, 16)?;
-            if data_address == u64::MAX {
+            // As in the v3/v4 branch, an undefined address with size 0 is an
+            // empty dataset; only a non-zero size with no address is an error.
+            if data_address == u64::MAX && data_size != 0 {
                 return Err(OxiH5Error::Format(
-                    "layout v1: data address is undefined (u64::MAX)".to_string(),
+                    "layout v1: data address is undefined (u64::MAX) for a non-empty dataset"
+                        .to_string(),
                 ));
             }
             Ok(LayoutInfo::Contiguous {
@@ -799,6 +808,55 @@ pub fn parse_filter_pipeline(body: &[u8]) -> Result<FilterPipeline, OxiH5Error> 
 // Attribute (message type 0x000C)
 // ---------------------------------------------------------------------------
 
+/// On-disk footprint, in bytes, of a single element of an attribute value.
+///
+/// Fixed-size datatypes report their exact width through [`Dtype::size`].
+/// Variable-length datatypes — vlen sequences and variable-length strings —
+/// are stored as a fixed-size global-heap reference
+/// (`length(4) + heap collection address(8) + heap object index(4)`), so their
+/// on-disk footprint is 16 bytes even though [`Dtype::size`] returns `None`.
+const VLEN_ATTR_ELEM_FOOTPRINT: usize = 16;
+
+fn attr_elem_footprint(dtype: &Dtype) -> usize {
+    dtype.size().unwrap_or(VLEN_ATTR_ELEM_FOOTPRINT)
+}
+
+/// Number of value elements described by an attribute dataspace.
+///
+/// A scalar dataspace holds exactly one element, a null dataspace none, and a
+/// simple dataspace the product of its dimensions.
+fn attr_elem_count(dataspace: &Dataspace) -> usize {
+    match dataspace {
+        Dataspace::Scalar => 1,
+        Dataspace::Null => 0,
+        Dataspace::Simple { dims, .. } => dims.iter().product::<u64>() as usize,
+    }
+}
+
+/// Length, in bytes, of the attribute value payload within the remaining
+/// message body.
+///
+/// A v1 attribute message shares the object header's 8-byte message alignment,
+/// so the writer pads the whole message — and therefore its declared size — up
+/// to a multiple of 8.  When the raw payload is not itself a multiple of 8 the
+/// trailing `(8 - data%8) % 8` alignment bytes belong to no field, yet the
+/// message body handed to the parser still contains them.  The true payload
+/// length is `element count x element footprint`; anything beyond that is
+/// padding and must be trimmed off so raw-data consumers do not see phantom
+/// elements.
+///
+/// When the computed length exceeds the bytes actually present — a malformed or
+/// unexpected file — the lenient behaviour of taking every remaining byte is
+/// kept, so this never reads past the message body.
+fn attr_payload_len(dtype: &Dtype, dataspace: &Dataspace, remaining: usize) -> usize {
+    let n_elems = attr_elem_count(dataspace);
+    let elem = attr_elem_footprint(dtype);
+    match n_elems.checked_mul(elem) {
+        Some(len) if len <= remaining => len,
+        _ => remaining,
+    }
+}
+
 /// Parse an attribute message body, returning a fully decoded `Attribute`.
 pub fn parse_attribute(body: &[u8]) -> Result<Attribute, OxiH5Error> {
     if body.is_empty() {
@@ -869,8 +927,12 @@ fn parse_attribute_v1(body: &[u8]) -> Result<Attribute, OxiH5Error> {
     let dataspace = parse_dataspace_rich(&body[pos..pos + dspace_size])?;
     pos += dspace_padded;
 
-    // Remaining bytes = attribute value data
-    let data = body[pos..].to_vec();
+    // The attribute value is `element count x element footprint` bytes; the rest
+    // of the message body is object-header 8-byte alignment padding (the writer
+    // declares the *padded* message size), so trim it off instead of folding it
+    // into the value.
+    let data_len = attr_payload_len(&dtype, &dataspace, body.len() - pos);
+    let data = body[pos..pos + data_len].to_vec();
 
     Ok(Attribute {
         name,
@@ -1304,6 +1366,172 @@ mod tests {
     fn test_parse_attribute_unsupported_version() {
         let body = vec![5u8, 0, 0, 0, 0, 0, 0, 0];
         assert!(parse_attribute(&body).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // B013: v1 attribute value must be trimmed to `n_elems * elem_size`, never
+    // fold the object-header 8-byte alignment padding into the value.
+    // -----------------------------------------------------------------------
+
+    /// A fixed-length ASCII string datatype message body of `len` bytes.
+    fn build_fixed_string_dtype_body(len: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 8];
+        b[0] = (1u8 << 4) | 3; // version=1, class=3 (string)
+        b[1] = 0; // strpad = nullterm, charset = ASCII
+        b[4..8].copy_from_slice(&len.to_le_bytes());
+        b
+    }
+
+    /// A variable-length string datatype message body (class 9, string kind),
+    /// whose on-disk element is a 16-byte global-heap reference.
+    fn build_vlen_string_dtype_body() -> Vec<u8> {
+        let mut b = vec![
+            (1u8 << 4) | 9, // version=1, class=9 (vlen)
+            0x01,           // bit_fields[0] = 1 (string)
+            0,
+            0,
+        ];
+        b.extend_from_slice(&16u32.to_le_bytes()); // size field
+                                                   // inline base: ASCII string, size 1
+        b.extend_from_slice(&[(1u8 << 4) | 3, 0, 0, 0]);
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b
+    }
+
+    /// Build a v1 attribute message body, appending `trailing_pad` zero bytes
+    /// after the value to simulate the object header's whole-message 8-byte
+    /// alignment padding (which `header.rs` includes in the sliced body).
+    fn build_v1_attr_body(
+        name: &[u8],
+        dtype_body: &[u8],
+        dspace_body: &[u8],
+        value: &[u8],
+        trailing_pad: usize,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(1u8); // version
+        body.push(0u8); // reserved
+        body.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        body.extend_from_slice(&(dtype_body.len() as u16).to_le_bytes());
+        body.extend_from_slice(&(dspace_body.len() as u16).to_le_bytes());
+        body.extend_from_slice(name);
+        body.extend_from_slice(dtype_body);
+        body.extend_from_slice(dspace_body);
+        body.extend_from_slice(value);
+        body.extend_from_slice(&vec![0u8; trailing_pad]);
+        body
+    }
+
+    #[test]
+    fn b013_v1_trims_i32_scalar_alignment_padding() {
+        // A 4-byte i32 value padded up to the message's 8-byte boundary: the
+        // parser must return exactly the 4 value bytes, not 8.
+        let body = build_v1_attr_body(
+            b"attr\x00\x00\x00\x00",
+            &build_int32_dtype_body(),
+            &build_scalar_dataspace_body(),
+            &(-9999i32).to_le_bytes(),
+            4, // 4 alignment bytes fold in without the trim
+        );
+        let attr = parse_attribute(&body).unwrap();
+        assert_eq!(attr.data, (-9999i32).to_le_bytes().to_vec());
+        assert_eq!(attr.data.len(), 4, "i32 attr payload must be 4 bytes");
+        assert_eq!(attr.as_i64(), Some(-9999));
+    }
+
+    #[test]
+    fn b013_v1_trims_fixed_string_alignment_padding() {
+        // "meters" is 6 bytes → 2 alignment bytes; the value must come back as
+        // exactly the 6 characters.
+        let body = build_v1_attr_body(
+            b"units\x00\x00\x00",
+            &build_fixed_string_dtype_body(6),
+            &build_scalar_dataspace_body(),
+            b"meters",
+            2,
+        );
+        let attr = parse_attribute(&body).unwrap();
+        assert_eq!(attr.data, b"meters".to_vec());
+        assert_eq!(attr.data.len(), 6);
+    }
+
+    #[test]
+    fn b013_v1_trims_i32_array_alignment_padding() {
+        // Three i32 elements = 12 bytes, padded to 16; must trim to 12.
+        let dspace = vec![1u8, 1, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0]; // v1, 1-D, dim=3
+        let value: Vec<u8> = [7i32, 8, 9].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let body = build_v1_attr_body(
+            b"arr\x00\x00\x00\x00\x00",
+            &build_int32_dtype_body(),
+            &dspace,
+            &value,
+            4,
+        );
+        let attr = parse_attribute(&body).unwrap();
+        assert_eq!(attr.data.len(), 12);
+        assert_eq!(attr.data, value);
+    }
+
+    #[test]
+    fn b013_v1_vlen_string_element_footprint_is_16() {
+        // A variable-length string attribute stores a 16-byte global-heap
+        // reference per element.  `Dtype::size` returns `None` for vlen, so the
+        // trim must fall back to 16 — not truncate the reference to nothing.
+        let gheap_ref = [0xAAu8; 16];
+        let body = build_v1_attr_body(
+            b"vl\x00\x00\x00\x00\x00\x00",
+            &build_vlen_string_dtype_body(),
+            &build_scalar_dataspace_body(),
+            &gheap_ref,
+            0, // 16 is already 8-aligned; no padding, and none must be stolen
+        );
+        let attr = parse_attribute(&body).unwrap();
+        assert!(matches!(
+            attr.dtype,
+            Dtype::String {
+                fixed_len: None,
+                ..
+            }
+        ));
+        assert_eq!(attr.data.len(), 16, "vlen ref must stay 16 bytes");
+        assert_eq!(attr.data, gheap_ref.to_vec());
+    }
+
+    #[test]
+    fn b013_v1_lenient_when_value_shorter_than_declared() {
+        // A malformed file whose declared element count exceeds the bytes
+        // present must not over-read: keep whatever remains.
+        let body = build_v1_attr_body(
+            b"attr\x00\x00\x00\x00",
+            &build_int32_dtype_body(),
+            &build_scalar_dataspace_body(),
+            &[0x01u8, 0x02], // only 2 bytes for a 4-byte i32
+            0,
+        );
+        let attr = parse_attribute(&body).unwrap();
+        assert_eq!(attr.data, vec![0x01, 0x02]);
+    }
+
+    #[test]
+    fn b013_v2_scalar_i32_unaffected() {
+        // v2/v3 bodies carry no whole-message padding, so the value is already
+        // exact; the reader must leave it untouched.
+        let name = b"speed\x00";
+        let dtype_body = build_int32_dtype_body();
+        let dspace_body = build_scalar_dataspace_body();
+        let value = 99i32.to_le_bytes();
+        let mut body = Vec::new();
+        body.push(2u8);
+        body.push(0u8);
+        body.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        body.extend_from_slice(&(dtype_body.len() as u16).to_le_bytes());
+        body.extend_from_slice(&(dspace_body.len() as u16).to_le_bytes());
+        body.extend_from_slice(name);
+        body.extend_from_slice(&dtype_body);
+        body.extend_from_slice(&dspace_body);
+        body.extend_from_slice(&value);
+        let attr = parse_attribute(&body).unwrap();
+        assert_eq!(attr.data, value.to_vec());
     }
 
     // -----------------------------------------------------------------------

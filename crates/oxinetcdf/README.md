@@ -68,7 +68,7 @@ w.close("out.nc")?;
 - Pure Rust: no `libnetcdf`, no `libhdf5`, no C/C++ dependencies in default features.
 - All compression via `oxiarc-deflate` / `oxiarc-szip` (COOLJAPAN policy).
 - No `unwrap()` in production code paths.
-- **72 tests passing** (`cargo nextest run -p oxinetcdf --all-features`).
+- **118 tests passing** (`cargo nextest run -p oxinetcdf --all-features`; 117 with default features) · 3 doc tests. Files written by `NcFileWriter` are verified openable by netCDF4-python 1.7.4.
 
 ---
 
