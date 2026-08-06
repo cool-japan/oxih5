@@ -13,10 +13,10 @@ This crate sits between [`oxih5-core`] (the data model) and the [`oxih5`] facade
 
 ```toml
 [dependencies]
-oxih5-format = "0.2.3"
+oxih5-format = "0.2.4"
 
 # Optional: rayon-parallel chunk assembly
-oxih5-format = { version = "0.2.3", features = ["parallel"] }
+oxih5-format = { version = "0.2.4", features = ["parallel"] }
 ```
 
 ## Quick Start

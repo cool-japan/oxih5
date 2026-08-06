@@ -1,6 +1,6 @@
 # OxiH5 Project TODO
 
-## Status — 0.2.3 (2026-08-06)
+## Status — 0.2.4 (2026-08-06)
 
 Functional read/write HDF5 library (~31.1 k SLOC Rust in `crates/*/src`, 987
 tests with `--all-features` / 966 with default features + 21 doc tests, all

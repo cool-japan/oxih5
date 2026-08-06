@@ -11,16 +11,16 @@ This crate is the recommended entry point: it wires together [`oxih5-core`] (the
 
 ```toml
 [dependencies]
-oxih5 = "0.2.3"
+oxih5 = "0.2.4"
 
 # With the ndarray bridge (Dataset::to_array_f32 / _f64 / _i32):
-oxih5 = { version = "0.2.3", features = ["ndarray"] }
+oxih5 = { version = "0.2.4", features = ["ndarray"] }
 
 # With rayon-parallel chunk assembly:
-oxih5 = { version = "0.2.3", features = ["parallel"] }
+oxih5 = { version = "0.2.4", features = ["parallel"] }
 
 # With szip (compression id 4) chunk decoding:
-oxih5 = { version = "0.2.3", features = ["szip"] }
+oxih5 = { version = "0.2.4", features = ["szip"] }
 ```
 
 ## Quick Start
