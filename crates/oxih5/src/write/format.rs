@@ -176,15 +176,41 @@ pub(super) fn write_local_heap(
 // SNOD — Symbol Table Node
 // ---------------------------------------------------------------------------
 
+/// What one symbol table entry says about its link.
+///
+/// A version-1 symbol table entry has no link-type field.  What it has is a
+/// *cache type*, and that one number is how the format distinguishes a plain
+/// object from a group from a soft link — so the three cases are one enum here
+/// rather than an address plus a flag that can disagree with it.
+pub(super) enum SnodValue {
+    /// Cache type 0: a plain object at this header address, nothing cached.
+    Object(u64),
+    /// Cache type 1: a group at this header address, with its own B-tree and
+    /// local heap cached in the scratch pad so a reader can descend without
+    /// first parsing the group's Symbol Table message.
+    Group {
+        /// Object-header address of the sub-group.
+        oh_addr: u64,
+        /// The sub-group's symbol table B-tree root.
+        btree_addr: u64,
+        /// The sub-group's local heap header.
+        heap_addr: u64,
+    },
+    /// Cache type 2: a **soft link**.  It has no object header at all, so the
+    /// address field carries the undefined-address sentinel and the scratch pad
+    /// carries the offset of the target path within *this* group's local heap.
+    SoftLink {
+        /// Byte offset of the NUL-terminated target path in the local heap.
+        link_value_offset: u32,
+    },
+}
+
 /// One symbol table entry.
 pub(super) struct SnodEntry {
     /// Offset of the link name within the enclosing local heap.
     pub(super) name_offset: u64,
-    /// Object-header address of the linked object.
-    pub(super) oh_addr: u64,
-    /// Present for groups only (`cache_type = 1`): the group's own B-tree and
-    /// local heap addresses, cached in the entry's scratch pad.
-    pub(super) group_cache: Option<(u64, u64)>,
+    /// What the entry links to, and how the cache type says so.
+    pub(super) value: SnodValue,
 }
 
 /// Write a SNOD holding `entries`; returns bytes written, always
@@ -226,14 +252,36 @@ pub(super) fn write_snod(
     for (i, entry) in entries.iter().enumerate() {
         let ste = snod_addr + SNOD_PREFIX + i * STE_SIZE;
         write_u64_le(buf, ste, entry.name_offset);
-        write_u64_le(buf, ste + 8, entry.oh_addr);
-        if let Some((btree_addr, heap_addr)) = entry.group_cache {
-            write_u32_le(buf, ste + 16, 1); // cache_type = 1 (group)
-            write_u32_le(buf, ste + 20, 0); // reserved
-            write_u64_le(buf, ste + 24, btree_addr); // scratch: B-tree addr
-            write_u64_le(buf, ste + 32, heap_addr); // scratch: local heap addr
+        match entry.value {
+            SnodValue::Object(oh_addr) => {
+                write_u64_le(buf, ste + 8, oh_addr);
+                // cache_type = 0 and an all-zero scratch pad.
+            }
+            SnodValue::Group {
+                oh_addr,
+                btree_addr,
+                heap_addr,
+            } => {
+                write_u64_le(buf, ste + 8, oh_addr);
+                write_u32_le(buf, ste + 16, 1); // cache_type = 1 (group)
+                write_u32_le(buf, ste + 20, 0); // reserved
+                write_u64_le(buf, ste + 24, btree_addr); // scratch: B-tree addr
+                write_u64_le(buf, ste + 32, heap_addr); // scratch: local heap addr
+            }
+            SnodValue::SoftLink { link_value_offset } => {
+                // A soft link has no object header; libhdf5 writes the
+                // undefined-address sentinel here and reads a *defined* address
+                // beside cache type 2 as corruption.
+                write_u64_le(buf, ste + 8, u64::MAX);
+                write_u32_le(buf, ste + 16, 2); // cache_type = 2 (symbolic link)
+                write_u32_le(buf, ste + 20, 0); // reserved
+                                                // The scratch pad's first four
+                                                // bytes are the link value's
+                                                // offset into the local heap;
+                                                // the remaining twelve stay zero.
+                write_u32_le(buf, ste + 24, link_value_offset);
+            }
         }
-        // cache_type = 0 and an all-zero scratch pad for plain objects.
     }
 
     Ok(total)
@@ -279,13 +327,15 @@ mod tests {
         let entries = vec![
             SnodEntry {
                 name_offset: 8,
-                oh_addr: 0x1000,
-                group_cache: None,
+                value: SnodValue::Object(0x1000),
             },
             SnodEntry {
                 name_offset: 16,
-                oh_addr: 0x2000,
-                group_cache: Some((0x3000, 0x4000)),
+                value: SnodValue::Group {
+                    oh_addr: 0x2000,
+                    btree_addr: 0x3000,
+                    heap_addr: 0x4000,
+                },
             },
         ];
         let wrote = write_snod(&mut buf, 0, &entries).expect("write_snod");
@@ -301,14 +351,43 @@ mod tests {
         assert!(buf[88..].iter().all(|&b| b == 0));
     }
 
+    /// Byte-pinned against the symbol table entry libhdf5 2.0.0 wrote for
+    /// `f['soft'] = h5py.SoftLink('/d')`: an undefined object header address,
+    /// cache type 2, and the heap offset of the target path in the first four
+    /// bytes of the scratch pad.
+    #[test]
+    fn a_soft_link_entry_matches_libhdf5() {
+        let mut buf = vec![0u8; SNOD_SIZE];
+        let entries = vec![SnodEntry {
+            name_offset: 16,
+            value: SnodValue::SoftLink {
+                link_value_offset: 24,
+            },
+        }];
+        write_snod(&mut buf, 0, &entries).expect("write_snod");
+
+        assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 16);
+        assert_eq!(
+            u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+            u64::MAX,
+            "a soft link has no object header"
+        );
+        assert_eq!(u32::from_le_bytes(buf[24..28].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(buf[28..32].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(buf[32..36].try_into().unwrap()), 24);
+        assert!(
+            buf[36..48].iter().all(|&b| b == 0),
+            "the rest of the scratch pad stays zero"
+        );
+    }
+
     #[test]
     fn snod_rejects_more_entries_than_one_node_can_hold() {
         let mut buf = vec![0u8; SNOD_SIZE];
         let entries: Vec<SnodEntry> = (0..SNOD_MAX_ENTRIES + 1)
             .map(|_| SnodEntry {
                 name_offset: 0,
-                oh_addr: 0,
-                group_cache: None,
+                value: SnodValue::Object(0),
             })
             .collect();
         assert!(write_snod(&mut buf, 0, &entries).is_err());

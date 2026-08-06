@@ -1,0 +1,8 @@
+# clippy configuration for the OxiH5 workspace.
+#
+# `msrv` matches `workspace.package.rust-version` in the top-level
+# `Cargo.toml`. Pinning it here activates `clippy::incompatible_msrv` and
+# related MSRV-aware lints, so a contributor's editor/CI flags a std API that
+# was stabilized after 1.80 before it ships, instead of silently raising the
+# workspace's real minimum supported Rust version.
+msrv = "1.80"

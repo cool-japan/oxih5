@@ -30,12 +30,21 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// Copy a fixture to a fresh temp path, or `None` when it was never generated.
+/// Copy a fixture to a fresh temp path.
+///
+/// Every name passed to this helper names a fixture tracked in git under
+/// `tests/fixtures/`, so a missing source file means a broken checkout, not
+/// an environment where the caller should be silently skipped — fail loudly
+/// instead of vacuously passing. The `Option` return is kept so call sites
+/// (`let Some(path) = fixture_copy(...) else { return };`) do not need to
+/// change; the `else` branch is now unreachable in practice.
 fn fixture_copy(name: &str, tag: &str) -> Option<PathBuf> {
     let src = fixture(name);
-    if !src.exists() {
-        return None;
-    }
+    assert!(
+        src.exists(),
+        "fixture {name} missing at {} — it is tracked in git",
+        src.display()
+    );
     let dst = tmp_path(tag);
     std::fs::copy(&src, &dst).expect("copy fixture to temp");
     Some(dst)

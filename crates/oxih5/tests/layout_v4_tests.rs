@@ -21,9 +21,13 @@ fn fixture(name: &str) -> PathBuf {
 
 fn open_fixture() -> Option<oxih5::File> {
     let path = fixture("layout_v4.h5");
-    if !path.exists() {
-        return None;
-    }
+    // Tracked in git (`tests/fixtures/layout_v4.h5`) — a missing file means a
+    // broken checkout and must fail every caller loudly, not silently skip.
+    assert!(
+        path.exists(),
+        "fixture layout_v4.h5 missing at {} — it is tracked in git",
+        path.display()
+    );
     Some(oxih5::open(&path).expect("open layout_v4.h5"))
 }
 
@@ -109,34 +113,23 @@ fn layout_v4_chunked_fixed_array() {
 
 /// Index type 4 — extensible array (exactly one unlimited dimension).
 ///
-/// The *layout message* now decodes correctly: the extensible-array index
-/// carries five creation-parameter bytes between the index-type byte and the
-/// index address, and the extensible-array header's index-block address sits
-/// after six 8-byte counters.  Both of those were wrong before and produced a
-/// nonsense address.
-///
-/// What is still missing is the element decoding: a real extensible array
-/// stores 8-byte bare chunk addresses (or, when filtered, address + a
-/// variable-width stored size + filter mask), and derives each chunk's position
-/// from its linear index — whereas this crate's parser expects each element to
-/// be a self-describing record.  That is reported as a typed `NotImplemented`
-/// rather than decoded speculatively; see the note in `ea_index.rs`.
+/// Two things had to be right for this to decode: the layout message carries
+/// five creation-parameter bytes between the index-type byte and the index
+/// address, and the extensible-array header's index-block address sits after
+/// six 8-byte statistics counters.  Beyond that, the elements are not
+/// self-describing — an unfiltered array stores a bare 8-byte chunk address and
+/// the position comes from the element's linear index — so the reader has to
+/// hand the chunk geometry to `ea_index`.  `tests/ea_index_tests.rs` covers the
+/// rest of the structure; this asserts the fixture every other v4 index type is
+/// checked against.
 #[test]
-fn layout_v4_chunked_extensible_array_is_reported_unsupported() {
+fn layout_v4_chunked_extensible_array() {
     let Some(file) = open_fixture() else { return };
-    match file.dataset("chunk_ea") {
-        Err(oxih5::OxiH5Error::NotImplemented(msg)) => {
-            assert!(
-                msg.contains("extensible array"),
-                "the error must name the index type: {msg}"
-            );
-        }
-        Err(other) => panic!("expected a typed NotImplemented, got: {other:?}"),
-        Ok(_) => panic!(
-            "extensible-array element decoding is not implemented; if this now succeeds, \
-             replace this test with a real value assertion"
-        ),
-    }
+    let ds = file
+        .dataset("chunk_ea")
+        .expect("read extensible-array chunked");
+    assert_eq!(ds.shape, vec![10]);
+    assert_eq!(ds.as_i32().expect("i32"), (0..10).collect::<Vec<i32>>());
 }
 
 /// Index type 5 — version-2 B-tree (two or more unlimited dimensions).
@@ -208,8 +201,6 @@ fn layout_v4_chunked_wide_dimension_encoding() {
 fn layout_v4_all_datasets_listed_and_readable() {
     let Some(file) = open_fixture() else { return };
     let names = file.dataset_names().expect("list root datasets");
-    // `chunk_ea` is listed but not yet decodable — see
-    // `layout_v4_chunked_extensible_array_is_reported_unsupported`.
     for expected in [
         "contig",
         "contig2d",
@@ -227,19 +218,6 @@ fn layout_v4_all_datasets_listed_and_readable() {
             names.iter().any(|n| n == expected),
             "expected '{expected}' in {names:?}"
         );
-    }
-    for expected in [
-        "contig",
-        "contig2d",
-        "scalar",
-        "compact",
-        "chunk_fa",
-        "chunk_bt2",
-        "chunk_single",
-        "chunk_single_gzip",
-        "chunk_implicit",
-        "chunk_wide",
-    ] {
         file.dataset(expected)
             .unwrap_or_else(|e| panic!("dataset '{expected}' must be readable: {e}"));
     }

@@ -1108,10 +1108,13 @@ fn test_libver_latest_large_read_dataset() {
 #[test]
 fn test_vds_resolves_source() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vds_main.h5");
-    if !path.exists() {
-        // VDS fixture not generated — skip gracefully
-        return;
-    }
+    // Tracked in git (`tests/fixtures/vds_main.h5`) — a missing file means a
+    // broken checkout and must fail the test loudly, not skip it silently.
+    assert!(
+        path.exists(),
+        "fixture vds_main.h5 missing at {} — it is tracked in git",
+        path.display()
+    );
     let file = oxih5::open(&path).expect("open VDS file");
     let ds = file.dataset("virtual_data").expect("resolve VDS");
     let values = ds.as_f32().expect("f32 values");

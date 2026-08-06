@@ -37,6 +37,66 @@ pub fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(f32_bits)
 }
 
+/// Software encode of an f32 to an IEEE 754 half-precision float (binary16).
+///
+/// The inverse of [`f16_to_f32`], rounding the 24-bit significand to 11 bits
+/// with the IEEE default policy, round-to-nearest-ties-to-even.  A magnitude
+/// too large for binary16 becomes an infinity of the same sign (`65520.0` is
+/// the first value that rounds up to it); one too small becomes a subnormal, or
+/// a signed zero below half the smallest subnormal.  A NaN stays a NaN — never
+/// an infinity — even when every payload bit it carries falls off the end.
+pub fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mantissa = bits & 0x007F_FFFF;
+
+    if exp == 0xFF {
+        if mantissa == 0 {
+            return sign | 0x7C00; // ±infinity
+        }
+        // NaN: keep the top payload bits, and force at least one set so the
+        // result cannot collapse into an infinity.
+        let payload = (mantissa >> 13) as u16;
+        return sign | 0x7C00 | if payload == 0 { 1 } else { payload };
+    }
+
+    // Re-bias the exponent from binary32 (127) to binary16 (15).
+    let e = exp - 127 + 15;
+    if e >= 0x1F {
+        return sign | 0x7C00; // overflows binary16's range
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign; // below half the smallest subnormal
+        }
+        // Subnormal: restore binary32's implicit leading 1, then shift the
+        // significand down into binary16's fixed 2^-24 quantum.
+        let m = mantissa | 0x0080_0000;
+        let shift = (14 - e) as u32;
+        let kept = m >> shift;
+        let dropped = m & ((1u32 << shift) - 1);
+        let half = 1u32 << (shift - 1);
+        let mut out = kept as u16;
+        if dropped > half || (dropped == half && kept & 1 == 1) {
+            // A carry out of the significand lands in the exponent field,
+            // which is exactly how a subnormal becomes the smallest normal.
+            out += 1;
+        }
+        return sign | out;
+    }
+
+    let kept = (mantissa >> 13) as u16;
+    let mut out = ((e as u16) << 10) | kept;
+    let dropped = mantissa & 0x1FFF;
+    if dropped > 0x1000 || (dropped == 0x1000 && kept & 1 == 1) {
+        // As above, a carry propagates into the exponent — and, at the top of
+        // the range, correctly produces an infinity.
+        out += 1;
+    }
+    sign | out
+}
+
 impl Dataset {
     /// Returns the byte size of a single element for fixed-width dtypes.
     ///
@@ -695,5 +755,100 @@ impl Dataset {
         };
         ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&shape), values)
             .map_err(|e| OxiH5Error::Format(format!("ndarray shape error: {}", e)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Half-precision conversion
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod half_tests {
+    use super::{f16_to_f32, f32_to_f16};
+
+    /// Bit patterns taken from IEEE 754-2019 §3.6 and the binary16 interchange
+    /// format, not from this implementation's own output.
+    #[test]
+    fn f32_to_f16_matches_the_interchange_format() {
+        let cases: &[(f32, u16)] = &[
+            (0.0, 0x0000),
+            (-0.0, 0x8000),
+            (1.0, 0x3C00),
+            (-1.0, 0xBC00),
+            (0.5, 0x3800),
+            (2.0, 0x4000),
+            (-1.5, 0xBE00),
+            // Largest finite binary16: (2 - 2^-10) × 2^15 = 65504.
+            (65504.0, 0x7BFF),
+            // Smallest positive normal: 2^-14.
+            (6.103_515_6e-5, 0x0400),
+            // Largest subnormal: (1 - 2^-10) × 2^-14.
+            (6.097_555e-5, 0x03FF),
+            // Smallest positive subnormal: 2^-24.
+            (5.960_464_5e-8, 0x0001),
+            (f32::INFINITY, 0x7C00),
+            (f32::NEG_INFINITY, 0xFC00),
+        ];
+        for &(value, bits) in cases {
+            assert_eq!(f32_to_f16(value), bits, "encoding {value}");
+            // And back: every one of these is exactly representable.
+            assert_eq!(
+                f16_to_f32(bits).to_bits(),
+                value.to_bits(),
+                "decoding {bits:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn f32_to_f16_rounds_to_nearest_ties_to_even() {
+        // Halfway between 1.0 (0x3C00) and 1 + 2^-10 (0x3C01): ties to even.
+        assert_eq!(f32_to_f16(1.0 + 2f32.powi(-11)), 0x3C00);
+        // Halfway between 0x3C01 and 0x3C02: ties to even rounds up.
+        assert_eq!(f32_to_f16(1.0 + 2f32.powi(-10) + 2f32.powi(-11)), 0x3C02);
+        // Just above the halfway point always rounds up.
+        assert_eq!(f32_to_f16(1.0 + 2f32.powi(-11) + 2f32.powi(-20)), 0x3C01);
+        // Half the smallest subnormal ties to even → zero, keeping the sign.
+        assert_eq!(f32_to_f16(2f32.powi(-25)), 0x0000);
+        assert_eq!(f32_to_f16(-2f32.powi(-25)), 0x8000);
+        // Just above it rounds up to the smallest subnormal.
+        assert_eq!(f32_to_f16(2f32.powi(-25) + 2f32.powi(-30)), 0x0001);
+        // A value 1023.6 quanta above zero is subnormal, but rounds up to
+        // 1024 quanta — which *is* the smallest normal, so the carry has to
+        // propagate out of the significand and into the exponent field.
+        assert_eq!(f32_to_f16(1023.6 * 2f32.powi(-24)), 0x0400);
+        // Just below the tie it stays the largest subnormal.
+        assert_eq!(f32_to_f16(1023.4 * 2f32.powi(-24)), 0x03FF);
+    }
+
+    #[test]
+    fn f32_to_f16_saturates_and_preserves_nan() {
+        // 65520 is the first value that rounds up past the largest finite
+        // binary16 and becomes an infinity; 65519 still fits.
+        assert_eq!(f32_to_f16(65519.0), 0x7BFF);
+        assert_eq!(f32_to_f16(65520.0), 0x7C00);
+        assert_eq!(f32_to_f16(-65520.0), 0xFC00);
+        assert_eq!(f32_to_f16(1e30), 0x7C00);
+
+        for nan in [f32::NAN, -f32::NAN, f32::from_bits(0x7F80_0001)] {
+            let bits = f32_to_f16(nan);
+            assert!(
+                f16_to_f32(bits).is_nan(),
+                "a NaN must never become an infinity: {bits:#06x}"
+            );
+        }
+    }
+
+    /// Every binary16 bit pattern must survive `f16 → f32 → f16`.
+    #[test]
+    fn round_trip_is_exact_for_every_bit_pattern() {
+        for bits in 0u16..=u16::MAX {
+            let value = f16_to_f32(bits);
+            if value.is_nan() {
+                assert!(f16_to_f32(f32_to_f16(value)).is_nan(), "{bits:#06x}");
+            } else {
+                assert_eq!(f32_to_f16(value), bits, "{bits:#06x}");
+            }
+        }
     }
 }

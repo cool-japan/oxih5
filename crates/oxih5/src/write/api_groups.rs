@@ -28,7 +28,7 @@ impl FileWriter {
     /// group already exists, which mirrors h5py.
     pub fn create_group(&mut self, path: &str) -> Result<(), OxiH5Error> {
         let (parent, name) = insertion_point(&mut self.root, path, "group")?;
-        parent.groups.push(GroupNode::new(name));
+        parent.push_group(GroupNode::new(name));
         Ok(())
     }
 

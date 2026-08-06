@@ -7,6 +7,321 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.2.3] - 2026-08-06
+
+### Fixed
+
+**Array datatypes were mis-parsed on read**
+
+- **A class-10 (array) datatype's dimensions were read as 8-byte fields.** They
+  are 4-byte fields in every version of the class, so an ordinary `(2, 3)`
+  array decoded as `[216172782147338240, 72057594037927936]` and its `int32`
+  base type as a 67-megabyte unsigned integer — silently, with no error. The
+  version-2 form's three reserved bytes and its per-dimension permutation
+  indices were not accounted for either, and the version dispatch treated a
+  version-1 array as real when the class was *introduced* with version 2 and
+  libhdf5 refuses to encode or decode an older one. `datatype::parse_array` now
+  implements both real forms (version 2 with reserved bytes and permutation
+  indices, version 3 without) and reports a sub-version-2 array rather than
+  guessing. Pinned against the datatype message
+  `h5t.array_create(NATIVE_INT32, (2, 3))` produces under **h5py 3.16 /
+  libhdf5 2.0.0**; before this, oxih5 could not read *any* array-datatype
+  dataset written by libhdf5.
+
+**Divide-by-zero / overflow panics and an OOM on crafted or corrupted files**
+
+- **Zero chunk dimension divide-by-zero, closed at every layer.** A crafted
+  layout v3/v4 chunked message could claim a chunk dimension of `0`; nothing
+  rejected it before a chunk reader divided a dataset coordinate by it,
+  panicking. `message::parse_layout` now rejects a zero chunk dimension for
+  both layout v3 and v4/v5 chunked encodings at parse time — the single
+  validation point every reader relies on — and `chunked_hyperslab::read_chunked_hyperslab`
+  carries its own defense-in-depth guard for the same hazard, mirroring the
+  fix already in `chunked::read_chunked_slice`/`assemble_chunks_slice`.
+- **Zero-stride hyperslab selections now a typed error, not a panic.**
+  `DimSelection`'s fields are public for ergonomic construction, so nothing
+  stopped a caller building `DimSelection { stride: 0, .. }` — the natural
+  mistake, since `stride` is documented `>= 1` but was never enforced. New
+  `Hyperslab::validate()` rejects a zero stride in any non-empty dimension and
+  is now called from every facade entry point that accepts a caller-supplied
+  `Hyperslab` (`scatter_chunk_hyperslab`, `read_chunked_hyperslab`,
+  `gather_hyperslab_contiguous`) before the division that used to panic.
+- **Overflow-then-undersized-buffer checks in the vlen/global-heap decoders.**
+  `decode_vlen_strings`, `decode_vlen_sequences`, `decode_object_refs` and
+  `decode_one_value`'s vlen-sequence arm sized their read buffers with plain
+  `n_elems * 16` / `seq_len * elem_footprint` multiplication of
+  attacker-controlled, on-disk-derived integers. On 32-bit/wasm32 `usize`
+  this can wrap to a small value that then passes the length check, letting
+  the decode loop slice past the end of the heap object. All four sites now
+  use `checked_mul` with a typed `OxiH5Error::Format` on overflow.
+- **B-tree v1 chunk index: an out-of-range node/child address bypassed its own
+  bounds check via integer overflow.** `btree_v1_chunk::collect`'s guard was
+  plain `off + 24 > file_data.len()`; in a release build that addition
+  silently wraps for an `off` within 24 of `usize::MAX`, so the wrapped sum
+  can come out *smaller* than `file_data.len()` and the check falsely passes
+  — the very next line then slices `file_data[off..off + 4]` with the
+  still-huge `off` and panics with a "range start index ... out of range"
+  message. `off` is a raw on-disk file address (an internal-node child
+  pointer, or the index root address itself) with no upstream validation, so
+  this is reachable from a corrupted `libver='earliest'` chunked file through
+  the public `File::dataset`/`dataset_slice` API. Found by the new
+  `fuzz_btree_v1_chunk` target. Every offset computation in `collect` and
+  `parse_chunk_key` (node bounds, per-entry key/child offsets, per-dimension
+  key offsets) now uses `checked_add`/`checked_mul`, returning a typed error
+  on overflow instead of reaching the direct slice.
+- **VDS version-1 hyperslab block list: an unbounded block count could OOM the
+  process.** `parse_hyperslab_v1_blocks` read `num_blocks` as a raw `u32` off
+  disk with no upstream bound and passed it straight to
+  `Vec::with_capacity(num_blocks)` — a tiny (39-byte) crafted VDS mapping
+  block could request an up-front allocation of tens of gigabytes, aborting
+  the process before a single byte was actually read from the (far smaller)
+  input buffer. The same "count field used unchecked as `Vec::with_capacity`"
+  hazard the Fixed Array chunk-index parser's element count already guards
+  against. Found by the new `fuzz_vds` target. `parse_hyperslab_v1_blocks` now
+  rejects a block count that could not possibly fit in the reader's remaining
+  bytes (each block needs at least `rank * 8` bytes) before allocating for it;
+  `Reader` gained a `remaining()` helper to support the check.
+- **The one remaining production `.expect()` removed.** `chunked::read_chunked_slice`'s
+  parallel (`parallel` feature) code path looked up a chunk's record index
+  from an origin coordinate twice — once while filtering to present cells,
+  and again inside the parallel `map` closure via
+  `chunk_map.get(&origin).expect("origin in map")`. The invariant held today,
+  but the redundant lookup meant a future edit to either half could silently
+  turn a correctness slip into a worker-thread panic. The resolved index is
+  now carried through from the first lookup instead of being re-derived.
+
+### Added
+
+- **Links: soft, external and hard-alias, on write (G011).** The reader has
+  resolved all three since 0.1.x — including soft→external chains — with no
+  writer counterpart. `FileWriter::create_soft_link`, `create_external_link`
+  and `create_hard_link` close that gap, and each is stored the way the format
+  actually stores it rather than the way that would be convenient:
+  - A **soft link** in an old-style group is a symbol table entry with *cache
+    type 2*, the undefined-address sentinel where its object header would be,
+    and its target path interned in the group's own local heap beside the link
+    names — the layout libhdf5 2.0.0 writes for `f['s'] = h5py.SoftLink(...)`,
+    byte for byte. Its target need not exist, and a relative target resolves
+    against the group that holds the link.
+  - A **hard alias** is an ordinary entry pointing at an object header another
+    name already reaches, and it now **raises that header's reference count** —
+    libhdf5 writes 2 for an aliased dataset, and leaving it at 1 makes
+    `H5Ldelete` on either name free storage the other name still points at. The
+    target is resolved against the *finished* layout, so an alias may be
+    created before the object it names.
+  - An **external link** has no symbol table encoding at all, so creating one
+    moves its group to link-message storage — exactly what libhdf5 does when an
+    external link is written into a default (`libver='earliest'`) file.
+- **New-style (link-message) groups, compact and dense (G013).** A group may
+  now store its members as Link messages instead of a symbol table, in both
+  forms libhdf5 uses, still inside a superblock-v0 / object-header-v1 file:
+  - **Compact**: a Link Info message (0x0002) with both addresses undefined, a
+    Group Info message (0x000A), and one Link message (0x0006) per member.
+  - **Dense**, past libhdf5's `max_compact` of 8: a **fractal heap writer**
+    (`write/fractal_heap.rs`) holding each link message as a managed heap
+    object in a root direct block, and a **version-2 B-tree writer**
+    (`write/btree_v2.rs`) indexing them by name — a type-5 link name index
+    whose records are sorted by the **Jenkins lookup3** hash of the link name,
+    because `H5B2__locate_record` binary-searches them and an unsorted index
+    does not fail loudly, it just hides links. `write/checksum.rs` implements
+    that hash, which is also `H5_checksum_metadata`: the heap header, the heap's
+    root direct block, the B-tree header and its leaf node each carry the
+    checksum libhdf5 computes, over exactly the byte range libhdf5 covers.
+  - **Creation order is preserved.** `FileWriter::set_track_order` gives every
+    link an explicit creation-order field and declares the group as tracking
+    them, so a reader walking the stored links sees them in the order they were
+    made rather than alphabetically. `set_link_storage` selects link messages
+    without tracking order.
+  - A converted group keeps its symbol table *structures* (an empty B-tree,
+    local heap and SNOD) with no symbol table *message*, so the parent's cached
+    entry still points at something real — the shape libhdf5 leaves behind when
+    it converts a group, verified by reading the result back with libhdf5.
+- **Compound (record) datatype datasets (G004).** `create_compound_dataset`
+  takes a member list (name, byte offset, type), a record stride and the raw
+  row bytes; the class-6 version-1 datatype message it emits is byte-identical
+  to what libhdf5 writes for `numpy.dtype([('id', '<i4'), ('value', '<f8')])`.
+  Offsets are honoured, never re-packed — a C-padded record and a tightly
+  packed one over the same members are different records, and the offsets say
+  which one the bytes hold. Overlapping members, a member past the record,
+  duplicate or empty names, and unwritable member types are typed errors at the
+  call.
+- **Variable-length (ragged) sequence datasets (G015).** `create_vlen_sequence_dataset`
+  (plus `create_vlen_i32_dataset` / `create_vlen_f64_dataset`) writes a class-9
+  subtype-0 sequence over any fixed-size base type, one global-heap object per
+  element, sharing the file's one collection set with vlen strings. The
+  sequence length in each 16-byte reference counts **elements**, not bytes —
+  libhdf5 writes 3 beside a 12-byte heap object for a three-`int32` sequence —
+  and an empty element is the all-zero null reference libhdf5 writes. Read back
+  with `File::dataset_vlen_sequences`.
+- **Array, opaque and bitfield datatype datasets (G016).**
+  `create_array_dataset`, `create_opaque_dataset` and `create_bitfield_dataset`.
+  The array type is emitted as datatype message **version 2** — the version the
+  array class was introduced with, and the only one libhdf5 accepts — with the
+  dimensionality byte, three reserved bytes, 4-byte extents and a permutation
+  index per dimension. Opaque tags are NUL-padded to eight bytes exactly as
+  `h5py.opaque_dtype` produces them.
+- **Interop fixture example.** `crates/oxih5/examples/interop_fixtures.rs`
+  writes one file per new writer capability so a third-party reader can check
+  them; all nine were read back by **h5py 3.16 / libhdf5 2.0.0**, including the
+  dense-root-group and `track_order`-root-group cases.
+
+- **Extensible-array chunk indexes are now read, not reported.** The index
+  libhdf5 selects for a chunked dataset with exactly one unlimited dimension —
+  `create_dataset(..., chunks=..., maxshape=(None, ...))` under
+  `libver='latest'`, the ordinary h5py append-able dataset — previously failed
+  with a typed `NotImplemented` for every element format libhdf5 actually
+  writes. `ea_index` now decodes the whole structure:
+  - **Elements are not self-describing**, which is what the old parser assumed.
+    The unfiltered client (`H5EA_CLS_CHUNK_ID`) stores a bare 8-byte chunk
+    address and takes its size from the uncompressed chunk size; the filtered
+    client (`H5EA_CLS_FILT_CHUNK_ID`) stores the address, the stored size in a
+    variable-width field whose width is whatever the header's element size
+    leaves over, and a 4-byte filter mask.
+  - **A chunk's position comes from its element index.** The index is
+    `H5VM_array_offset_pre` over *swizzled* coordinates: the unlimited
+    dimension is **rotated** to the front (`0,1,2 → 2,0,1` when it is the last
+    of three), not swapped with dimension 0 — the two agree only for rank 2 or
+    when the unlimited dimension is dimension 1. The chunk grid comes from the
+    dataspace's **maximum** dimensions, not its current ones, so that the
+    numbering survives the dataset growing. Rank 1 needs no maximum dimensions
+    at all; rank ≥ 2 without them is a typed error rather than a guess.
+  - **Block traversal is exact.** Data-block element counts now come from the
+    `sblk_info` recurrence libhdf5 derives from the header's creation
+    parameters (`2^(u/2)` blocks of `2^(ceil(u/2)) × data_blk_min_elmts`
+    elements per super block *u*), replacing a heuristic that guessed a
+    block's extent from the next recognisable structure in the file. Super
+    blocks ("EASB") are located at `14 + ceil(max_nelmts_bits/8)` rather than a
+    hard-coded 22, their stated element offset is cross-checked against the
+    creation parameters, and their page-init bitmasks
+    (`ndblks × ceil(npages/8)` bytes, MSB-first, indexed
+    `dblk_idx × npages + page`) are decoded so that the data-block addresses
+    after them are found at all. **Paged data blocks** — where one block holds
+    more than `2^max_dblk_page_nelmts_bits` elements and is split into pages
+    with per-page checksums — are read, and uninitialised pages are skipped
+    rather than decoded as allocator leftovers. Every block's back-pointer to
+    its own header is verified.
+  - **API.** `ea_index::parse_extensible_array` takes an `EaGeometry`
+    (chunk shape, current dims, maximum dims, uncompressed chunk bytes) in
+    place of a bare rank, and `chunked::{read_chunked, read_chunked_slice}` /
+    `chunked_hyperslab::read_chunked_hyperslab` take a
+    `chunked::DatasetShape { dims, max_dims }` in place of `dataset_dims: &[u64]`.
+    `resolve_chunk_index` now rejects `ExtensibleArray` alongside `BTreeV2` /
+    `SingleChunk` / `Implicit` as needing geometry `chunk_records` supplies.
+  - **Tests.** 20 unit tests over synthetic arrays encoded the way libhdf5
+    encodes them (inline elements, index-block data blocks, secondary blocks,
+    paged blocks, uninitialised pages, both clients, narrow stored-size
+    fields, the rank-2/3 coordinate rotation, and the structural rejections),
+    plus 12 integration tests in `crates/oxih5/tests/ea_index_tests.rs`
+    against a new h5py-authored fixture `tests/fixtures/chunked_ea.h5` that
+    reaches every level of the structure. `layout_v4_tests.rs`'s
+    "reported unsupported" test is now a value assertion.
+
+- **Big-endian datasets and attributes, and half-precision floats — writer
+  roadmap items G008 and G012.** Both are read already; neither had a write
+  path, so a file oxih5 could parse it could not produce.
+  - `FileWriter::write_dataset_numeric(path, values, order, shape)` takes a
+    `NumericValues` (`F16`/`F32`/`F64`/`I8`…`U64`) and an explicit
+    `ByteOrder`, so eleven element types × two byte orders is one entry point
+    rather than twenty-two near-identical methods. The datatype message's
+    byte-order bit and the payload bytes are produced from the same `order`
+    argument, which is what makes it impossible for them to disagree — the
+    failure mode that self-round-trips perfectly and reads back byte-swapped
+    everywhere else.  `write_numeric_attr` and `write_numeric_scalar_attr` are
+    the attribute counterparts (1-D and scalar dataspace respectively), closing
+    the big-endian-attribute half of G006 as well.
+  - `create_dataset` and `create_dataset_unlimited` no longer reject a
+    big-endian `Dtype`: it now maps to the matching big-endian element type
+    instead of erroring.  (0.2.2's guard was the honest behaviour while no
+    byte-swap path existed; it is obsolete now.)
+  - `oxih5_core::f32_to_f16` is new — round-to-nearest-ties-to-even over the
+    24-bit significand, subnormals, saturation to infinity at 65 520, and a NaN
+    that never collapses into an infinity.  Unit-tested against IEEE 754
+    binary16 bit patterns and by round-tripping all 65 536 of them through
+    `f16_to_f32`.
+  - Note when reading a half-precision dataset back: `Dataset::as_f32` is for
+    binary**32** and returns `TypeMismatch` for a 2-byte float; the accessor is
+    `Dataset::as_f16` (or `iter_f16`), which yields `f32` values.  This
+    asymmetry predates the writer but is newly reachable now that oxih5 can
+    produce such a file.
+  - **Verified against h5py 3.16 / libhdf5 2.0.0**, not only against oxih5's
+    own reader: `crates/oxih5/tests/be_f16_write_tests.rs` asserts numpy sees
+    `>f4`, `>f8`, `>i2`, `>i4`, `>i8`, `>u2`, `>u4`, `>u8`, `>f2` and
+    `float16` with exact values, including a 2-D big-endian dataset and
+    big-endian array and scalar attributes.
+
+- **`rustfmt.toml` and `clippy.toml`.** Pin `edition = "2021"` (matching
+  `workspace.package.edition`; the codebase already matched rustfmt's stable
+  defaults, so this changes no formatting) and `msrv = "1.80"` (matching
+  `workspace.package.rust-version`, activating `clippy::incompatible_msrv`
+  and related MSRV-aware lints).
+- **Six new fuzz targets** driving parsers directly with raw bytes, rather
+  than only reaching them through a structurally valid whole file (which
+  random mutation of `fuzz_file_open` almost never produces): `fuzz_fa_index`,
+  `fuzz_ea_index` and `fuzz_btree_v1_chunk` for the three real chunk-index
+  parsers; `fuzz_filters` for the read-direction filter pipeline;
+  `fuzz_vds` for the VDS mapping-block parser; `fuzz_vlen_values` for the
+  vlen/object-reference value decoders. `fuzz_btree_v1_chunk` and `fuzz_vds`
+  each found a real crash within seconds of their first run (see Fixed,
+  above).
+- **Runnable examples.** `crates/oxih5/examples/read_dataset.rs` (open a
+  file, then read a dataset whole, via a contiguous slice, and via a strided
+  hyperslab) and `write_dataset.rs` (`FileWriter`, chunking, deflate, and
+  attributes on both a dataset and a group); `crates/oxinetcdf/examples/write_and_read.rs`
+  (`NcFileWriter` → `NcFile`, dimensions, a variable, and global + per-variable
+  attributes). All three are self-contained (they write their own fixture to
+  a temp path first) and verified with `cargo run --example`.
+
+### Changed
+
+- **`oxih5-format/src/chunked.rs` split into `chunked/{cache,index,read,slice,geometry,tests}.rs`.**
+  The file had grown to 1963 lines, 37 under the workspace's 2000-line cap,
+  with no natural room left for the next feature. Split along the seams the
+  code already implied — the index cache, chunk-index-type resolution,
+  whole-dataset reading, hyperslab-range reading, and the low-level I/O/filter/coordinate
+  helpers shared by both readers — with every item that used to be reachable
+  as `chunked::X` (whether `pub` or crate-visible `pub(crate)`) still
+  reachable at that exact path via glob re-exports in `chunked/mod.rs`. Purely
+  an internal reorganisation: the public API and every test are unchanged.
+- **`oxih5-format/src/ea_index.rs` split into `ea_index/{header,blocks,elements,tests}.rs`.**
+  Teaching the extensible-array parser the real libhdf5 structure (see Added)
+  more than doubled the file, so it was cut along the same seams the format
+  itself has — the array header and its creation parameters, the index/super/
+  data block traversal, and the two element clients — with `mod.rs` re-exporting
+  every item that was reachable as `ea_index::X` before, so no caller changed a
+  `use` path. Both halves of this release's splitting keep every file under the
+  workspace's 2000-line-per-file cap.
+
+### Dependencies
+- `oxiarc-deflate` / `oxiarc-szip` 0.3.6 → 0.4.1 (upstream releases, two bumps since 0.2.2:
+  0.3.6 → 0.4.0 → 0.4.1).
+
+### Documentation
+
+- `crates/oxih5-format/TODO.md`'s status paragraph claimed all four
+  chunk-index varieties (B-tree v1, B-tree v2, Fixed Array, Extensible Array)
+  were fully supported while the Extensible Array parser still returned a
+  typed `NotImplemented`. The claim is now true (see Added), and the paragraph
+  says what the Extensible Array reader actually covers. The matching
+  "read-side known limitation" entry has been removed from `TODO.md`.
+- Removed a stale "hyperslab selections with `block > 1` drop elements on
+  chunked datasets" limitation from `TODO.md`'s known-limitations list —
+  `test_hyperslab_block2_2d` exercises `block=2`/`stride=2` against a
+  chunked+gzip+shuffle 2-D fixture and asserts exact output bytes, so the
+  limitation no longer holds (if it ever did).
+- Widened `README.md`'s "zero `unwrap()` in production code" claim to also
+  cover `.expect()`, and to note the two narrow, by-design assertions that
+  remain (a compile-time `assert!` inside a `const fn`, and a
+  `debug_assert_eq!` compiled out of release builds).
+- Hardened eight fixture-gated integration tests (`vlen_chunked_tests.rs`,
+  `vds_tests.rs`, `layout_v4_tests.rs`, `soft_link_old_tests.rs`,
+  `read_contig.rs`, `inplace_tests.rs`, `oxinetcdf/fix_ncr_backcompat.rs`,
+  `oxinetcdf/src/file.rs::test_read_strings_from_fixture`) that
+  silently `return`/skipped when their fixture file was missing, which would
+  make the suite pass vacuously (green-but-empty) instead of failing loudly
+  if a committed `.h5`/`.nc` fixture were ever lost to a `.gitignore` change
+  or a partial checkout. Every fixture they guard is tracked in git today, so
+  each now `assert!`s the file exists before proceeding.
+
 ## [0.2.2] - 2026-07-22
 
 Every file `FileWriter` and `NcFileWriter` produce is now verified byte-openable
@@ -518,6 +833,7 @@ message.rs          — decode all standard message types
 
 ---
 
+[0.2.3]: https://github.com/cool-japan/oxih5/releases/tag/v0.2.3
 [0.2.2]: https://github.com/cool-japan/oxih5/releases/tag/v0.2.2
 [0.2.1]: https://github.com/cool-japan/oxih5/releases/tag/v0.2.1
 [0.2.0]: https://github.com/cool-japan/oxih5/releases/tag/v0.2.0

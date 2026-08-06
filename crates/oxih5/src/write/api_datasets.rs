@@ -5,10 +5,10 @@
 //! which is where all per-type knowledge lives.  See [`super`] for the
 //! writer-wide overview and the shared size contract.
 
-use oxih5_core::{Dtype, OxiH5Error};
+use oxih5_core::{ByteOrder, Dtype, OxiH5Error};
 
 use super::elem::{
-    dtype_to_elem_type, AttrDesc, AttrKind, ElemType, COMPACT_LAYOUT_SENTINEL_NAME,
+    dtype_to_elem_type, AttrDesc, AttrKind, ElemType, NumType, COMPACT_LAYOUT_SENTINEL_NAME,
     FILL_VALUE_SENTINEL_NAME,
 };
 use super::tree::{dataset_mut, insertion_point, DatasetDesc, Storage};
@@ -228,15 +228,18 @@ impl FileWriter {
         let n = strings.len();
         let values: Vec<String> = strings.iter().map(|s| (*s).to_string()).collect();
         let (parent, name) = insertion_point(&mut self.root, path, "vlen-string dataset")?;
-        parent.datasets.push(DatasetDesc {
+        parent.push_dataset(DatasetDesc {
             name: name.to_string(),
             raw: Vec::new(), // VlenStr datasets use vlen_strings, not raw
             shape: vec![n],
             elem_type: ElemType::VlenStr,
+            dtype: None,
             attrs: Vec::new(),
             storage: Storage::Contiguous,
             filter: None,
             vlen_strings: Some(values),
+            vlen_seqs: None,
+            creation_order: 0,
         });
         Ok(())
     }
@@ -304,15 +307,18 @@ impl FileWriter {
         }
 
         let (parent, name) = insertion_point(&mut self.root, path, "fixed-string dataset")?;
-        parent.datasets.push(DatasetDesc {
+        parent.push_dataset(DatasetDesc {
             name: name.to_string(),
             raw,
             shape: vec![n],
             elem_type: ElemType::FixedStr(width_field),
+            dtype: None,
             attrs: Vec::new(),
             storage: Storage::Contiguous,
             filter: None,
             vlen_strings: None,
+            vlen_seqs: None,
+            creation_order: 0,
         });
         Ok(())
     }
@@ -410,11 +416,12 @@ impl FileWriter {
         let et = dtype_to_elem_type(dtype)?;
 
         let (parent, name) = insertion_point(&mut self.root, path, "dataset")?;
-        parent.datasets.push(DatasetDesc {
+        parent.push_dataset(DatasetDesc {
             name: name.to_string(),
             raw: data.to_vec(),
             shape: shape.to_vec(),
             elem_type: et,
+            dtype: None,
             attrs: Vec::new(),
             storage: Storage::Chunked {
                 // Kept verbatim, short vector and all: completing it needs the
@@ -426,6 +433,8 @@ impl FileWriter {
             },
             filter: None,
             vlen_strings: None,
+            vlen_seqs: None,
+            creation_order: 0,
         });
         Ok(())
     }
@@ -554,6 +563,15 @@ impl FileWriter {
         le_bytes: Vec<u8>,
     ) -> Result<&mut Self, OxiH5Error> {
         let ds = dataset_mut(&mut self.root, path)?;
+        if ds.dtype.is_some() {
+            // A compound, array, opaque, bitfield or vlen-sequence dataset has no
+            // `ElemType` for `elem` to be compared against, so the width check
+            // below would pass on a coincidence: a one-byte fill would be
+            // accepted for a twelve-byte record.  Refuse it outright.
+            return Err(OxiH5Error::Format(format!(
+                "set_fill_value('{path}'): a structured datatype has no scalar fill value"
+            )));
+        }
         if ds.elem_type != elem {
             return Err(OxiH5Error::Format(format!(
                 "set_fill_value('{path}'): a {elem:?} fill value does not match the \
@@ -620,9 +638,10 @@ impl FileWriter {
                 "set_compact('{path}'): a chunked dataset cannot use the compact layout"
             )));
         }
-        if ds.vlen_strings.is_some() {
+        if ds.vlen_strings.is_some() || ds.vlen_seqs.is_some() {
             return Err(OxiH5Error::Format(format!(
-                "set_compact('{path}'): a vlen-string dataset cannot use the compact layout"
+                "set_compact('{path}'): a variable-length dataset cannot use the compact \
+                 layout — its data area is global-heap references, not the values themselves"
             )));
         }
         // The compact layout message is a 4-byte prefix plus the data, padded to
@@ -670,16 +689,176 @@ impl FileWriter {
         }
 
         let (parent, name) = insertion_point(&mut self.root, path, "dataset")?;
-        parent.datasets.push(DatasetDesc {
+        parent.push_dataset(DatasetDesc {
             name: name.to_string(),
             raw,
             shape: shape.to_vec(),
             elem_type,
+            dtype: None,
             attrs: Vec::new(),
             storage: Storage::Contiguous,
             filter: None,
             vlen_strings: None,
+            vlen_seqs: None,
+            creation_order: 0,
         });
         Ok(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// G008 / G012: explicit byte order and half precision
+// ---------------------------------------------------------------------------
+
+/// A typed run of numeric values for [`FileWriter::write_dataset_numeric`] and
+/// [`FileWriter::write_numeric_attr`].
+///
+/// One enum rather than a method per `(type, byte order)` pair: the byte order
+/// is a separate argument, so eleven element types times two orders is one
+/// entry point instead of twenty-two near-identical ones.
+///
+/// [`NumericValues::F16`] takes `f32` because Rust has no `f16` in stable
+/// arithmetic; each value is rounded to IEEE-754 binary16 with
+/// [`oxih5_core::f32_to_f16`] (round-to-nearest-ties-to-even), which is exactly
+/// what `numpy.float16` does.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum NumericValues<'a> {
+    /// IEEE-754 binary16, supplied as `f32` and rounded on write.
+    F16(&'a [f32]),
+    /// IEEE-754 binary32.
+    F32(&'a [f32]),
+    /// IEEE-754 binary64.
+    F64(&'a [f64]),
+    /// Signed 8-bit integers.
+    I8(&'a [i8]),
+    /// Signed 16-bit integers.
+    I16(&'a [i16]),
+    /// Signed 32-bit integers.
+    I32(&'a [i32]),
+    /// Signed 64-bit integers.
+    I64(&'a [i64]),
+    /// Unsigned 8-bit integers.
+    U8(&'a [u8]),
+    /// Unsigned 16-bit integers.
+    U16(&'a [u16]),
+    /// Unsigned 32-bit integers.
+    U32(&'a [u32]),
+    /// Unsigned 64-bit integers.
+    U64(&'a [u64]),
+}
+
+impl NumericValues<'_> {
+    /// Number of values.
+    pub fn len(&self) -> usize {
+        match self {
+            NumericValues::F16(v) | NumericValues::F32(v) => v.len(),
+            NumericValues::F64(v) => v.len(),
+            NumericValues::I8(v) => v.len(),
+            NumericValues::I16(v) => v.len(),
+            NumericValues::I32(v) => v.len(),
+            NumericValues::I64(v) => v.len(),
+            NumericValues::U8(v) => v.len(),
+            NumericValues::U16(v) => v.len(),
+            NumericValues::U32(v) => v.len(),
+            NumericValues::U64(v) => v.len(),
+        }
+    }
+
+    /// Whether there are no values.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The numeric family these values belong to.
+    pub(super) fn num_type(self) -> NumType {
+        match self {
+            NumericValues::F16(_) => NumType::F16,
+            NumericValues::F32(_) => NumType::F32,
+            NumericValues::F64(_) => NumType::F64,
+            NumericValues::I8(_) => NumType::I8,
+            NumericValues::I16(_) => NumType::I16,
+            NumericValues::I32(_) => NumType::I32,
+            NumericValues::I64(_) => NumType::I64,
+            NumericValues::U8(_) => NumType::U8,
+            NumericValues::U16(_) => NumType::U16,
+            NumericValues::U32(_) => NumType::U32,
+            NumericValues::U64(_) => NumType::U64,
+        }
+    }
+
+    /// Serialise into on-disk bytes in `order`.
+    ///
+    /// Every arm goes through `to_le_bytes`/`to_be_bytes` on the on-disk width,
+    /// so the payload's byte order always matches the byte-order bit the
+    /// datatype message will declare.
+    pub(super) fn to_bytes(self, order: ByteOrder) -> Vec<u8> {
+        /// Concatenate `f(v)` over `values`, in `order`.
+        macro_rules! pack {
+            ($values:expr, $to_bits:expr) => {{
+                let mut out = Vec::with_capacity($values.len() * core::mem::size_of_val(&0u64));
+                for v in $values.iter() {
+                    let bytes = $to_bits(*v);
+                    match order {
+                        ByteOrder::Little => out.extend_from_slice(&bytes.to_le_bytes()),
+                        ByteOrder::Big => out.extend_from_slice(&bytes.to_be_bytes()),
+                    }
+                }
+                out
+            }};
+        }
+        match self {
+            NumericValues::F16(v) => pack!(v, oxih5_core::f32_to_f16),
+            // A float's byte order applies to its IEEE-754 bit pattern, so
+            // going through `to_bits` is the same encoding as `f32::to_be_bytes`.
+            NumericValues::F32(v) => pack!(v, f32::to_bits),
+            NumericValues::F64(v) => pack!(v, f64::to_bits),
+            NumericValues::I8(v) => pack!(v, core::convert::identity::<i8>),
+            NumericValues::I16(v) => pack!(v, core::convert::identity::<i16>),
+            NumericValues::I32(v) => pack!(v, core::convert::identity::<i32>),
+            NumericValues::I64(v) => pack!(v, core::convert::identity::<i64>),
+            NumericValues::U8(v) => pack!(v, core::convert::identity::<u8>),
+            NumericValues::U16(v) => pack!(v, core::convert::identity::<u16>),
+            NumericValues::U32(v) => pack!(v, core::convert::identity::<u32>),
+            NumericValues::U64(v) => pack!(v, core::convert::identity::<u64>),
+        }
+    }
+}
+
+impl FileWriter {
+    /// Add a numeric dataset at `path` in an explicit byte order.
+    ///
+    /// This is the entry point for the two element shapes the per-type
+    /// `write_dataset_*` methods do not cover: **big-endian** datasets
+    /// (`ByteOrder::Big`), and **half-precision** floats
+    /// ([`NumericValues::F16`]).  With `ByteOrder::Little` and any other
+    /// variant it is equivalent to the matching `write_dataset_*` method.
+    ///
+    /// The declared datatype and the payload bytes are produced from the same
+    /// `order`, so the two can never disagree.
+    ///
+    /// ```
+    /// use oxih5::{ByteOrder, FileWriter, NumericValues};
+    ///
+    /// let mut w = FileWriter::new();
+    /// w.write_dataset_numeric("be", NumericValues::F32(&[1.0, 2.0]), ByteOrder::Big, &[2])?;
+    /// w.write_dataset_numeric("half", NumericValues::F16(&[0.5, 1.5]), ByteOrder::Little, &[2])?;
+    /// # Ok::<(), oxih5::OxiH5Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write_dataset_f32`]: `OxiH5Error::Format` if `path` is empty
+    /// or malformed, if its final name is already taken, or if the value count
+    /// does not equal the product of `shape`.
+    pub fn write_dataset_numeric(
+        &mut self,
+        path: &str,
+        values: NumericValues<'_>,
+        order: ByteOrder,
+        shape: &[usize],
+    ) -> Result<&mut Self, OxiH5Error> {
+        let elem = values.num_type().as_elem(order);
+        self.add_dataset(path, values.to_bytes(order), shape, elem)
     }
 }

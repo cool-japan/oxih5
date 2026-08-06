@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 rust-version = "1.80"
 authors = ["COOLJAPAN OU (Team Kitasan)"]
@@ -17,17 +17,17 @@ repository = "https://github.com/cool-japan/oxih5"
 description = "OxiH5 is the COOLJAPAN Pure-Rust HDF5 reader (no libhdf5 FFI)."
 
 [workspace.dependencies]
-oxih5-core     = { path = "crates/oxih5-core",   version = "0.2.2" }
-oxih5-format   = { path = "crates/oxih5-format", version = "0.2.2" }
-oxih5          = { path = "crates/oxih5",         version = "0.2.2" }
-oxinetcdf      = { path = "crates/oxinetcdf",     version = "0.2.2" }
+oxih5-core     = { path = "crates/oxih5-core",   version = "0.2.3" }
+oxih5-format   = { path = "crates/oxih5-format", version = "0.2.3" }
+oxih5          = { path = "crates/oxih5",         version = "0.2.3" }
+oxinetcdf      = { path = "crates/oxinetcdf",     version = "0.2.3" }
 thiserror      = { version = "2" }
 # COOLJAPAN Pure-Rust DEFLATE/zlib — used for the HDF5 gzip/deflate filter (id 1).
 # Never flate2 / miniz_oxide / zlib-ng (Pure Rust + COOLJAPAN policy).
-oxiarc-deflate = { version = "0.3.6" }
+oxiarc-deflate = { version = "0.4.1" }
 # COOLJAPAN Pure-Rust SZIP/AEC — used for the HDF5 szip filter (id 4), behind the `szip` feature.
 # Published on crates.io (since v0.3.2); resolved from the registry, no path override.
-oxiarc-szip    = "0.3.6"
+oxiarc-szip    = "0.4.1"
 memmap2        = { version = "0.9" }
 criterion      = { version = "0.8", features = ["html_reports"] }
 rayon          = { version = "1" }

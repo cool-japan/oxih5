@@ -281,7 +281,10 @@ pub(crate) fn read_dataset_from_object_header(
                 file_data,
                 &lay,
                 &pipeline,
-                &dataset_dims,
+                oxih5_format::chunked::DatasetShape {
+                    dims: &dataset_dims,
+                    max_dims: dsp.max_dims.as_deref(),
+                },
                 elem_size,
                 fill_value.as_deref(),
                 cache,

@@ -19,7 +19,9 @@ use super::elem::{
 use super::format::{
     fill_zero, write_msg_header, write_u16_le, write_u32_le, write_u64_le, MSG_HDR_SIZE,
 };
+use super::link::{self, LinkInfo, LinkMsg, GROUP_INFO_BODY};
 use super::pipeline;
+use super::plan::LinkStorage;
 use super::tree::{DatasetDesc, Filter};
 use super::{check_size, narrow, pad8};
 
@@ -72,6 +74,10 @@ pub(super) struct OhAddrs {
     pub(super) heap: u64,
     /// Raw data address for a contiguous dataset.
     pub(super) data: u64,
+    /// Fractal heap holding a dense group's links, or `u64::MAX`.
+    pub(super) fractal_heap: u64,
+    /// Version-2 B-tree indexing a dense group's links by name, or `u64::MAX`.
+    pub(super) name_index: u64,
 }
 
 /// One message of a v1 object header.
@@ -79,8 +85,19 @@ pub(super) struct OhAddrs {
 /// Each variant carries everything that affects its own length and nothing that
 /// does not; addresses come from [`OhAddrs`].
 pub(super) enum OhMsg<'a> {
-    /// 0x0011 — symbol table; its presence is what makes an object a group.
+    /// 0x0011 — symbol table; its presence is what makes an object an
+    /// **old-style** group.
     SymbolTable,
+    /// 0x0002 — link info; its presence is what makes an object a **new-style**
+    /// group.  Mutually exclusive with [`OhMsg::SymbolTable`]: the reader
+    /// classifies a group by which of the two it finds, and an object carrying
+    /// both would be read as old-style with its links invisible.
+    LinkInfo(LinkInfo),
+    /// 0x000A — group info.  Carries no information this writer varies, but
+    /// libhdf5 writes one beside every Link Info message and expects one back.
+    GroupInfo,
+    /// 0x0006 — one link of a new-style group.
+    Link(&'a LinkMsg),
     /// 0x0001 — dataspace, v1, always written with max dims present.
     Dataspace {
         /// Current extent of each dimension.
@@ -132,6 +149,14 @@ pub(super) enum OhMsg<'a> {
     },
     /// 0x000C — attribute, v1.
     Attr(&'a ResolvedAttr<'a>),
+    /// 0x0003 — a datatype whose body was encoded ahead of time.
+    ///
+    /// [`OhMsg::Datatype`] covers every type an [`ElemType`] can name, all of
+    /// which have a fixed length.  A compound, array, opaque, bitfield or
+    /// variable-length *sequence* type does not, so its body is built once when
+    /// the dataset is declared and copied in verbatim here — see
+    /// [`super::dtype`].
+    DatatypeBody(&'a [u8]),
 }
 
 impl OhMsg<'_> {
@@ -139,8 +164,11 @@ impl OhMsg<'_> {
     fn msg_type(&self) -> u16 {
         match self {
             OhMsg::SymbolTable => 0x0011,
+            OhMsg::LinkInfo(_) => 0x0002,
+            OhMsg::GroupInfo => 0x000A,
+            OhMsg::Link(_) => 0x0006,
             OhMsg::Dataspace { .. } => 0x0001,
-            OhMsg::Datatype(_) => 0x0003,
+            OhMsg::Datatype(_) | OhMsg::DatatypeBody(_) => 0x0003,
             OhMsg::FillValue { .. } => 0x0005,
             OhMsg::LayoutContiguous { .. }
             | OhMsg::LayoutChunked { .. }
@@ -158,7 +186,13 @@ impl OhMsg<'_> {
             // is also how libhdf5 writes all three.  A pipeline that could be
             // rewritten in place would let a reader disagree with the chunk
             // lengths already recorded in the B-tree keys.
-            OhMsg::Datatype(_) | OhMsg::FillValue { .. } | OhMsg::FilterPipeline { .. } => 0x01,
+            //
+            // Group Info joins them because libhdf5 marks it constant too.
+            OhMsg::Datatype(_)
+            | OhMsg::DatatypeBody(_)
+            | OhMsg::FillValue { .. }
+            | OhMsg::FilterPipeline { .. }
+            | OhMsg::GroupInfo => 0x01,
             _ => 0x00,
         }
     }
@@ -167,8 +201,11 @@ impl OhMsg<'_> {
     fn what(&self) -> &'static str {
         match self {
             OhMsg::SymbolTable => "symbol table message",
+            OhMsg::LinkInfo(_) => "link info message",
+            OhMsg::GroupInfo => "group info message",
+            OhMsg::Link(_) => "link message",
             OhMsg::Dataspace { .. } => "dataspace message",
-            OhMsg::Datatype(_) => "datatype message",
+            OhMsg::Datatype(_) | OhMsg::DatatypeBody(_) => "datatype message",
             OhMsg::FillValue { .. } => "fill value message",
             OhMsg::LayoutContiguous { .. } => "contiguous layout message",
             OhMsg::LayoutChunked { .. } => "chunked layout message",
@@ -179,12 +216,20 @@ impl OhMsg<'_> {
     }
 
     /// Unpadded body size — the writer's single size formula.
-    fn body_size(&self) -> usize {
-        match self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `OxiH5Error::Format` if a link's name is too long to be counted.
+    fn body_size(&self) -> Result<usize, OxiH5Error> {
+        Ok(match self {
             OhMsg::SymbolTable => SYMBOL_TABLE_BODY,
+            OhMsg::LinkInfo(info) => info.body_size(),
+            OhMsg::GroupInfo => GROUP_INFO_BODY,
+            OhMsg::Link(msg) => msg.body_size()?,
             // Dimension vector plus max-dimension vector.
             OhMsg::Dataspace { dims, .. } => DATASPACE_PREFIX + dims.len() * 8 * 2,
             OhMsg::Datatype(elem_type) => elem_type.dt_body_size(),
+            OhMsg::DatatypeBody(body) => body.len(),
             // 4 fixed header bytes + a 4-byte size field + the value bytes; the
             // default (`None`) is size 0 and no value, i.e. the historic 8.
             OhMsg::FillValue { value, .. } => FILL_VALUE_BODY + value.map_or(0, <[u8]>::len),
@@ -193,12 +238,16 @@ impl OhMsg<'_> {
             OhMsg::LayoutCompact { data } => LAYOUT_COMPACT_PREFIX + data.len(),
             OhMsg::FilterPipeline { filter, .. } => pipeline::body_size(filter),
             OhMsg::Attr(attr) => attr.body_size(),
-        }
+        })
     }
 
     /// Total bytes this message occupies in the header, padding included.
-    fn total(&self) -> usize {
-        msg_total(self.body_size())
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::body_size`].
+    fn total(&self) -> Result<usize, OxiH5Error> {
+        Ok(msg_total(self.body_size()?))
     }
 
     /// Write this message's body at `start`; returns bytes written.
@@ -220,11 +269,24 @@ impl OhMsg<'_> {
                 Ok(SYMBOL_TABLE_BODY)
             }
 
+            OhMsg::LinkInfo(info) => {
+                Ok(info.write_body(buf, start, addrs.fractal_heap, addrs.name_index))
+            }
+
+            OhMsg::GroupInfo => Ok(link::write_group_info_body(buf, start)),
+
+            OhMsg::Link(msg) => msg.write_body(buf, start),
+
+            OhMsg::DatatypeBody(body) => {
+                buf[start..start + body.len()].copy_from_slice(body);
+                Ok(body.len())
+            }
+
             OhMsg::Dataspace {
                 dims,
                 unlimited_dim0,
             } => {
-                let body = self.body_size();
+                let body = self.body_size()?;
                 fill_zero(buf, start, body);
                 buf[start] = 0x01; // version = 1
                 buf[start + 1] = narrow("dataspace dimensionality", dims.len())?;
@@ -245,7 +307,7 @@ impl OhMsg<'_> {
             OhMsg::Datatype(elem_type) => write_datatype_body(buf, start, *elem_type),
 
             OhMsg::FillValue { incremental, value } => {
-                let body = self.body_size();
+                let body = self.body_size()?;
                 fill_zero(buf, start, body);
                 buf[start] = 0x02; // version = 2
                                    // Space allocation time: chunked storage is
@@ -282,7 +344,7 @@ impl OhMsg<'_> {
             }
 
             OhMsg::LayoutChunked { chunk_dims } => {
-                let body = self.body_size();
+                let body = self.body_size()?;
                 fill_zero(buf, start, body);
                 buf[start] = 0x03; // version = 3
                 buf[start + 1] = 0x02; // class = 2 (chunked)
@@ -295,7 +357,7 @@ impl OhMsg<'_> {
             }
 
             OhMsg::LayoutCompact { data } => {
-                let body = self.body_size();
+                let body = self.body_size()?;
                 fill_zero(buf, start, body);
                 buf[start] = 0x03; // version = 3
                 buf[start + 1] = 0x00; // class = 0 (compact)
@@ -317,8 +379,17 @@ impl OhMsg<'_> {
 }
 
 /// Total size of a v1 object header holding `msgs`.
-pub(super) fn oh_size(msgs: &[OhMsg<'_>]) -> usize {
-    OH_PREFIX + msgs.iter().map(OhMsg::total).sum::<usize>()
+///
+/// # Errors
+///
+/// Returns `OxiH5Error::Format` if a message's length cannot be computed — only
+/// a link whose name or value overruns its on-disk length field can do that.
+pub(super) fn oh_size(msgs: &[OhMsg<'_>]) -> Result<usize, OxiH5Error> {
+    let mut total = OH_PREFIX;
+    for msg in msgs {
+        total += msg.total()?;
+    }
+    Ok(total)
 }
 
 /// Write a complete v1 object header at `addr`; returns bytes written.
@@ -339,8 +410,9 @@ pub(super) fn write_oh(
     addr: usize,
     msgs: &[OhMsg<'_>],
     addrs: &OhAddrs,
+    refcount: u32,
 ) -> Result<usize, OxiH5Error> {
-    let total = oh_size(msgs);
+    let total = oh_size(msgs)?;
     let header_data_size = total - OH_PREFIX;
 
     fill_zero(buf, addr, OH_PREFIX);
@@ -351,7 +423,11 @@ pub(super) fn write_oh(
         addr + 2,
         narrow("object header message count", msgs.len())?,
     );
-    write_u32_le(buf, addr + 4, 1); // reference count
+    // Reference count: how many hard links reach this object.  One, unless a
+    // hard alias adds another — libhdf5 writes 2 for an aliased dataset, and a
+    // count of 1 there would make deleting either name free storage the other
+    // still points at.
+    write_u32_le(buf, addr + 4, refcount);
     write_u32_le(
         buf,
         addr + 8,
@@ -361,7 +437,7 @@ pub(super) fn write_oh(
 
     let mut pos = addr + OH_PREFIX;
     for msg in msgs {
-        let body_size = msg.body_size();
+        let body_size = msg.body_size()?;
         // The size declared in the message header is the *padded* body size —
         // exactly what `msg_total` reserves.  libhdf5's `H5O__chunk_deserialize`
         // walks a v1 header by advancing `8 + declared_size` and aborts the whole
@@ -387,7 +463,7 @@ pub(super) fn write_oh(
         )?;
 
         // Pad the message out to its 8-byte boundary.
-        let end = pos + msg.total();
+        let end = pos + msg.total()?;
         fill_zero(buf, body_start + body_size, end - body_start - body_size);
         pos = end;
     }
@@ -413,6 +489,40 @@ pub(super) fn group_oh_msgs<'a>(attrs: &'a [ResolvedAttr<'a>]) -> Vec<OhMsg<'a>>
     msgs
 }
 
+/// The message list of a **new-style** group object header.
+///
+/// Link Info, then Group Info, then one Link message per member for a compact
+/// group (none for a dense one, whose links live in a fractal heap), then the
+/// attributes — the order libhdf5 writes them in.
+///
+/// There is deliberately **no** symbol table message: `is_new_style_group` and
+/// `find_symbol_table_addresses` both classify a group by which of the two it
+/// carries, so an object with both would be read as old-style and its links
+/// would vanish.  The symbol table *structures* still exist and the parent's
+/// entry still caches them; only the message is absent, which is exactly the
+/// shape libhdf5 leaves behind when it converts a group.
+///
+/// # Errors
+///
+/// Returns `OxiH5Error::Format` if a link message cannot be sized.
+pub(super) fn link_group_oh_msgs<'a>(
+    storage: &'a LinkStorage,
+    attrs: &'a [ResolvedAttr<'a>],
+) -> Result<Vec<OhMsg<'a>>, OxiH5Error> {
+    let header_links = storage.header_links();
+    let mut msgs = Vec::with_capacity(2 + header_links.len() + attrs.len());
+    msgs.push(OhMsg::LinkInfo(storage.info));
+    msgs.push(OhMsg::GroupInfo);
+    msgs.extend(header_links.iter().map(|link| OhMsg::Link(&link.msg)));
+    msgs.extend(attrs.iter().map(OhMsg::Attr));
+    // Surface an unencodable link here rather than at emit time, where the
+    // header has already been sized around it.
+    for msg in &msgs {
+        msg.body_size()?;
+    }
+    Ok(msgs)
+}
+
 /// The message list of a dataset object header.
 ///
 /// This is the single definition of what a dataset header contains; the sizing
@@ -433,7 +543,13 @@ pub(super) fn dataset_oh_msgs<'a>(
         dims: &ds.shape,
         unlimited_dim0: ds.unlimited_dim0(),
     });
-    msgs.push(OhMsg::Datatype(ds.elem_type));
+    // A structured datatype (compound, array, opaque, bitfield, vlen sequence)
+    // was encoded when the dataset was declared and is emitted verbatim; every
+    // other type is named by its `ElemType` and encoded here.
+    msgs.push(match ds.datatype_body() {
+        Some(body) => OhMsg::DatatypeBody(body),
+        None => OhMsg::Datatype(ds.elem_type),
+    });
     // Chunked storage is allocated incrementally by libhdf5; contiguous late.
     // A custom fill value, if one was set, rides the dataset's attribute list as
     // a sentinel; folding it in here (rather than emitting it as an attribute)
@@ -449,7 +565,7 @@ pub(super) fn dataset_oh_msgs<'a>(
     if let Some(filter) = ds.filter.filter(Filter::is_active) {
         msgs.push(OhMsg::FilterPipeline {
             filter,
-            elem_size: ds.elem_type.byte_size(),
+            elem_size: ds.elem_size(),
         });
     }
     // A compact request wins over the default contiguous layout: the data was
@@ -478,15 +594,18 @@ mod tests {
     fn group_header_matches_the_historic_constants() {
         let msgs = group_oh_msgs(&[]);
         assert_eq!(msgs.len(), 1);
-        assert_eq!(oh_size(&msgs), 40);
+        assert_eq!(oh_size(&msgs).expect("size"), 40);
 
         let mut buf = vec![0u8; 40];
         let addrs = OhAddrs {
             btree: 0x1111,
             heap: 0x2222,
-            data: 0,
+            ..OhAddrs::default()
         };
-        assert_eq!(write_oh(&mut buf, 0, &msgs, &addrs).expect("write_oh"), 40);
+        assert_eq!(
+            write_oh(&mut buf, 0, &msgs, &addrs, 1).expect("write_oh"),
+            40
+        );
 
         assert_eq!(buf[0], 0x01); // version
         assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 1); // num_messages
@@ -511,10 +630,10 @@ mod tests {
             },
         ];
         let msgs = group_oh_msgs(&attrs);
-        let total = oh_size(&msgs);
+        let total = oh_size(&msgs).expect("size");
         let mut buf = vec![0u8; total];
         assert_eq!(
-            write_oh(&mut buf, 0, &msgs, &OhAddrs::default()).expect("write_oh"),
+            write_oh(&mut buf, 0, &msgs, &OhAddrs::default(), 1).expect("write_oh"),
             total
         );
         assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 3);
@@ -534,9 +653,9 @@ mod tests {
         let resolved = resolve_attrs(&attrs);
         // 16 prefix + 24 symbol table + one attribute message.
         let expected = 16 + 24 + msg_total(resolved[0].body_size());
-        assert_eq!(oh_size(&group_oh_msgs(&resolved)), expected);
+        assert_eq!(oh_size(&group_oh_msgs(&resolved)).expect("size"), expected);
         // An attribute-free group is still exactly the historic 40 bytes.
-        assert_eq!(oh_size(&group_oh_msgs(&[])), 40);
+        assert_eq!(oh_size(&group_oh_msgs(&[])).expect("size"), 40);
     }
 
     #[test]
@@ -547,7 +666,7 @@ mod tests {
                 dims: &dims,
                 unlimited_dim0: false,
             };
-            assert_eq!(msg.body_size(), 8 + ndims * 16);
+            assert_eq!(msg.body_size().expect("size"), 8 + ndims * 16);
         }
     }
 
@@ -558,7 +677,7 @@ mod tests {
             let msg = OhMsg::LayoutChunked {
                 chunk_dims: &chunk_dims,
             };
-            assert_eq!(msg.body_size(), 11 + (ndims + 1) * 4);
+            assert_eq!(msg.body_size().expect("size"), 11 + (ndims + 1) * 4);
         }
     }
 
@@ -573,7 +692,11 @@ mod tests {
             incremental: false,
             value: Some(&neg999),
         };
-        assert_eq!(msg.body_size(), 16, "4 header + 4 size + 8 value");
+        assert_eq!(
+            msg.body_size().expect("size"),
+            16,
+            "4 header + 4 size + 8 value"
+        );
         let mut buf = vec![0xAAu8; 16];
         assert_eq!(
             msg.write_body(&mut buf, 0, &OhAddrs::default())
@@ -590,7 +713,11 @@ mod tests {
             incremental: true,
             value: Some(&neg7),
         };
-        assert_eq!(msg.body_size(), 12, "4 header + 4 size + 4 value");
+        assert_eq!(
+            msg.body_size().expect("size"),
+            12,
+            "4 header + 4 size + 4 value"
+        );
         let mut buf = vec![0u8; 12];
         msg.write_body(&mut buf, 0, &OhAddrs::default())
             .expect("write");
@@ -605,7 +732,11 @@ mod tests {
             incremental: false,
             value: None,
         };
-        assert_eq!(msg.body_size(), 8, "default fill message is unchanged");
+        assert_eq!(
+            msg.body_size().expect("size"),
+            8,
+            "default fill message is unchanged"
+        );
         let mut buf = vec![0xAAu8; 8];
         msg.write_body(&mut buf, 0, &OhAddrs::default())
             .expect("write");
@@ -619,7 +750,7 @@ mod tests {
         // Six little-endian i32 [0..6], as h5py's compact `d` stores them.
         let data: Vec<u8> = (0..6i32).flat_map(|v| v.to_le_bytes()).collect();
         let msg = OhMsg::LayoutCompact { data: &data };
-        assert_eq!(msg.body_size(), 4 + 24, "4 prefix + 24 data");
+        assert_eq!(msg.body_size().expect("size"), 4 + 24, "4 prefix + 24 data");
         let mut buf = vec![0xAAu8; 4 + 24];
         assert_eq!(
             msg.write_body(&mut buf, 0, &OhAddrs::default())
@@ -641,9 +772,9 @@ mod tests {
             dims: &dims,
             unlimited_dim0: true,
         }];
-        let total = oh_size(&msgs);
+        let total = oh_size(&msgs).expect("size");
         let mut buf = vec![0u8; total];
-        write_oh(&mut buf, 0, &msgs, &OhAddrs::default()).expect("write_oh");
+        write_oh(&mut buf, 0, &msgs, &OhAddrs::default(), 1).expect("write_oh");
         let body = 16 + MSG_HDR_SIZE;
         assert_eq!(
             u64::from_le_bytes(buf[body + 8..body + 16].try_into().unwrap()),

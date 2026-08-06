@@ -50,7 +50,7 @@ pub use oxih5_format::values::Value;
 pub use oxih5_format::{DimSelection, Hyperslab};
 
 mod write;
-pub use write::FileWriter;
+pub use write::{FileWriter, NumericValues};
 
 mod attr_view;
 pub use attr_view::AttrView;

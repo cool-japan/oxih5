@@ -23,24 +23,46 @@ use std::collections::HashMap;
 use oxih5_core::OxiH5Error;
 
 use super::btree_v1;
+use super::btree_v2::NameIndexWriter;
 use super::elem::{self, ResolvedAttr};
 use super::format;
+use super::fractal_heap::FractalHeapWriter;
+use super::link::{LinkInfo, LinkMsg, LinkValue};
 use super::oh;
 use super::payload::{self, Payload};
-use super::tree::{DatasetDesc, GroupNode};
+use super::tree::{DatasetDesc, GroupNode, LinkKind};
 use super::{chunked, pad8};
 
 /// Smallest local heap data segment libhdf5 is happy to see.
 const MIN_HEAP_DATA_SIZE: usize = 88;
 
+/// Most links a new-style group keeps in its own object header before moving
+/// them into a fractal heap.
+///
+/// libhdf5's default `max_compact` for a group creation property list.  Below
+/// it the links are object-header messages a reader finds by walking the
+/// header; at it and above, a fractal heap plus a version-2 name index.
+const MAX_COMPACT_LINKS: usize = 8;
+
+/// The "undefined address" sentinel a compact group's Link Info message carries
+/// in place of a fractal heap and a name index.
+const UNDEFINED_ADDRESS: u64 = u64::MAX;
+
 // ---------------------------------------------------------------------------
 // Plan structures
 // ---------------------------------------------------------------------------
 
-/// A local heap data segment together with the name offsets into it.
+/// A local heap data segment together with the offsets into it.
 pub(super) struct LocalHeap {
-    /// Offset of each name within the segment, in insertion order.
+    /// Offset of each link's name within the segment, in sorted-link order.
     pub(super) name_offsets: Vec<u64>,
+    /// Offset of each **soft link's value** within the segment, in the same
+    /// order; `None` for every link that is not a soft link.
+    ///
+    /// An old-style symbol table has nowhere else to put a soft link's target:
+    /// the entry itself carries only a 4-byte offset into this very heap, so
+    /// the path is interned here beside the names.
+    pub(super) value_offsets: Vec<Option<u64>>,
     /// The segment itself, already padded out to its allocated size.
     pub(super) data: Vec<u8>,
     /// Bytes of the segment in use; the free list starts here.
@@ -77,24 +99,91 @@ pub(super) struct DatasetPlan<'a> {
     /// Chunk dimension vector as the layout message stores it (chunk shape,
     /// then the element size); empty for a contiguous dataset.
     pub(super) chunk_dims: Vec<u32>,
-    /// Global-heap object index of each string, for a vlen-string dataset.
+    /// Global-heap object index of each string, for a vlen-string dataset, or
+    /// of each sequence, for a vlen-sequence dataset.
     pub(super) vlen_obj_idx: Vec<u32>,
+    /// Object header reference count: one, plus one per hard alias that names
+    /// this dataset.  Filled by [`GroupPlan::apply_refcounts`].
+    pub(super) refcount: u32,
 }
 
-/// What one symbol table link points at.
+/// What one of a group's links points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LinkTarget {
     /// Index into the enclosing group's dataset plans.
     Dataset(usize),
     /// Index into the enclosing group's sub-group plans.
     Group(usize),
+    /// Index into the enclosing group node's [`super::tree::LinkDesc`] list —
+    /// a link that owns no object: a hard alias, a soft link or an external
+    /// link.
+    Link(usize),
 }
 
-/// One link of a group's symbol table.
+/// One member of a group, in whichever encoding the group uses.
 pub(super) struct Link<'a> {
     /// The link name — also the sort key, compared as raw bytes.
     pub(super) name: &'a str,
     /// Where the link points.
     pub(super) target: LinkTarget,
+    /// Position in the group's creation order.
+    pub(super) creation_order: u64,
+}
+
+/// One link of a **new-style** group, with the message that encodes it.
+///
+/// The message is built during the layout pass, when its *length* is already
+/// final but a hard link's target address is not; [`GroupPlan::patch_links`]
+/// fills the addresses in afterwards, which cannot change any length because
+/// every hard-link value is exactly eight bytes.
+pub(super) struct PlannedLink {
+    /// The encoded link, address placeholder included.
+    pub(super) msg: LinkMsg,
+    /// Where the link points, for the address-patching pass.
+    pub(super) target: LinkTarget,
+}
+
+/// A new-style group's link storage, compact or dense.
+pub(super) struct LinkStorage {
+    /// Every member as a link message, in emission order.
+    pub(super) links: Vec<PlannedLink>,
+    /// The Link Info message's own fields.
+    pub(super) info: LinkInfo,
+    /// Set when the links live in a fractal heap rather than in the header.
+    pub(super) dense: Option<DenseLinks>,
+}
+
+impl LinkStorage {
+    /// The links this group carries as object-header messages: all of them for
+    /// a compact group, none for a dense one.
+    pub(super) fn header_links(&self) -> &[PlannedLink] {
+        match self.dense {
+            Some(_) => &[],
+            None => &self.links,
+        }
+    }
+
+    /// Address of the fractal heap, or the undefined sentinel when compact.
+    pub(super) fn fractal_heap_addr(&self) -> u64 {
+        self.dense
+            .as_ref()
+            .map_or(UNDEFINED_ADDRESS, |dense| dense.heap.header_addr())
+    }
+
+    /// Address of the name index, or the undefined sentinel when compact.
+    pub(super) fn name_index_addr(&self) -> u64 {
+        self.dense
+            .as_ref()
+            .map_or(UNDEFINED_ADDRESS, |dense| dense.index.header_addr())
+    }
+}
+
+/// The two structures a dense group's links live in.
+pub(super) struct DenseLinks {
+    /// Holds the link message bytes as heap objects.
+    pub(super) heap: FractalHeapWriter,
+    /// Maps each link name's hash to the heap ID that retrieves it.
+    pub(super) index: NameIndexWriter,
 }
 
 /// Where one group's local heap and symbol table live.
@@ -120,9 +209,24 @@ pub(super) struct GroupPlan<'a> {
     /// Bytes reserved for that object header.
     pub(super) oh_size: usize,
     /// The group's local heap and symbol table.
+    ///
+    /// Present for **every** group, new-style ones included: libhdf5 leaves the
+    /// symbol table structures in place when it converts a group to link
+    /// messages, and the parent's symbol table entry keeps caching their
+    /// addresses.  Reproducing that means a new-style group's entry stays a
+    /// perfectly ordinary `cache_type = 1` entry pointing at real (empty)
+    /// structures, rather than at addresses of things that do not exist.
     pub(super) sym: SymPlan,
     /// The group's links, in sorted order.
     pub(super) links: Vec<Link<'a>>,
+    /// New-style link storage; `None` for an old-style symbol-table group.
+    pub(super) link_storage: Option<LinkStorage>,
+    /// Resolved object-header address of each hard alias, indexed like
+    /// `node.links`; `None` for a soft or external link, and until resolution.
+    pub(super) link_addrs: Vec<Option<u64>>,
+    /// Object header reference count: one, plus one per hard alias naming this
+    /// group.  Filled by [`GroupPlan::apply_refcounts`].
+    pub(super) refcount: u32,
     /// Plans for the group's datasets, in declaration order.
     pub(super) datasets: Vec<DatasetPlan<'a>>,
     /// Plans for the group's sub-groups, in creation order.
@@ -133,6 +237,37 @@ pub(super) struct GroupPlan<'a> {
 // Links and the local heap
 // ---------------------------------------------------------------------------
 
+/// Every member of a group, in creation order, whatever kind it is.
+///
+/// Datasets, sub-groups and bare links are all *links* of the group they sit
+/// in; a group's member list is one list, never three, which is what makes the
+/// duplicate-name rule and the creation order well defined across all of them.
+fn collect_links(node: &GroupNode) -> Vec<Link<'_>> {
+    let mut links: Vec<Link<'_>> = node
+        .datasets
+        .iter()
+        .enumerate()
+        .map(|(index, ds)| Link {
+            name: ds.name.as_str(),
+            target: LinkTarget::Dataset(index),
+            creation_order: ds.creation_order,
+        })
+        .chain(node.groups.iter().enumerate().map(|(index, grp)| Link {
+            name: grp.name.as_str(),
+            target: LinkTarget::Group(index),
+            creation_order: grp.creation_order,
+        }))
+        .chain(node.links.iter().enumerate().map(|(index, link)| Link {
+            name: link.name.as_str(),
+            target: LinkTarget::Link(index),
+            creation_order: link.creation_order,
+        }))
+        .collect();
+    // Creation order is unique within a group, so this sort is total.
+    links.sort_unstable_by_key(|link| link.creation_order);
+    links
+}
+
 /// Order a group's links the way libhdf5 orders them: ascending by raw name
 /// bytes.
 ///
@@ -142,41 +277,54 @@ pub(super) struct GroupPlan<'a> {
 /// walk) still reports them.  Every downstream offset depends on this order, so
 /// it has to be settled before the local heap is built.
 ///
-/// Datasets and sub-groups interleave here: a group's links are ordered by
-/// name, never by kind.
-fn sorted_links<'a>(datasets: &'a [DatasetDesc], groups: &'a [GroupNode]) -> Vec<Link<'a>> {
-    let mut links: Vec<Link<'a>> = datasets
-        .iter()
-        .enumerate()
-        .map(|(index, ds)| Link {
-            name: ds.name.as_str(),
-            target: LinkTarget::Dataset(index),
-        })
-        .chain(groups.iter().enumerate().map(|(index, grp)| Link {
-            name: grp.name.as_str(),
-            target: LinkTarget::Group(index),
-        }))
-        .collect();
+/// Datasets, sub-groups and bare links interleave here: a group's links are
+/// ordered by name, never by kind.
+fn sorted_links(node: &GroupNode) -> Vec<Link<'_>> {
+    let mut links = collect_links(node);
     // Names are unique within a group, so the sort is total and an unstable
     // sort is deterministic.
     links.sort_unstable_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
     links
 }
 
-/// Build a local heap data segment holding `names`.
+/// The value a link interns in its group's local heap, if any.
 ///
-/// Offset 0 of the segment is reserved for the free-block link, every name is
+/// Only a soft link has one: a symbol table entry stores a 4-byte offset into
+/// the group's local heap instead of an address, and the target path lives
+/// there.  A hard alias resolves to an address, and an external link cannot
+/// appear in a symbol table at all.
+fn heap_value(node: &GroupNode, target: LinkTarget) -> Option<&str> {
+    let LinkTarget::Link(index) = target else {
+        return None;
+    };
+    match &node.links.get(index)?.kind {
+        LinkKind::Soft { path } => Some(path.as_str()),
+        LinkKind::HardAlias { .. } | LinkKind::External { .. } => None,
+    }
+}
+
+/// Build a local heap data segment holding every link name, and every soft
+/// link's target path beside it.
+///
+/// Offset 0 of the segment is reserved for the free-block link, every string is
 /// NUL-terminated and 8-byte aligned, and the tail carries a single free-list
 /// entry covering whatever slack the allocation rounded up to.
-fn build_local_heap<'a>(names: impl Iterator<Item = &'a str>) -> LocalHeap {
+fn build_local_heap(node: &GroupNode, links: &[Link<'_>]) -> LocalHeap {
     let mut bytes: Vec<u8> = vec![0u8; 8];
-    let mut name_offsets = Vec::new();
-    for name in names {
-        name_offsets.push(bytes.len() as u64);
-        bytes.extend_from_slice(name.as_bytes());
+    let intern = |bytes: &mut Vec<u8>, text: &str| -> u64 {
+        let offset = bytes.len() as u64;
+        bytes.extend_from_slice(text.as_bytes());
         bytes.push(0);
         let end = bytes.len();
         bytes.resize(pad8(end), 0);
+        offset
+    };
+
+    let mut name_offsets = Vec::with_capacity(links.len());
+    let mut value_offsets = Vec::with_capacity(links.len());
+    for link in links {
+        name_offsets.push(intern(&mut bytes, link.name));
+        value_offsets.push(heap_value(node, link.target).map(|value| intern(&mut bytes, value)));
     }
 
     let used = bytes.len();
@@ -189,6 +337,7 @@ fn build_local_heap<'a>(names: impl Iterator<Item = &'a str>) -> LocalHeap {
 
     LocalHeap {
         name_offsets,
+        value_offsets,
         data,
         used,
     }
@@ -204,8 +353,12 @@ fn build_local_heap<'a>(names: impl Iterator<Item = &'a str>) -> LocalHeap {
 ///
 /// Returns `OxiH5Error::Format` if the group holds more links than the writer
 /// will lay out.
-fn plan_sym_table(links: &[Link<'_>], current: &mut usize) -> Result<SymPlan, OxiH5Error> {
-    let heap = build_local_heap(links.iter().map(|link| link.name));
+fn plan_sym_table(
+    node: &GroupNode,
+    links: &[Link<'_>],
+    current: &mut usize,
+) -> Result<SymPlan, OxiH5Error> {
+    let heap = build_local_heap(node, links);
     let mut table = btree_v1::SymTable::plan(links.len())?;
 
     let btree_addr = *current;
@@ -259,7 +412,7 @@ fn plan_dataset<'a>(
     let chunk_dims = if chunk_shape.is_empty() {
         Vec::new()
     } else {
-        chunked::layout_chunk_dims(&chunk_shape, ds.elem_type.byte_size())?
+        chunked::layout_chunk_dims(&chunk_shape, ds.elem_size())?
     };
     // Refuse an over-cap chunk count from the geometry alone, before
     // `payload::build` cuts and compresses a single tile.  The chunk index caps
@@ -272,13 +425,12 @@ fn plan_dataset<'a>(
     let payload = payload::build(ds, &chunk_shape)?;
 
     let oh_addr = *current;
-    let oh_size = oh::oh_size(&oh::dataset_oh_msgs(ds, &chunk_dims, &attrs));
+    let oh_size = oh::oh_size(&oh::dataset_oh_msgs(ds, &chunk_dims, &attrs))?;
     *current += oh_size;
 
     let chunk_tree = match &payload {
         Payload::Chunked(images) => {
-            let mut tree =
-                chunked::ChunkTree::plan(ds.shape.len(), images.len(), ds.elem_type.byte_size())?;
+            let mut tree = chunked::ChunkTree::plan(ds.shape.len(), images.len(), ds.elem_size())?;
             tree.assign(*current);
             *current += tree.bytes();
             Some(tree)
@@ -303,7 +455,117 @@ fn plan_dataset<'a>(
         chunk_shape,
         chunk_dims,
         vlen_obj_idx: Vec::new(),
+        // One name reaches every object until a hard alias adds another; see
+        // [`GroupPlan::apply_refcounts`].
+        refcount: 1,
     })
+}
+
+/// Encode one member of a new-style group as a link message.
+///
+/// Hard links — to a dataset, a sub-group, or an aliased object elsewhere in
+/// the file — are encoded with a placeholder address, because at this point in
+/// the layout pass the target's object header has not been placed yet.  The
+/// *length* is already final (a hard link's value is always eight bytes), which
+/// is what lets the group's object header be sized here and patched later by
+/// [`GroupPlan::patch_links`].
+fn planned_link(node: &GroupNode, link: &Link<'_>, track_order: bool) -> PlannedLink {
+    let value = match link.target {
+        LinkTarget::Dataset(_) | LinkTarget::Group(_) => LinkValue::Hard(0),
+        LinkTarget::Link(index) => match node.links.get(index).map(|desc| &desc.kind) {
+            Some(LinkKind::Soft { path }) => LinkValue::Soft(path.clone()),
+            Some(LinkKind::External { file, path }) => LinkValue::External {
+                file: file.clone(),
+                path: path.clone(),
+            },
+            // A hard alias, or an index that cannot occur because `collect_links`
+            // built it from this very vector; either way the value is an address.
+            Some(LinkKind::HardAlias { .. }) | None => LinkValue::Hard(0),
+        },
+    };
+    PlannedLink {
+        msg: LinkMsg {
+            name: link.name.to_string(),
+            value,
+            creation_order: track_order.then_some(link.creation_order),
+        },
+        target: link.target,
+    }
+}
+
+/// Decide how a new-style group stores its links, and encode them.
+///
+/// Nothing here depends on where anything lands, which is the point: the
+/// group's object header can be sized from this *before* the cursor moves, and
+/// the addresses are filled in afterwards by [`LinkStorage::assign`].
+///
+/// A group at or below [`MAX_COMPACT_LINKS`] members keeps its links in its own
+/// object header; a larger one gets a fractal heap and a version-2 name index,
+/// both sized from the link messages' *lengths*, which are final even though
+/// their hard-link addresses are not.
+///
+/// # Errors
+///
+/// Returns `OxiH5Error::Format` if a link message cannot be encoded, or if the
+/// links together do not fit the one direct block the heap writer emits.
+fn build_link_storage(node: &GroupNode) -> Result<LinkStorage, OxiH5Error> {
+    // Emission order is creation order when the group tracks it, and name order
+    // otherwise — the same order an old-style group would have used, so turning
+    // a group new-style does not silently reshuffle it.
+    let ordered = if node.track_order {
+        collect_links(node)
+    } else {
+        sorted_links(node)
+    };
+    let links: Vec<PlannedLink> = ordered
+        .iter()
+        .map(|link| planned_link(node, link, node.track_order))
+        .collect();
+
+    let info = LinkInfo {
+        creation_order_tracked: node.track_order,
+        max_creation_order: node.next_creation_order,
+    };
+
+    if links.len() <= MAX_COMPACT_LINKS {
+        return Ok(LinkStorage {
+            links,
+            info,
+            dense: None,
+        });
+    }
+
+    let mut sizes = Vec::with_capacity(links.len());
+    for link in &links {
+        sizes.push(link.msg.body_size()?);
+    }
+    let heap = FractalHeapWriter::plan(&sizes)?;
+
+    let mut entries = Vec::with_capacity(links.len());
+    for (index, link) in links.iter().enumerate() {
+        entries.push((link.msg.name.clone(), heap.heap_id(index)?));
+    }
+    let index = NameIndexWriter::plan(entries)?;
+
+    Ok(LinkStorage {
+        links,
+        info,
+        dense: Some(DenseLinks { heap, index }),
+    })
+}
+
+impl LinkStorage {
+    /// Place this group's dense structures, advancing `current` past them.
+    ///
+    /// A compact group has nothing to place and leaves the cursor alone.
+    fn assign(&mut self, current: &mut usize) {
+        if let Some(dense) = &mut self.dense {
+            dense.heap.assign(*current);
+            *current += dense.heap.bytes();
+            dense.index.assign(*current);
+            *current += dense.index.bytes();
+        }
+    }
 }
 
 /// Reserve space for one group and everything beneath it.
@@ -331,13 +593,32 @@ pub(super) fn plan_group<'a>(
     current: &mut usize,
 ) -> Result<GroupPlan<'a>, OxiH5Error> {
     let attrs = elem::resolve_attrs(&node.attrs);
+    let links = sorted_links(node);
 
+    // A new-style group's links are messages in its own object header, so the
+    // link storage has to be planned before the header can be sized.  It also
+    // *reserves* file space (a dense group's heap and index), which is why the
+    // cursor is walked past the header first: the header sits at the group's
+    // own address, exactly as it does in the old-style case.
     let oh_addr = *current;
-    let oh_size = oh::oh_size(&oh::group_oh_msgs(&attrs));
-    *current += oh_size;
+    let (link_storage, oh_size) = if node.is_link_style() {
+        let mut storage = build_link_storage(node)?;
+        let size = oh::oh_size(&oh::link_group_oh_msgs(&storage, &attrs)?)?;
+        *current += size;
+        storage.assign(current);
+        (Some(storage), size)
+    } else {
+        let size = oh::oh_size(&oh::group_oh_msgs(&attrs))?;
+        *current += size;
+        (None, size)
+    };
 
-    let links = sorted_links(&node.datasets, &node.groups);
-    let sym = plan_sym_table(&links, current)?;
+    // Every group owns a symbol table, new-style ones included: libhdf5 leaves
+    // the structures behind when it converts a group, and the parent's cached
+    // entry keeps pointing at them.  A new-style group's table is empty — its
+    // members are links, not symbol table entries.
+    let sym_links: &[Link<'_>] = if node.is_link_style() { &[] } else { &links };
+    let sym = plan_sym_table(node, sym_links, current)?;
 
     let mut datasets = Vec::with_capacity(node.datasets.len());
     for ds in &node.datasets {
@@ -358,6 +639,9 @@ pub(super) fn plan_group<'a>(
         oh_size,
         sym,
         links,
+        link_storage,
+        link_addrs: vec![None; node.links.len()],
+        refcount: 1,
         datasets,
         groups,
     })
@@ -393,6 +677,110 @@ impl<'a> GroupPlan<'a> {
         }
     }
 
+    /// Resolve every hard alias in this subtree to the address it names, and
+    /// tally how many aliases reach each object.
+    ///
+    /// A hard alias is the one link kind whose value is an address the writer
+    /// has to look up: a soft link's value is a path the *reader* resolves, and
+    /// an external link's target is not in this file at all.  Resolving them
+    /// here — after the layout pass, against the same path map object-reference
+    /// attributes use — is what lets `create_hard_link` name its target the way
+    /// a user thinks of it.
+    ///
+    /// The tally is not bookkeeping: an object header's reference count is the
+    /// number of hard links that reach it, and libhdf5 writes 2 for a dataset
+    /// with one alias.  Leaving it at 1 makes `H5Ldelete` on either name free
+    /// storage the other name still points at.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OxiH5Error::Format` naming the link and its target if the
+    /// target is not an object in this file.
+    pub(super) fn resolve_link_targets(
+        &mut self,
+        path_to_addr: &HashMap<String, u64>,
+        counts: &mut HashMap<u64, u32>,
+    ) -> Result<(), OxiH5Error> {
+        for (index, link) in self.node.links.iter().enumerate() {
+            let LinkKind::HardAlias { target } = &link.kind else {
+                continue;
+            };
+            // "/a/b" and "a/b" are the same object; the map is keyed by the
+            // latter, which is also what `collect_addresses` records.
+            let key = target.trim_start_matches('/');
+            let addr = path_to_addr.get(key).copied().ok_or_else(|| {
+                OxiH5Error::Format(format!(
+                    "hard link '{}' names '{target}', which is not an object in this file",
+                    link.name
+                ))
+            })?;
+            if let Some(slot) = self.link_addrs.get_mut(index) {
+                *slot = Some(addr);
+            }
+            *counts.entry(addr).or_insert(0) += 1;
+        }
+        for grp in &mut self.groups {
+            grp.resolve_link_targets(path_to_addr, counts)?;
+        }
+        Ok(())
+    }
+
+    /// Set every object's header reference count from the alias tally.
+    pub(super) fn apply_refcounts(&mut self, counts: &HashMap<u64, u32>) {
+        let extra = |addr: usize| 1 + counts.get(&(addr as u64)).copied().unwrap_or(0);
+        self.refcount = extra(self.oh_addr);
+        for ds in &mut self.datasets {
+            ds.refcount = extra(ds.oh_addr);
+        }
+        for grp in &mut self.groups {
+            grp.apply_refcounts(counts);
+        }
+    }
+
+    /// Fill each new-style link message's hard-link address in.
+    ///
+    /// Every address a link message can carry is now known: a dataset's and a
+    /// sub-group's from their own plans, an alias's from
+    /// [`Self::resolve_link_targets`].  Because a hard link's value is a
+    /// fixed-width address, nothing here can change a message's length — which
+    /// is checked, not assumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OxiH5Error::Format` if a link points at something that was
+    /// never planned, or if patching an address changed a message's length.
+    pub(super) fn patch_links(&mut self) -> Result<(), OxiH5Error> {
+        if let Some(storage) = &mut self.link_storage {
+            for link in &mut storage.links {
+                let LinkValue::Hard(_) = link.msg.value else {
+                    continue;
+                };
+                let before = link.msg.body_size()?;
+                let addr = match link.target {
+                    LinkTarget::Dataset(index) => {
+                        self.datasets.get(index).map(|plan| plan.oh_addr as u64)
+                    }
+                    LinkTarget::Group(index) => {
+                        self.groups.get(index).map(|plan| plan.oh_addr as u64)
+                    }
+                    LinkTarget::Link(index) => self.link_addrs.get(index).copied().flatten(),
+                };
+                let addr = addr.ok_or_else(|| {
+                    OxiH5Error::Format(format!(
+                        "internal writer error: link '{}' has no resolved target address",
+                        link.msg.name
+                    ))
+                })?;
+                link.msg.value = LinkValue::Hard(addr);
+                super::check_size("patched link message", link.msg.body_size()?, before)?;
+            }
+        }
+        for grp in &mut self.groups {
+            grp.patch_links()?;
+        }
+        Ok(())
+    }
+
     /// Resolve every object reference in this subtree.
     ///
     /// # Errors
@@ -413,13 +801,31 @@ impl<'a> GroupPlan<'a> {
         Ok(())
     }
 
-    /// Register every vlen-string dataset in this subtree with the file's one
-    /// shared global heap collection, recording the object indices it hands back.
+    /// Register every variable-length dataset in this subtree with the file's
+    /// one shared global heap collection, recording the object indices it hands
+    /// back.
+    ///
+    /// Strings and sequences go into the very same collection set: on disk they
+    /// are the same thing, a heap object addressed by a 16-byte reference, and
+    /// only the datatype message distinguishes them.  An **empty** sequence
+    /// registers nothing — its reference is the all-zero null reference, which
+    /// is what libhdf5 writes and what `decode_vlen_sequences` reads back as an
+    /// empty sequence — so the index vector carries a 0 in that slot.
     pub(super) fn register_vlen_strings(&mut self, gcol: &mut oxih5_format::GlobalHeapWriter) {
         for ds in &mut self.datasets {
-            ds.vlen_obj_idx = match &ds.desc.vlen_strings {
-                Some(strings) => strings.iter().map(|s| gcol.write_string(s)).collect(),
-                None => Vec::new(),
+            ds.vlen_obj_idx = match (&ds.desc.vlen_strings, &ds.desc.vlen_seqs) {
+                (Some(strings), _) => strings.iter().map(|s| gcol.write_string(s)).collect(),
+                (None, Some(seqs)) => seqs
+                    .iter()
+                    .map(|bytes| {
+                        if bytes.is_empty() {
+                            0
+                        } else {
+                            gcol.write_bytes(bytes)
+                        }
+                    })
+                    .collect(),
+                (None, None) => Vec::new(),
             };
         }
         for grp in &mut self.groups {
@@ -480,7 +886,10 @@ mod tests {
             attrs: Vec::new(),
             storage: Storage::Contiguous,
             filter: None,
+            dtype: None,
             vlen_strings: None,
+            vlen_seqs: None,
+            creation_order: 0,
         }
     }
 
@@ -500,13 +909,16 @@ mod tests {
                 deflate: Some(6),
                 ..Filter::default()
             }),
+            dtype: None,
             vlen_strings: None,
+            vlen_seqs: None,
+            creation_order: 0,
         }
     }
 
     #[test]
     fn empty_local_heap_is_padded_to_the_minimum() {
-        let heap = build_local_heap(std::iter::empty());
+        let heap = build_local_heap(&GroupNode::new(""), &[]);
         assert!(heap.name_offsets.is_empty());
         assert_eq!(heap.used, 8);
         assert_eq!(heap.data.len(), MIN_HEAP_DATA_SIZE);
@@ -523,7 +935,11 @@ mod tests {
 
     #[test]
     fn local_heap_names_are_nul_terminated_and_aligned() {
-        let heap = build_local_heap(["lat", "longitude"].into_iter());
+        let mut node = GroupNode::new("");
+        node.push_dataset(dataset("lat"));
+        node.push_dataset(dataset("longitude"));
+        let links = sorted_links(&node);
+        let heap = build_local_heap(&node, &links);
         assert_eq!(heap.name_offsets, vec![8, 16]);
         assert_eq!(&heap.data[8..12], b"lat\0");
         assert_eq!(&heap.data[16..26], b"longitude\0");
@@ -534,8 +950,12 @@ mod tests {
 
     #[test]
     fn local_heap_grows_past_the_minimum_when_needed() {
-        let names: Vec<String> = (0..16).map(|i| format!("dataset_number_{i:03}")).collect();
-        let heap = build_local_heap(names.iter().map(String::as_str));
+        let mut node = GroupNode::new("");
+        for i in 0..16 {
+            node.push_dataset(dataset(&format!("dataset_number_{i:03}")));
+        }
+        let links = sorted_links(&node);
+        let heap = build_local_heap(&node, &links);
         assert!(heap.data.len() > MIN_HEAP_DATA_SIZE);
         assert!(heap.data.len() >= heap.used + 16);
         assert_eq!(heap.data.len() % 8, 0);
@@ -544,9 +964,12 @@ mod tests {
     /// Datasets and sub-groups share one name ordering.
     #[test]
     fn links_interleave_datasets_and_groups_by_name() {
-        let datasets = vec![dataset("zebra"), dataset("apple")];
-        let groups = vec![GroupNode::new("mango"), GroupNode::new("banana")];
-        let links = sorted_links(&datasets, &groups);
+        let mut node = GroupNode::new("");
+        node.push_dataset(dataset("zebra"));
+        node.push_dataset(dataset("apple"));
+        node.push_group(GroupNode::new("mango"));
+        node.push_group(GroupNode::new("banana"));
+        let links = sorted_links(&node);
         let names: Vec<&str> = links.iter().map(|link| link.name).collect();
         assert_eq!(names, vec!["apple", "banana", "mango", "zebra"]);
         // The targets still index the *declaration* order they came from.
@@ -567,8 +990,8 @@ mod tests {
     #[test]
     fn a_compressed_dataset_reserves_its_compressed_length() {
         let mut root = GroupNode::new("");
-        root.datasets.push(deflated("packed", 4096));
-        root.datasets.push(dataset("after"));
+        root.push_dataset(deflated("packed", 4096));
+        root.push_dataset(dataset("after"));
 
         let mut current = format::ROOT_OH_ADDR;
         let plan = plan_group(&root, &mut current).expect("plan");
@@ -615,12 +1038,12 @@ mod tests {
     #[test]
     fn nested_groups_are_planned_without_overlap() {
         let mut root = GroupNode::new("");
-        root.datasets.push(dataset("top"));
+        root.push_dataset(dataset("top"));
         let mut a = GroupNode::new("a");
         let mut b = GroupNode::new("b");
-        b.datasets.push(dataset("deep"));
-        a.groups.push(b);
-        root.groups.push(a);
+        b.push_dataset(dataset("deep"));
+        a.push_group(b);
+        root.push_group(a);
 
         let mut current = format::ROOT_OH_ADDR;
         let plan = plan_group(&root, &mut current).expect("plan");
@@ -644,12 +1067,12 @@ mod tests {
     #[test]
     fn addresses_are_collected_by_full_path() {
         let mut root = GroupNode::new("");
-        root.datasets.push(dataset("top"));
+        root.push_dataset(dataset("top"));
         let mut a = GroupNode::new("a");
         let mut b = GroupNode::new("b");
-        b.datasets.push(dataset("deep"));
-        a.groups.push(b);
-        root.groups.push(a);
+        b.push_dataset(dataset("deep"));
+        a.push_group(b);
+        root.push_group(a);
 
         let mut current = format::ROOT_OH_ADDR;
         let plan = plan_group(&root, &mut current).expect("plan");

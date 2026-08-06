@@ -38,3 +38,39 @@ name = "fuzz_file_open"
 path = "fuzz_targets/fuzz_file_open.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_fa_index"
+path = "fuzz_targets/fuzz_fa_index.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ea_index"
+path = "fuzz_targets/fuzz_ea_index.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_btree_v1_chunk"
+path = "fuzz_targets/fuzz_btree_v1_chunk.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_filters"
+path = "fuzz_targets/fuzz_filters.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_vds"
+path = "fuzz_targets/fuzz_vds.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_vlen_values"
+path = "fuzz_targets/fuzz_vlen_values.rs"
+test = false
+doc = false

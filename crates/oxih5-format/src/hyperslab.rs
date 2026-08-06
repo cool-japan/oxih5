@@ -111,6 +111,28 @@ impl Hyperslab {
     pub fn is_empty(&self) -> bool {
         self.dims.iter().any(|d| d.count == 0 || d.block == 0)
     }
+
+    /// Reject a selection with a zero `stride` in any non-empty dimension.
+    ///
+    /// `DimSelection::stride` is documented as `>= 1`, but `DimSelection`'s
+    /// fields are public for ergonomic construction, so nothing stops a
+    /// caller from building `DimSelection { stride: 0, .. }` directly. A
+    /// zero stride has no valid HDF5 meaning and, left unvalidated, causes a
+    /// divide-by-zero panic in [`DimSelection::contains`] and
+    /// [`scatter_chunk_hyperslab`]'s output-coordinate arithmetic the moment
+    /// a non-empty dimension (`count > 0 && block > 0`) is evaluated. Call
+    /// this at every facade entry point that accepts a caller-supplied
+    /// `Hyperslab` before it can reach that arithmetic.
+    pub fn validate(&self) -> Result<(), OxiH5Error> {
+        for (d, sel) in self.dims.iter().enumerate() {
+            if sel.count > 0 && sel.block > 0 && sel.stride == 0 {
+                return Err(OxiH5Error::Format(format!(
+                    "hyperslab selection dim {d}: stride must be >= 1 when count > 0 and block > 0 (got stride=0)"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Scatter elements from a decoded chunk into a hyperslab-shaped output buffer.
@@ -147,6 +169,7 @@ pub fn scatter_chunk_hyperslab(
             "scatter_chunk_hyperslab: dimension mismatch".into(),
         ));
     }
+    selection.validate()?;
 
     // Bounding box of the selection — used to clip the per-dim iteration range.
     let bbox = selection.bounding_ranges();
@@ -311,6 +334,98 @@ mod tests {
         let r: std::ops::Range<u64> = 0..3;
         let non_empty = Hyperslab::contiguous(&[r]);
         assert!(!non_empty.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Hyperslab::validate / stride == 0 divide-by-zero guard
+    // -----------------------------------------------------------------------
+
+    /// `DimSelection` has fully public fields, so a caller can construct
+    /// `stride: 0` directly (the doc comment says ">= 1" but nothing enforces
+    /// it). `validate()` must catch this before it ever reaches the division
+    /// in `DimSelection::contains` / `scatter_chunk_hyperslab`.
+    #[test]
+    fn test_validate_rejects_zero_stride_nonempty() {
+        let hs = Hyperslab {
+            dims: vec![DimSelection {
+                start: 0,
+                stride: 0,
+                count: 1,
+                block: 1,
+            }],
+        };
+        assert!(
+            hs.validate().is_err(),
+            "stride=0 with count>0 and block>0 must be rejected"
+        );
+    }
+
+    /// An already-empty dimension (`count == 0` or `block == 0`) never
+    /// reaches the division, so `stride == 0` there is harmless and must not
+    /// be rejected by `validate()`.
+    #[test]
+    fn test_validate_allows_zero_stride_when_already_empty() {
+        let count_zero = Hyperslab {
+            dims: vec![DimSelection {
+                start: 0,
+                stride: 0,
+                count: 0,
+                block: 1,
+            }],
+        };
+        assert!(count_zero.validate().is_ok());
+
+        let block_zero = Hyperslab {
+            dims: vec![DimSelection {
+                start: 0,
+                stride: 0,
+                count: 3,
+                block: 0,
+            }],
+        };
+        assert!(block_zero.validate().is_ok());
+    }
+
+    /// A non-empty selection with a legitimate stride passes validation.
+    #[test]
+    fn test_validate_accepts_normal_selection() {
+        let hs = Hyperslab::contiguous(&[0..4, 2..6]);
+        assert!(hs.validate().is_ok());
+    }
+
+    /// Regression: before `scatter_chunk_hyperslab` called `selection.validate()`,
+    /// a `stride: 0` selection panicked with a divide-by-zero inside
+    /// `DimSelection::contains` (`rel / self.stride`) the moment any element
+    /// in the chunk overlapped the selection's bounding box. It must now
+    /// return a typed error instead.
+    #[test]
+    fn test_scatter_chunk_hyperslab_zero_stride_errors_not_panics() {
+        let selection = Hyperslab {
+            dims: vec![DimSelection {
+                start: 0,
+                stride: 0,
+                count: 1,
+                block: 1,
+            }],
+        };
+        let out_shape = selection.output_shape();
+        let mut output = vec![0u8; out_shape.iter().product::<u64>() as usize];
+        let chunk_data = [42u8];
+
+        let result = scatter_chunk_hyperslab(
+            &mut output,
+            &chunk_data,
+            &[0u64],
+            &[1u64],
+            &selection,
+            &out_shape,
+            1,
+        );
+
+        assert!(
+            result.is_err(),
+            "stride=0 must return an error, not panic with divide-by-zero"
+        );
     }
 
     #[test]

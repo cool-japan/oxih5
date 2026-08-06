@@ -70,7 +70,24 @@ fn collect(
     }
 
     let off = node_address as usize;
-    if off + 24 > file_data.len() {
+    // `node_address` is a raw on-disk file address — read straight from a
+    // sibling/child pointer (see the `read_u64(file_data, child_off)` call
+    // below) with no upstream validation, so it can be any `u64`, including
+    // values near `u64::MAX`. In a release build, plain `off + 24` silently
+    // wraps on overflow instead of panicking; a wrapped sum can come out
+    // *smaller* than `file_data.len()`, which would make the bounds check
+    // below pass even though `off` itself is far out of range. The direct
+    // slice a few lines down (`file_data[off..off + 4]`) would then panic
+    // with a "range start index ... out of range" instead of this function
+    // returning its typed error — confirmed by fuzzing (`fuzz_btree_v1_chunk`).
+    // `checked_add` closes that: an overflow is rejected here, before any
+    // indexing happens.
+    let node_end = off.checked_add(24).ok_or_else(|| {
+        OxiH5Error::Format(format!(
+            "chunk B-tree node address {node_address:#x} overflows a file offset"
+        ))
+    })?;
+    if node_end > file_data.len() {
         return Err(OxiH5Error::Format(format!(
             "chunk B-tree node at {node_address:#x}: out of bounds (file len={})",
             file_data.len()
@@ -92,17 +109,34 @@ fn collect(
     let entries_used = u16::from_le_bytes([file_data[off + 6], file_data[off + 7]]) as usize;
 
     // A chunk key is: size(4) + filter_mask(4) + (ndims+1)*8 offset bytes.
+    // `ndims` is bounded to at most 255 by its single-byte on-disk encoding
+    // (`parse_dataspace`'s `dimensionality: u8`), so `key_size` itself cannot
+    // overflow; the per-entry offsets built from it below still need
+    // checked arithmetic because `entries_used` (attacker-controlled, up to
+    // `u16::MAX`) multiplies it.
     let key_size = 8 + (ndims + 1) * 8;
     let child_size = 8usize;
+    let stride = key_size + child_size;
 
     // Keys and children are interleaved starting at off+24:
     //   key[0] child[0] key[1] child[1] … key[K-1] child[K-1] key[K]
     // child[i] sits immediately after key[i]:
     //   child[i] @ off + 24 + (i+1)*key_size + i*child_size
     for i in 0..entries_used {
-        let key_off = off + 24 + i * (key_size + child_size);
-        let child_off = key_off + key_size;
-        if child_off + child_size > file_data.len() {
+        // Same wrap-then-pass-bounds-check hazard as `node_end` above: `i`
+        // and `stride` are both attacker-influenced (via `entries_used` and
+        // `ndims`), so build `key_off`/`child_off` with checked arithmetic.
+        let key_off = i
+            .checked_mul(stride)
+            .and_then(|p| p.checked_add(node_end))
+            .ok_or_else(|| OxiH5Error::Format(format!("chunk B-tree key[{i}] offset overflows")))?;
+        let child_off = key_off.checked_add(key_size).ok_or_else(|| {
+            OxiH5Error::Format(format!("chunk B-tree child[{i}] offset overflows"))
+        })?;
+        let child_end = child_off.checked_add(child_size).ok_or_else(|| {
+            OxiH5Error::Format(format!("chunk B-tree child[{i}] offset overflows"))
+        })?;
+        if child_end > file_data.len() {
             return Err(OxiH5Error::Format(format!(
                 "chunk B-tree child[{i}] at {child_off:#x}: out of bounds"
             )));
@@ -132,7 +166,15 @@ fn parse_chunk_key(
     ndims: usize,
     address: u64,
 ) -> Result<ChunkRecord, OxiH5Error> {
-    if key_off + 8 > file_data.len() {
+    // `key_off` is derived from `collect`'s already-`checked_add`ed
+    // arithmetic, but treat it as untrusted here too — `parse_chunk_key` is
+    // a free function callable with any `key_off`, and a future caller must
+    // not be able to reintroduce the same wrap-then-pass-bounds-check
+    // hazard fixed in `collect`.
+    let header_end = key_off
+        .checked_add(8)
+        .ok_or_else(|| OxiH5Error::Format("chunk B-tree: key offset overflows".into()))?;
+    if header_end > file_data.len() {
         return Err(OxiH5Error::Format(
             "chunk B-tree: key truncated (size/mask)".into(),
         ));
@@ -141,10 +183,21 @@ fn parse_chunk_key(
     let filter_mask = read_u32(file_data, key_off + 4)?;
 
     // Read `ndims` real offsets (skip the trailing element-offset dimension).
+    // `ndims` itself is bounded to at most 255 (see `collect`), so
+    // `Vec::with_capacity(ndims)` is safe; `header_end + d * 8` still needs
+    // checked arithmetic since it is built from `key_off`.
     let mut offsets = Vec::with_capacity(ndims);
     for d in 0..ndims {
-        let o = key_off + 8 + d * 8;
-        if o + 8 > file_data.len() {
+        let o = d
+            .checked_mul(8)
+            .and_then(|p| p.checked_add(header_end))
+            .ok_or_else(|| {
+                OxiH5Error::Format(format!("chunk B-tree: offset[{d}] position overflows"))
+            })?;
+        let o_end = o.checked_add(8).ok_or_else(|| {
+            OxiH5Error::Format(format!("chunk B-tree: offset[{d}] position overflows"))
+        })?;
+        if o_end > file_data.len() {
             return Err(OxiH5Error::Format(format!(
                 "chunk B-tree: offset[{d}] truncated"
             )));
@@ -255,6 +308,78 @@ mod tests {
         let mut buf = vec![0u8; 64];
         buf[0..4].copy_from_slice(b"XXXX");
         assert!(parse(&buf, 0, 1).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: a node/child address near `u64::MAX` must error, not panic.
+    //
+    // `collect`'s bounds check used to be plain `off + 24 > file_data.len()`.
+    // In a release build that addition silently wraps on overflow instead of
+    // panicking, so for `off` within 24 of `usize::MAX` the wrapped sum comes
+    // out *smaller* than `file_data.len()` and the check falsely passes. The
+    // very next line then slices `file_data[off..off + 4]` with the
+    // still-huge `off`, which panics with a "range start index ... out of
+    // range" message instead of this function returning its typed error.
+    // Found by `fuzz/fuzz_targets/fuzz_btree_v1_chunk.rs`
+    // (`crates/oxih5-format/src/btree_v1_chunk.rs:79` on a 161-byte input,
+    // `off = 0xFFFFFFFFFFFFFFFC`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_root_address_overflow_rejected_not_panic() {
+        let buf = vec![0u8; 64];
+        let evil_addr = u64::MAX - 3;
+        let result = parse(&buf, evil_addr, 1);
+        assert!(
+            result.is_err(),
+            "an overflowing root node address must return an error, not panic"
+        );
+    }
+
+    /// Same hazard, but reached the way the fuzzer actually found it: an
+    /// internal node's on-disk child pointer (read via `read_u64`, no
+    /// upstream validation) is the huge value, not the address `parse` is
+    /// called with directly.
+    #[test]
+    fn test_internal_node_child_address_overflow_rejected_not_panic() {
+        let ndims = 1;
+        let key_size = 8 + (ndims + 1) * 8;
+        let child_size = 8;
+        let root_addr = 0usize;
+
+        let mut buf = vec![0u8; 64];
+        buf[root_addr..root_addr + 4].copy_from_slice(b"TREE");
+        buf[root_addr + 4] = 1; // node type = raw data chunks
+        buf[root_addr + 5] = 1; // level 1 (internal)
+        buf[root_addr + 6..root_addr + 8].copy_from_slice(&1u16.to_le_bytes()); // 1 entry
+        buf[root_addr + 8..root_addr + 16].copy_from_slice(&UNDEF.to_le_bytes());
+        buf[root_addr + 16..root_addr + 24].copy_from_slice(&UNDEF.to_le_bytes());
+
+        // child[0] — an attacker-controlled on-disk pointer near `u64::MAX`.
+        let c0 = root_addr + 24 + key_size;
+        let evil_child_addr = u64::MAX - 3;
+        buf[c0..c0 + 8].copy_from_slice(&evil_child_addr.to_le_bytes());
+        let _ = child_size; // documents the interleaving; not otherwise needed
+
+        let result = parse(&buf, root_addr as u64, ndims);
+        assert!(
+            result.is_err(),
+            "an overflowing child node address must return an error, not panic"
+        );
+    }
+
+    /// Direct regression for `parse_chunk_key`'s own overflow guard: a
+    /// `key_off` near `usize::MAX` must not panic either, independent of
+    /// however `collect` derived it.
+    #[test]
+    fn test_parse_chunk_key_offset_overflow_rejected_not_panic() {
+        let buf = vec![0u8; 32];
+        let evil_key_off = usize::MAX - 2;
+        let result = parse_chunk_key(&buf, evil_key_off, 2, 0x1000);
+        assert!(
+            result.is_err(),
+            "an overflowing key offset must return an error, not panic"
+        );
     }
 
     #[test]

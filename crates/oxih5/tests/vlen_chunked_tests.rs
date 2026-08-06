@@ -22,9 +22,15 @@ fn expected() -> Vec<String> {
 #[test]
 fn chunked_vlen_strings_full() {
     let path = fixture("vlen_str_chunked.h5");
-    if !path.exists() {
-        return;
-    }
+    // This fixture is committed to git (`tests/fixtures/vlen_str_chunked.h5`);
+    // a missing file means a broken checkout, not an environment where the
+    // test should be silently skipped — fail loudly instead of vacuously
+    // passing (see tests/gen_fixtures.py for how it's regenerated).
+    assert!(
+        path.exists(),
+        "fixture vlen_str_chunked.h5 missing at {} — it is tracked in git",
+        path.display()
+    );
     let file = oxih5::open(&path).expect("open chunked vlen fixture");
     let strings = file
         .dataset_strings("words")
@@ -35,9 +41,13 @@ fn chunked_vlen_strings_full() {
 #[test]
 fn chunked_vlen_strings_hyperslab() {
     let path = fixture("vlen_str_chunked.h5");
-    if !path.exists() {
-        return;
-    }
+    // See `chunked_vlen_strings_full` above: this fixture is tracked in git,
+    // so a missing file must fail the test, not silently skip it.
+    assert!(
+        path.exists(),
+        "fixture vlen_str_chunked.h5 missing at {} — it is tracked in git",
+        path.display()
+    );
     let file = oxih5::open(&path).expect("open chunked vlen fixture");
     // Select elements 2..7, which spans chunk boundaries (chunks of 3).
     let ranges: Vec<std::ops::Range<usize>> = std::iter::once(2..7).collect();

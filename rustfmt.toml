@@ -1,0 +1,12 @@
+# rustfmt configuration for the OxiH5 workspace.
+#
+# Deliberately minimal: the existing codebase already matches rustfmt's
+# stable defaults (verified via `cargo fmt --all -- --check` before this file
+# was added), so this file exists to pin that behavior explicitly rather than
+# to change formatting. `edition` is set to match `workspace.package.edition`
+# in the top-level `Cargo.toml` so `cargo fmt` doesn't have to infer it
+# per-crate. Only stable rustfmt options are used — nightly-only options
+# (e.g. `imports_granularity`, `wrap_comments`) would make `cargo fmt` print
+# a warning on the stable toolchain this workspace targets, which would
+# violate the zero-warnings policy.
+edition = "2021"

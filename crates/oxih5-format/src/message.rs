@@ -365,6 +365,17 @@ pub fn parse_layout(body: &[u8]) -> Result<LayoutInfo, OxiH5Error> {
             for i in 0..ndims {
                 chunk_dims.push(read_u32_le(body, 11 + i * 4)? as u64);
             }
+            // A zero chunk dimension (including the implicit trailing
+            // element-size slot) has no valid HDF5 meaning and, left
+            // unvalidated, lets a crafted/corrupted file reach a
+            // divide-by-zero panic deep in whichever chunk reader ends up
+            // dividing dataset coordinates by it (chunked.rs, chunked_hyperslab.rs).
+            // Reject it here, once, for every reader.
+            if let Some(pos) = chunk_dims.iter().position(|&d| d == 0) {
+                return Err(OxiH5Error::Format(format!(
+                    "layout v3 chunked: chunk dimension {pos} is zero"
+                )));
+            }
             Ok(LayoutInfo::Chunked {
                 data_address,
                 dimensionality,
@@ -490,6 +501,18 @@ pub fn parse_layout(body: &[u8]) -> Result<LayoutInfo, OxiH5Error> {
                     value |= (byte as u64) << (8 * shift);
                 }
                 chunk_dims.push(value);
+            }
+
+            // A zero chunk dimension (including the implicit trailing
+            // element-size slot) has no valid HDF5 meaning and, left
+            // unvalidated, lets a crafted/corrupted file reach a
+            // divide-by-zero panic deep in whichever chunk reader ends up
+            // dividing dataset coordinates by it (chunked.rs, chunked_hyperslab.rs).
+            // Reject it here, once, for every reader.
+            if let Some(pos) = chunk_dims.iter().position(|&d| d == 0) {
+                return Err(OxiH5Error::Format(format!(
+                    "layout v{version} chunked: chunk dimension {pos} is zero"
+                )));
             }
 
             // Chunk indexing type, then its variable-size parameter block.
@@ -1198,6 +1221,57 @@ mod tests {
             }
             _ => panic!("expected Chunked"),
         }
+    }
+
+    /// A crafted layout v3 chunked message claiming a zero-sized chunk
+    /// dimension must be rejected at parse time — not accepted and later
+    /// divided by inside a chunk reader (chunked.rs / chunked_hyperslab.rs),
+    /// which used to panic with a divide-by-zero.
+    #[test]
+    fn test_parse_layout_v3_chunked_zero_dim_rejected() {
+        let ndims: u8 = 2;
+        let mut body = vec![0u8; 11 + ndims as usize * 4];
+        body[0] = 3;
+        body[1] = 2; // chunked
+        body[2] = ndims;
+        body[3..11].copy_from_slice(&0x2000u64.to_le_bytes());
+        body[11..15].copy_from_slice(&0u32.to_le_bytes()); // dim[0] = 0 (invalid)
+        body[15..19].copy_from_slice(&4u32.to_le_bytes()); // dim[1] (elem size)
+        let err = parse_layout(&body).expect_err("zero chunk dimension must be rejected");
+        assert!(
+            matches!(err, OxiH5Error::Format(_)),
+            "expected a typed Format error, got {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("dimension"),
+            "error should name the offending chunk dimension: {err}"
+        );
+    }
+
+    /// Same as above but for the layout v4 chunked encoding (variable-width
+    /// dimension fields + chunk-indexing-type parameter block).
+    #[test]
+    fn test_parse_layout_v4_chunked_zero_dim_rejected() {
+        // version=4, class=2 (chunked), flags=0, dimensionality=2, enc_bytes=4
+        let mut body = vec![0u8; 22];
+        body[0] = 4;
+        body[1] = 2;
+        body[2] = 0; // flags
+        body[3] = 2; // dimensionality
+        body[4] = 4; // enc_bytes
+        body[5..9].copy_from_slice(&0u32.to_le_bytes()); // dim[0] = 0 (invalid)
+        body[9..13].copy_from_slice(&4u32.to_le_bytes()); // dim[1] (elem size)
+        body[13] = 2; // chunk indexing type = implicit (no parameter block)
+        body[14..22].copy_from_slice(&0x3000u64.to_le_bytes()); // index address
+        let err = parse_layout(&body).expect_err("zero chunk dimension must be rejected");
+        assert!(
+            matches!(err, OxiH5Error::Format(_)),
+            "expected a typed Format error, got {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("dimension"),
+            "error should name the offending chunk dimension: {err}"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -158,11 +158,17 @@ pub fn decode_vlen_strings(
     data: &[u8],
     n_elems: usize,
 ) -> Result<Vec<String>, OxiH5Error> {
-    if data.len() < n_elems * 16 {
+    // `n_elems` ultimately derives from a dataspace dimension product, which
+    // is attacker-controlled (a crafted file). `checked_mul` avoids a
+    // wrap-then-undersized-check on 32-bit/wasm32 `usize`, and also closes
+    // the (much less likely) 64-bit case of a dataspace dimension near
+    // `u64::MAX`; either way the multiplication must never silently wrap.
+    let needed = n_elems
+        .checked_mul(16)
+        .ok_or_else(|| OxiH5Error::Format("vlen string buffer: n_elems * 16 overflows".into()))?;
+    if data.len() < needed {
         return Err(OxiH5Error::Format(format!(
-            "vlen string buffer: need {} bytes for {} elems, got {}",
-            n_elems * 16,
-            n_elems,
+            "vlen string buffer: need {needed} bytes for {n_elems} elems, got {}",
             data.len()
         )));
     }
@@ -205,11 +211,12 @@ pub fn decode_vlen_sequences(
     n_elems: usize,
     base_dtype: &Dtype,
 ) -> Result<Vec<Value>, OxiH5Error> {
-    if data.len() < n_elems * 16 {
+    let header_needed = n_elems
+        .checked_mul(16)
+        .ok_or_else(|| OxiH5Error::Format("vlen sequence buffer: n_elems * 16 overflows".into()))?;
+    if data.len() < header_needed {
         return Err(OxiH5Error::Format(format!(
-            "vlen sequence buffer: need {} bytes for {} refs, got {}",
-            n_elems * 16,
-            n_elems,
+            "vlen sequence buffer: need {header_needed} bytes for {n_elems} refs, got {}",
             data.len()
         )));
     }
@@ -238,7 +245,15 @@ pub fn decode_vlen_sequences(
         let seq_len = seq_len as usize;
         let raw = heap_object_bytes(file_data, heap_addr, obj_idx, &mut heap_cache)?.to_vec();
 
-        let needed = seq_len * elem_footprint;
+        // `seq_len` is a u32 read straight off disk; on 32-bit/wasm32 `usize`
+        // this multiplication can wrap and pass the length guard with a
+        // wrapped-small `needed`, letting the loop below slice `raw` out of
+        // bounds. `checked_mul` turns that into a typed error instead.
+        let needed = seq_len.checked_mul(elem_footprint).ok_or_else(|| {
+            OxiH5Error::Format(format!(
+                "vlen sequence elem {i}: seq_len {seq_len} * elem_footprint {elem_footprint} overflows"
+            ))
+        })?;
         if raw.len() < needed {
             return Err(OxiH5Error::Format(format!(
                 "vlen sequence elem {i}: heap object has {} bytes, expected {} ({seq_len} × {elem_footprint})",
@@ -284,10 +299,12 @@ pub fn decode_vlen_sequences(
 /// Each reference is a u64 LE absolute byte offset of the target object's header.
 /// `u64::MAX` is an undefined/null reference (returned as `Value::ObjectRef(u64::MAX)`).
 pub fn decode_object_refs(data: &[u8], n_elems: usize) -> Result<Vec<u64>, OxiH5Error> {
-    if data.len() < n_elems * 8 {
+    let needed = n_elems
+        .checked_mul(8)
+        .ok_or_else(|| OxiH5Error::Format("object refs buffer: n_elems * 8 overflows".into()))?;
+    if data.len() < needed {
         return Err(OxiH5Error::Format(format!(
-            "object refs buffer: need {} bytes, got {}",
-            n_elems * 8,
+            "object refs buffer: need {needed} bytes, got {}",
             data.len()
         )));
     }
@@ -790,7 +807,11 @@ pub fn decode_one_value(
             let base_size = base.size().unwrap_or(16);
             let seq_len = seq_len as usize;
             let raw = heap_object_bytes(file_data, heap_addr, obj_idx, heap_cache)?.to_vec();
-            let needed = seq_len * base_size;
+            let needed = seq_len.checked_mul(base_size).ok_or_else(|| {
+                OxiH5Error::Format(format!(
+                    "vlen sequence: seq_len {seq_len} * base_size {base_size} overflows"
+                ))
+            })?;
             if raw.len() < needed {
                 return Err(OxiH5Error::Format(format!(
                     "vlen sequence: heap object has {} bytes, need {needed}",
@@ -1055,6 +1076,22 @@ mod tests {
         assert_eq!(strings[1], "beta");
     }
 
+    /// Regression: `n_elems` derives from a dataspace dimension product,
+    /// which is attacker-controlled. Before the fix, `n_elems * 16` used
+    /// plain multiplication, which panics with "attempt to multiply with
+    /// overflow" in a debug build (and silently wraps in release, letting an
+    /// undersized buffer pass the length check). `checked_mul` must turn
+    /// this into a typed `Err` on every profile.
+    #[test]
+    fn test_decode_vlen_strings_huge_n_elems_no_overflow_panic() {
+        let data = [0u8; 4];
+        let result = decode_vlen_strings(&[], &data, usize::MAX / 4);
+        assert!(
+            result.is_err(),
+            "huge n_elems must return an error, not overflow-panic"
+        );
+    }
+
     // ------------------------------------------------------------------
     // decode_object_refs
 
@@ -1072,6 +1109,17 @@ mod tests {
     #[test]
     fn test_decode_object_refs_too_short() {
         assert!(decode_object_refs(&[0u8; 4], 1).is_err());
+    }
+
+    /// Regression: same overflow hazard as `decode_vlen_strings` — `n_elems
+    /// * 8` used plain multiplication before the fix.
+    #[test]
+    fn test_decode_object_refs_huge_n_elems_no_overflow_panic() {
+        let result = decode_object_refs(&[0u8; 4], usize::MAX / 4);
+        assert!(
+            result.is_err(),
+            "huge n_elems must return an error, not overflow-panic"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1361,6 +1409,28 @@ mod tests {
         };
         let v = decode_one_value(&[], &bytes, &dtype, &mut HashMap::new(), 0).unwrap();
         assert_eq!(v, Value::Bitfield(0xFF));
+    }
+
+    // ------------------------------------------------------------------
+    // decode_vlen_sequences: overflow guard
+
+    /// Regression: `decode_vlen_sequences`'s header check used plain
+    /// `n_elems * 16` before the fix — same overflow hazard as
+    /// `decode_vlen_strings`, reachable through the same attacker-controlled
+    /// dataspace-derived `n_elems`.
+    #[test]
+    fn test_decode_vlen_sequences_huge_n_elems_no_overflow_panic() {
+        let base_dtype = Dtype::Int {
+            size: 4,
+            signed: true,
+            order: ByteOrder::Little,
+        };
+        let data = [0u8; 4];
+        let result = decode_vlen_sequences(&[], &data, usize::MAX / 4, &base_dtype);
+        assert!(
+            result.is_err(),
+            "huge n_elems must return an error, not overflow-panic"
+        );
     }
 
     // ------------------------------------------------------------------

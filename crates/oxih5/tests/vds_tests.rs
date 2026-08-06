@@ -21,9 +21,13 @@ fn fixture(name: &str) -> std::path::PathBuf {
 #[test]
 fn vds_simple_full_mapping() {
     let path = fixture("vds_simple.h5");
-    if !path.exists() {
-        return; // fixture not generated
-    }
+    // Tracked in git (`tests/fixtures/vds_simple.h5`) — a missing file means a
+    // broken checkout and must fail the test loudly, not skip it silently.
+    assert!(
+        path.exists(),
+        "fixture vds_simple.h5 missing at {} — it is tracked in git",
+        path.display()
+    );
     let file = oxih5::open(&path).expect("open vds_simple.h5");
     let ds = file.dataset("virt").expect("resolve virtual dataset");
     assert_eq!(ds.shape, vec![6]);
@@ -36,9 +40,12 @@ fn vds_simple_full_mapping() {
 #[test]
 fn vds_concat_two_sources() {
     let path = fixture("vds_concat.h5");
-    if !path.exists() {
-        return;
-    }
+    // Tracked in git — see `vds_simple_full_mapping` above.
+    assert!(
+        path.exists(),
+        "fixture vds_concat.h5 missing at {} — it is tracked in git",
+        path.display()
+    );
     let file = oxih5::open(&path).expect("open vds_concat.h5");
     let ds = file.dataset("cat").expect("resolve virtual dataset");
     assert_eq!(ds.shape, vec![8]);
@@ -50,9 +57,12 @@ fn vds_concat_two_sources() {
 #[test]
 fn vds_main_fixture() {
     let path = fixture("vds_main.h5");
-    if !path.exists() {
-        return;
-    }
+    // Tracked in git — see `vds_simple_full_mapping` above.
+    assert!(
+        path.exists(),
+        "fixture vds_main.h5 missing at {} — it is tracked in git",
+        path.display()
+    );
     let file = oxih5::open(&path).expect("open vds_main.h5");
     let ds = file
         .dataset("virtual_data")
@@ -69,9 +79,12 @@ fn vds_main_fixture() {
 #[test]
 fn soft_link_through_external_link() {
     let path = fixture("soft_ext_main.h5");
-    if !path.exists() {
-        return;
-    }
+    // Tracked in git — see `vds_simple_full_mapping` above.
+    assert!(
+        path.exists(),
+        "fixture soft_ext_main.h5 missing at {} — it is tracked in git",
+        path.display()
+    );
     let file = oxih5::open(&path).expect("open soft_ext_main.h5");
     let via_ext = file.dataset("ext").expect("resolve external link");
     assert_eq!(via_ext.as_i32().expect("i32"), vec![7, 8, 9, 10]);

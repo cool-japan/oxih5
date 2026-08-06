@@ -4,8 +4,9 @@
 //! for which objects can carry attributes — and the duplicate-name overwrite
 //! semantics — lives in exactly one place.  See [`super`] for the overview.
 
-use oxih5_core::OxiH5Error;
+use oxih5_core::{ByteOrder, OxiH5Error};
 
+use super::api_datasets::NumericValues;
 use super::elem::{AttrDesc, AttrKind, ElemType};
 use super::tree::attrs_mut;
 use super::FileWriter;
@@ -202,7 +203,7 @@ impl FileWriter {
             attr_name,
             AttrKind::Num {
                 elem: ElemType::F32,
-                le_bytes: value.to_le_bytes().to_vec(),
+                bytes: value.to_le_bytes().to_vec(),
             },
         )
     }
@@ -223,7 +224,7 @@ impl FileWriter {
             attr_name,
             AttrKind::Num {
                 elem: ElemType::I8,
-                le_bytes: value.to_le_bytes().to_vec(),
+                bytes: value.to_le_bytes().to_vec(),
             },
         )
     }
@@ -244,7 +245,7 @@ impl FileWriter {
             attr_name,
             AttrKind::Num {
                 elem: ElemType::I16,
-                le_bytes: value.to_le_bytes().to_vec(),
+                bytes: value.to_le_bytes().to_vec(),
             },
         )
     }
@@ -265,7 +266,7 @@ impl FileWriter {
             attr_name,
             AttrKind::Num {
                 elem: ElemType::U8,
-                le_bytes: value.to_le_bytes().to_vec(),
+                bytes: value.to_le_bytes().to_vec(),
             },
         )
     }
@@ -286,7 +287,7 @@ impl FileWriter {
             attr_name,
             AttrKind::Num {
                 elem: ElemType::U16,
-                le_bytes: value.to_le_bytes().to_vec(),
+                bytes: value.to_le_bytes().to_vec(),
             },
         )
     }
@@ -307,7 +308,7 @@ impl FileWriter {
             attr_name,
             AttrKind::Num {
                 elem: ElemType::U32,
-                le_bytes: value.to_le_bytes().to_vec(),
+                bytes: value.to_le_bytes().to_vec(),
             },
         )
     }
@@ -328,7 +329,7 @@ impl FileWriter {
             attr_name,
             AttrKind::Num {
                 elem: ElemType::U64,
-                le_bytes: value.to_le_bytes().to_vec(),
+                bytes: value.to_le_bytes().to_vec(),
             },
         )
     }
@@ -353,7 +354,7 @@ impl FileWriter {
             attr_name,
             AttrKind::NumArray {
                 elem: ElemType::F32,
-                le_bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
             },
         )
     }
@@ -374,7 +375,7 @@ impl FileWriter {
             attr_name,
             AttrKind::NumArray {
                 elem: ElemType::I8,
-                le_bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
             },
         )
     }
@@ -395,7 +396,7 @@ impl FileWriter {
             attr_name,
             AttrKind::NumArray {
                 elem: ElemType::I16,
-                le_bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
             },
         )
     }
@@ -422,7 +423,7 @@ impl FileWriter {
             attr_name,
             AttrKind::NumArray {
                 elem: ElemType::I32,
-                le_bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
             },
         )
     }
@@ -443,7 +444,7 @@ impl FileWriter {
             attr_name,
             AttrKind::NumArray {
                 elem: ElemType::U8,
-                le_bytes: values.to_vec(),
+                bytes: values.to_vec(),
             },
         )
     }
@@ -464,7 +465,7 @@ impl FileWriter {
             attr_name,
             AttrKind::NumArray {
                 elem: ElemType::U16,
-                le_bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
             },
         )
     }
@@ -485,7 +486,7 @@ impl FileWriter {
             attr_name,
             AttrKind::NumArray {
                 elem: ElemType::U32,
-                le_bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
             },
         )
     }
@@ -506,7 +507,7 @@ impl FileWriter {
             attr_name,
             AttrKind::NumArray {
                 elem: ElemType::U64,
-                le_bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
             },
         )
     }
@@ -609,5 +610,79 @@ impl FileWriter {
             });
         }
         Ok(())
+    }
+}
+
+impl FileWriter {
+    // -----------------------------------------------------------------------
+    // G008 / G012: attributes in an explicit byte order, and half precision
+    // -----------------------------------------------------------------------
+
+    /// Write a 1-D numeric attribute in an explicit byte order.
+    ///
+    /// The counterpart of [`FileWriter::write_dataset_numeric`] for attributes:
+    /// it covers the two shapes the per-type `write_*_array_attr` methods do not
+    /// — **big-endian** values, and **half-precision** floats — and is
+    /// equivalent to them for `ByteOrder::Little` otherwise.  The declared
+    /// datatype and the payload bytes come from the same `order`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write_string_attr`]; additionally `OxiH5Error::Format` if
+    /// `values` is empty, since HDF5 has no zero-length attribute dataspace
+    /// this writer can emit.
+    pub fn write_numeric_attr(
+        &mut self,
+        path: &str,
+        attr_name: &str,
+        values: NumericValues<'_>,
+        order: ByteOrder,
+    ) -> Result<(), OxiH5Error> {
+        if values.is_empty() {
+            return Err(OxiH5Error::Format(format!(
+                "attribute '{attr_name}': a numeric array attribute needs at least one value"
+            )));
+        }
+        self.attach_attr(
+            path,
+            attr_name,
+            AttrKind::NumArray {
+                elem: values.num_type().as_elem(order),
+                bytes: values.to_bytes(order),
+            },
+        )
+    }
+
+    /// Write a scalar numeric attribute in an explicit byte order.
+    ///
+    /// Same as [`Self::write_numeric_attr`] but emits HDF5's *scalar* dataspace
+    /// rather than a one-element vector, so h5py reads the value back with
+    /// shape `()` instead of `(1,)`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write_string_attr`]; additionally `OxiH5Error::Format` unless
+    /// `values` holds exactly one value.
+    pub fn write_numeric_scalar_attr(
+        &mut self,
+        path: &str,
+        attr_name: &str,
+        values: NumericValues<'_>,
+        order: ByteOrder,
+    ) -> Result<(), OxiH5Error> {
+        if values.len() != 1 {
+            return Err(OxiH5Error::Format(format!(
+                "attribute '{attr_name}': a scalar numeric attribute needs exactly one value, got {}",
+                values.len()
+            )));
+        }
+        self.attach_attr(
+            path,
+            attr_name,
+            AttrKind::Num {
+                elem: values.num_type().as_elem(order),
+                bytes: values.to_bytes(order),
+            },
+        )
     }
 }

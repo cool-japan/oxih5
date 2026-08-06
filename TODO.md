@@ -1,14 +1,16 @@
 # OxiH5 Project TODO
 
-## Status — 0.2.2 (2026-07-22)
+## Status — 0.2.3 (2026-08-06)
 
-Functional read/write HDF5 library (~26.7 k SLOC Rust in `crates/*/src`, 862
-tests with `--all-features` / 841 with default features + 15 doc tests, all
+Functional read/write HDF5 library (~31.1 k SLOC Rust in `crates/*/src`, 987
+tests with `--all-features` / 966 with default features + 21 doc tests, all
 pass; clippy `--workspace --all-features --all-targets` clean).
 Files written by `FileWriter` / `NcFileWriter` are verified byte-openable by
 **h5py 3.16 (libhdf5 2.0.0)** and **netCDF4-python 1.7.4** — 0.2.2 landed a
 44-agent differential interop audit (33 conformance defects fixed, 9 writer
-capability gaps closed; see `CHANGELOG.md` and the 0.2.3+ roadmap below).
+capability gaps closed) and 0.2.3 closed six more writer capability gaps plus
+the extensible-array chunk-index reader (see `CHANGELOG.md`, milestone M12 and
+the 0.2.3+ roadmap below).
 Supports superblock v0/v1/v2/v3 (+ v2/v3 superblock extension parsing:
 B-tree K values, shared message table, file space info, driver info via
 `File::superblock_extension()`), object header v1/v2 (+continuation, with
@@ -156,43 +158,138 @@ conformance defects fixed and 9 writer capability gaps closed. 862 tests
       `write_dataset_bool`, `set_chunking` (fixed-maxshape tiling),
       `set_fill_value_*`, `set_compact`.
 
+### M12 — Writer capability wave + extensible-array reader (DONE, 0.2.3, 2026-08-06)
+Six 0.2.2-audit writer gaps closed (G004 compound, G008 big-endian, G011 links,
+G012 float16, G013 new-style/dense groups + `track_order`, G015 vlen sequences,
+G016 array/opaque/bitfield), extensible-array chunk indexes now read in full
+instead of returning `NotImplemented`, a mis-parsed class-10 array datatype
+fixed, and five crash/OOM classes on crafted input closed (zero chunk dimension,
+zero hyperslab stride, vlen/global-heap size overflow, B-tree-v1 chunk address
+overflow, unbounded VDS block count). Six new byte-level fuzz targets added;
+two of them found real crashes on their first run. 987 tests (`--all-features`)
+/ 966 default + 21 doc tests pass; clippy / rustdoc clean. Item-by-item detail
+is in the roadmap list immediately below.
+
 ### 0.2.3+ Roadmap — remaining capability gaps
-_All 862 `--all-features` tests pass (no remaining test failures). These are
+_All 987 `--all-features` tests pass (no remaining test failures). These are
 writer capability gaps surfaced by the 0.2.2 interop audit but deliberately not
 attempted in 0.2.2; each has a reader that already parses the corresponding
 feature, so round-trip fidelity is the target._
-- [ ] **G004 — compound (structured/record) datatype datasets.** New class-6
-      datatype encoder (member name+offset+inline type), an API to declare
-      fields and hand row bytes; backs pandas HDFStore tables and event records.
+- [x] **G004 — compound (structured/record) datatype datasets (closed in 0.2.3).**
+      `create_compound_dataset(path, fields, record_size, rows, shape)` takes an
+      `oxih5_core::CompoundField` list — the very type the reader produces — and
+      the raw row bytes. The class-6 version-1 message is byte-identical to
+      libhdf5's for `numpy.dtype([('id','<i4'),('value','<f8')])`; declared
+      member offsets are honoured, never re-packed, so a C-padded record and a
+      packed one stay distinguishable. Fixed-length string members work.
+      Overlapping members, a member past the record, duplicate/empty names and
+      unwritable member types are typed errors at the call
+      (`crates/oxih5/tests/wave5_dtype_tests.rs`).
 - [ ] **G005 — resize/append after creation + modify-existing-file mode.**
       `FileWriter` is build-once; `write_dataset_in_place` (0.2.1) covers only
       same-size overwrite. Need extend-dataset and open-append.
 - [ ] **G007 (remainder) — scaleoffset / nbit / szip filters on write.**
       Fletcher32 + shuffle + deflate shipped in 0.2.2; the other three read-side
       filters still have no write path.
-- [ ] **G008 — big-endian datasets and attributes.** Writer is little-endian
-      only; the reader already decodes BE. Also covers ≥2-D and big-endian
-      *attributes* (the part of G006 not closed in 0.2.2).
+- [x] **G008 — big-endian datasets and attributes (closed in 0.2.3).**
+      `FileWriter::write_dataset_numeric` / `write_numeric_attr` /
+      `write_numeric_scalar_attr` take an explicit `ByteOrder`, and
+      `create_dataset`/`create_dataset_unlimited` no longer reject a big-endian
+      `Dtype`. Covers ≥2-D and big-endian attributes. Verified by h5py 3.16 /
+      libhdf5 2.0.0 reporting `>f4`/`>f8`/`>i2`/`>i4`/`>i8`/`>u2`/`>u4`/`>u8`
+      with exact values (`crates/oxih5/tests/be_f16_write_tests.rs`).
 - [ ] **G009 (remainder) — arbitrary enum datatype datasets.** numpy `bool`
       shipped in 0.2.2 as a class-8 enum; general enums (arbitrary member
       name/value tables over any base type) remain.
-- [ ] **G011 — soft / external / hard-alias link creation on write.** The reader
-      resolves all three (incl. soft→external chains); no writer path exists.
-- [ ] **G012 — half-precision (float16) datasets.** `f16_to_f32` exists on read;
-      no `write_dataset_f16`.
-- [ ] **G013 — new-style (link-message) groups + creation-order / `track_order`
-      preservation on write.** Writer emits only old-style symbol-table groups.
-- [ ] **G015 — variable-length non-string (ragged) sequence datasets.** Reader
-      has `dataset_vlen_sequences`; no writer counterpart.
-- [ ] **G016 — array / opaque / bitfield datatype datasets.** Rejected at the
-      writer's catch-all arm; all three parse on read.
+- [x] **G011 — soft / external / hard-alias link creation on write (closed in
+      0.2.3).** `create_soft_link` / `create_external_link` / `create_hard_link`.
+      A soft link is a cache-type-2 symbol table entry with its target interned
+      in the group's local heap (byte-pinned against libhdf5); a hard alias is
+      an ordinary entry that also **raises the target header's reference
+      count**, resolved against the finished layout so it may precede its
+      target; an external link has no symbol table encoding at all and moves its
+      group to link messages, exactly as libhdf5 does
+      (`crates/oxih5/tests/wave5_link_tests.rs`).
+- [x] **G012 — half-precision (float16) datasets (closed in 0.2.3).**
+      `NumericValues::F16` on `write_dataset_numeric` / the numeric attribute
+      entry points, backed by a new `oxih5_core::f32_to_f16` (round-to-nearest-
+      ties-to-even, subnormals, saturation to infinity, NaN preserved) that
+      round-trips every one of the 65 536 binary16 bit patterns through
+      `f16_to_f32`. h5py reports `float16` / `>f2` with exact values.
+- [x] **G013 — new-style (link-message) groups + creation-order / `track_order`
+      preservation on write (closed in 0.2.3).** Both storage forms, inside a
+      superblock-v0 / object-header-v1 file: **compact** (Link Info + Group Info
+      + one Link message per member) and, past libhdf5's `max_compact` of 8,
+      **dense** — a fractal heap writer (`write/fractal_heap.rs`, root direct
+      block) plus a type-5 version-2 B-tree writer (`write/btree_v2.rs`) whose
+      records are sorted by the Jenkins lookup3 hash of the link name, with
+      every version-2 metadata checksum computed over exactly the range libhdf5
+      covers (`write/checksum.rs`). `set_track_order` / `set_link_storage`
+      select the style; creation order is recorded per link and preserved in
+      stored order. A converted group keeps its (now empty) symbol table
+      structures so the parent's cached entry stays valid, matching libhdf5.
+      _(Creation order is recorded but not separately **indexed**: no type-6
+      version-2 B-tree is written, which is also what libhdf5 does for
+      `track_order` without `H5P_CRT_ORDER_INDEXED`.)_
+- [x] **G015 — variable-length non-string (ragged) sequence datasets (closed in
+      0.2.3).** `create_vlen_sequence_dataset` over any fixed-size base type,
+      plus `create_vlen_i32_dataset` / `create_vlen_f64_dataset`. One
+      global-heap object per element in the file's shared collection set; the
+      sequence length counts **elements**, not bytes, and an empty element is
+      the all-zero null reference libhdf5 writes. Round-trips through
+      `File::dataset_vlen_sequences`.
+- [x] **G016 — array / opaque / bitfield datatype datasets (closed in 0.2.3).**
+      `create_array_dataset` / `create_opaque_dataset` / `create_bitfield_dataset`.
+      The array type is emitted as datatype message **version 2** — the version
+      the class was introduced with, and the only one libhdf5 accepts — which
+      also uncovered and fixed a read-side bug: `parse_array` read the extents
+      as 8-byte fields and ignored the version-2 reserved bytes and permutation
+      indices, so oxih5 could not read *any* libhdf5-authored array dataset.
 - [ ] **G018 — virtual dataset (VDS) write.** VDS reads shipped in 0.1.4; no
       write path for the mapping/global-heap block.
 - [ ] **G019 — region-reference datasets and attributes.** Object references
       write; region references do not.
-- [ ] **Read-side known limitations (carried from 0.2.1):** extensible-array
-      chunk indexes decode to a typed `NotImplemented`; hyperslab selections
-      with `block > 1` drop elements on chunked datasets.
+
+#### Known bounds of the 0.2.3 link / datatype writers
+_Each of these is a deliberate edge of what the new writers emit, not a bug;
+every one is a typed error rather than a silently wrong file._
+- [ ] **A dense group's fractal heap is one root direct block.** Its link
+      messages must fit a single 65 536-byte block (roughly four thousand
+      members); past that, `FractalHeapWriter::plan` returns a typed error
+      instead of growing an indirect root, which needs a doubling table and
+      "FHIB" blocks the writer does not emit. The *read* side already traverses
+      indirect roots.
+- [ ] **A link name index is a single version-2 B-tree leaf.** Node size is a
+      per-tree creation parameter, so the leaf is sized to hold every record —
+      legal, and enough for any heap that fits one direct block — but no "BTIN"
+      internal nodes are written.
+- [ ] **Creation order is tracked, not indexed.** No type-6 (creation-order)
+      version-2 B-tree is emitted, so `H5_INDEX_CRT_ORDER` iteration in libhdf5
+      falls back to name order; the per-link creation-order *fields* and the
+      stored link order both preserve it, which is what a linear reader sees.
+- [ ] **A structured datatype's members are inline scalars.** A compound member,
+      an array base, or a vlen sequence base may be any type an `ElemType`
+      names (numeric in either byte order, fixed-length string, boolean enum) —
+      not a nested compound, array or variable-length type. The read side
+      decodes those; the encoder reports them rather than guessing at a layout.
+- [ ] **Variable-length datasets are contiguous.** `set_deflate`, `set_shuffle`,
+      `set_fletcher32`, `set_chunking` and `set_compact` all refuse a ragged
+      dataset, because its data area is global-heap references rather than the
+      values a filter or an inline layout would act on.
+- [x] **Read-side: extensible-array chunk indexes (closed in 0.2.3).** The
+      index libhdf5 selects for a chunked dataset with exactly one unlimited
+      dimension (`create_dataset(..., chunks=..., maxshape=(None, ...))` under
+      `libver='latest'`) is now decoded in full — header, index block, super
+      blocks, data blocks and paged data blocks, both element clients, and the
+      rotated coordinate mapping that puts the unlimited dimension first.
+      `oxih5-format/src/ea_index/` plus `crates/oxih5/tests/ea_index_tests.rs`
+      against the h5py-authored `tests/fixtures/chunked_ea.h5`.
+      _(The previously listed "hyperslab selections with `block > 1` drop
+      elements on chunked datasets" limitation was stale and has been removed:
+      `test_hyperslab_block2_2d` in `crates/oxih5/tests/hyperslab_tests.rs`
+      exercises `block=2`/`stride=2` against a chunked+gzip+shuffle 2-D
+      fixture and asserts exact output bytes — the output-coordinate math in
+      `oxih5-format/src/hyperslab.rs` handles `block > 1` correctly.)_
 
 ---
 
@@ -410,7 +507,7 @@ feature, so round-trip fidelity is the target._
 <!-- production-readiness-backlog 2026-07-16 -->
 ## Production-Readiness Backlog — 2026-07-16
 
-_Consolidated from static audit + Opus adversarial bug-hunt (48 verified defects across noffi) + baseline nextest/clippy + design investigation. See `../NOFFI_PRODUCTION_BACKLOG.md` for the full cross-project list and severity/model legend. Confirmed bugs and H1–H4 shipped in 0.1.4 (see checkboxes below); H5/H6 remain open._
+_Consolidated from static audit + Opus adversarial bug-hunt (48 verified defects across noffi) + baseline nextest/clippy + design investigation. See `../NOFFI_PRODUCTION_BACKLOG.md` for the full cross-project list and severity/model legend. Confirmed bugs and H1–H4 shipped in 0.1.4; H5 and H6 shipped in 0.2.3 (see checkboxes below)._
 
 **Confirmed bugs — Opus-verified:**
 - [x] **S · high** `oxih5-format/src/fa_index.rs:221` — fixed-array "Number of Elements" u64 header used directly as `Vec` capacity → capacity-overflow panic / huge alloc pre-validation. R2/N0 (done 0.1.4: bounded to 16Mi elements (`FA_MAX_ELEMENTS = 1 << 24`) and cross-checked against bytes remaining in the file before use as `Vec::with_capacity`; `test_fa_oversized_element_count_rejected`.)
@@ -420,5 +517,5 @@ _Consolidated from static audit + Opus adversarial bug-hunt (48 verified defects
 - [x] **A/hard/Opus · H2** virtual dataset layout. (done 0.1.4: new `oxih5-format/src/vds.rs`, 728 lines — `VdsMapping`/`VdsEntry`/`VdsSelection`, `parse_vds_mapping`/`parse_vds_block`, `selection_element_offsets`; 9 unit tests + 4 integration tests in `tests/vds_tests.rs`.)
 - [x] **A/hard/Opus · H3** variable-length elements in chunked/hyperslab. (done 0.1.4: new `on_disk_elem_footprint` helper accounts for the 16-byte vlen global-heap-reference footprint; incompatible filters now explicitly rejected; `crates/oxih5/tests/vlen_chunked_tests.rs`.)
 - [x] **A/med/Opus · H4** szip RAW mode + FractalHeap I/O filters + soft→external link. (done 0.1.4: public `apply_pipeline_sized` in `filters.rs` for RAW-mode szip; fractal-heap I/O-Filters-Encoded-Length field now read at the correct offset/width; `soft_link_through_external_link` integration test in `crates/oxih5/tests/vds_tests.rs`.)
-- [ ] **B/med · H5** write-path unwrap reduction (232 non-test, up from 225) + panic!17 triage (overlaps confirmed bugs). (clarified 2026-07-18: a full workspace audit found 0 unwrap() call sites in actual production logic — the historical "232 non-test" count conflated test-module and doctest unwraps with production code; see README Policy Compliance. The panic! triage portion remains open.)
-- [ ] **B/easy · H6** preventive split lib.rs(**done**)/chunked.rs(1963, was 1730); examples/doctests. lib.rs reached 1999 of the 2000-line cap and has now been split (0.2.1) into `file.rs` (`File`), `group_handle.rs` (`Group`), `reader.rs` (navigation + object-header dataset assembly) and `slicing.rs` (lazy range/hyperslab reads), leaving lib.rs at 388 lines; `links.rs` swapped its `use super::*` glob for explicit imports. Behaviour-preserving — the public API surface is unchanged apart from the two `pub use` re-exports that keep `oxih5::File`/`oxih5::Group` at their original paths. `oxih5-format/src/chunked.rs` (1963) remains the outstanding half.
+- [x] **B/med · H5** write-path unwrap reduction (232 non-test, up from 225) + panic!17 triage (overlaps confirmed bugs). (clarified 2026-07-18: a full workspace audit found 0 unwrap() call sites in actual production logic — the historical "232 non-test" count conflated test-module and doctest unwraps with production code; see README Policy Compliance. Panic! triage completed 2026-08-04: a full non-test scan of `crates/*/src` finds zero production `unwrap()`/`panic!()`/`todo!()`/`unimplemented!()`. The one remaining production `.expect("origin in map")` — `chunked::read_chunked_slice`'s parallel (`parallel` feature) chunk-record lookup — is now gone: the already-resolved record index is carried through from the filter step instead of being re-derived via a second, panic-on-miss map lookup (`chunked/slice.rs`). Two narrow, by-design, non-unwrap/expect assertions remain: a compile-time `assert!` inside a `const fn` in `write/format.rs`, and one `debug_assert_eq!` in `global_heap_writer.rs` compiled out of release builds.)
+- [x] **B/easy · H6** preventive split lib.rs(**done**)/chunked.rs(1963, was 1730); examples/doctests. lib.rs reached 1999 of the 2000-line cap and has now been split (0.2.1) into `file.rs` (`File`), `group_handle.rs` (`Group`), `reader.rs` (navigation + object-header dataset assembly) and `slicing.rs` (lazy range/hyperslab reads), leaving lib.rs at 388 lines; `links.rs` swapped its `use super::*` glob for explicit imports. Behaviour-preserving — the public API surface is unchanged apart from the two `pub use` re-exports that keep `oxih5::File`/`oxih5::Group` at their original paths. `oxih5-format/src/chunked.rs` (1963) is now also split (2026-08-04) into `chunked/{cache,index,read,slice,geometry,tests}.rs`, every one of them well under the 2000-line cap; every item reachable as `chunked::X` before the split (`pub` or crate-visible `pub(crate)`) stays reachable at the same flat path via glob re-exports in `chunked/mod.rs` — no caller anywhere in the workspace needed a `use`-path change. Runnable examples added: `crates/oxih5/examples/read_dataset.rs` + `write_dataset.rs`, `crates/oxinetcdf/examples/write_and_read.rs` (all three build, run, and clean up their own temp-path fixture).

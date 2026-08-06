@@ -166,7 +166,10 @@ pub(crate) fn slice_dataset_at_header(
                     file_data,
                     &lay,
                     &pipeline,
-                    &dataset_dims,
+                    oxih5_format::chunked::DatasetShape {
+                        dims: &dataset_dims,
+                        max_dims: dsp.max_dims.as_deref(),
+                    },
                     oxih5_format::chunked::ChunkSliceParams {
                         elem_size,
                         fill_value: fill_value.as_deref(),
@@ -323,7 +326,10 @@ pub(crate) fn hyperslab_dataset_at_header(
                     file_data,
                     &lay,
                     &pipeline,
-                    &dataset_dims,
+                    oxih5_format::chunked::DatasetShape {
+                        dims: &dataset_dims,
+                        max_dims: dsp.max_dims.as_deref(),
+                    },
                     oxih5_format::chunked::ChunkSliceParams {
                         elem_size,
                         fill_value: fill_value.as_deref(),

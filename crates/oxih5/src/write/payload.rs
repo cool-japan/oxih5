@@ -83,16 +83,21 @@ pub(super) fn build<'a>(
     ds: &'a DatasetDesc,
     chunk_shape: &[usize],
 ) -> Result<Payload<'a>, OxiH5Error> {
+    // A variable-length dataset — strings or sequences — has no raw data area
+    // at all: each element is a 16-byte reference into the file's global heap.
     if let Some(strings) = &ds.vlen_strings {
         return Ok(Payload::VlenRefs {
             count: strings.len(),
         });
     }
+    if let Some(seqs) = &ds.vlen_seqs {
+        return Ok(Payload::VlenRefs { count: seqs.len() });
+    }
     if ds.chunked().is_none() {
         return Ok(Payload::Raw(&ds.raw));
     }
 
-    let elem_size = ds.elem_type.byte_size();
+    let elem_size = ds.elem_size();
     let origins = chunked::chunk_origins(&ds.shape, chunk_shape);
     // One chunk that is exactly the dataset needs no rearranging, so it is
     // borrowed rather than rebuilt.  `cut_tile` would produce the same bytes.
@@ -250,7 +255,10 @@ mod tests {
             attrs: Vec::new(),
             storage,
             filter,
+            dtype: None,
             vlen_strings: None,
+            vlen_seqs: None,
+            creation_order: 0,
         }
     }
 

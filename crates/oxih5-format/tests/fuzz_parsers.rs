@@ -90,9 +90,26 @@ fn fuzz_extra_parsers(data: &[u8], addr: u64, state: &mut u64) {
         let _ = btree_v1_chunk::parse(data, addr, ndims);
     }
 
-    // ea_index::parse_extensible_array — takes (file_data, header_address, ndims)
+    // ea_index::parse_extensible_array — takes (file_data, header_address, geometry)
     for ndims in [0usize, 1, 2, 4] {
-        let _ = ea_index::parse_extensible_array(data, addr, ndims);
+        let chunk_dims = vec![4u64; ndims];
+        let dataset_dims = vec![64u64; ndims];
+        let mut max_dims = vec![64u64; ndims];
+        if ndims > 0 {
+            max_dims[0] = u64::MAX;
+        }
+        for max in [None, Some(max_dims.as_slice())] {
+            let _ = ea_index::parse_extensible_array(
+                data,
+                addr,
+                &ea_index::EaGeometry {
+                    chunk_dims: &chunk_dims,
+                    dataset_dims: &dataset_dims,
+                    max_dims: max,
+                    chunk_bytes: 32,
+                },
+            );
+        }
     }
 
     // fa_index::parse_fixed_array — takes (file_data, header_address, ndims)

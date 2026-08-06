@@ -38,9 +38,14 @@ fn fixture(name: &str) -> PathBuf {
 
 fn open_fixture() -> Option<oxih5::File> {
     let path = fixture("soft_links_old.h5");
-    if !path.exists() {
-        return None;
-    }
+    // Tracked in git (`tests/fixtures/soft_links_old.h5`) — a missing file
+    // means a broken checkout and must fail every caller loudly, not
+    // silently skip.
+    assert!(
+        path.exists(),
+        "fixture soft_links_old.h5 missing at {} — it is tracked in git",
+        path.display()
+    );
     Some(oxih5::open(&path).expect("open soft_links_old.h5"))
 }
 

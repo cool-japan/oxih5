@@ -36,7 +36,7 @@
 #![forbid(unsafe_code)]
 
 mod dataset_convert;
-pub use dataset_convert::f16_to_f32;
+pub use dataset_convert::{f16_to_f32, f32_to_f16};
 
 use thiserror::Error;
 

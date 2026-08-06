@@ -1,6 +1,6 @@
 use crate::chunked::{
     apply_filters_to_chunk, chunk_records, flat_to_coords, index_of, read_chunk_bytes,
-    row_major_strides, ChunkIndexCache, ChunkIndexQuery, ChunkSliceParams,
+    row_major_strides, ChunkIndexCache, ChunkIndexQuery, ChunkSliceParams, DatasetShape,
 };
 use crate::hyperslab::{scatter_chunk_hyperslab, Hyperslab};
 use crate::message::LayoutInfo;
@@ -24,7 +24,7 @@ use rayon::prelude::*;
 /// * `file_data`     – the complete HDF5 file buffer
 /// * `layout`        – parsed chunked layout message (must be `LayoutInfo::Chunked`)
 /// * `pipeline`      – the dataset's filter pipeline (empty ⇒ no filters)
-/// * `dataset_dims`  – full dataset dimensions in elements
+/// * `shape`         – the dataset's current and maximum dimensions
 /// * `params`        – element size + optional fill-value bytes
 /// * `selection`     – N-dimensional hyperslab selection
 /// * `cache`         – optional pre-parsed chunk index cache; pass `None` to disable
@@ -32,11 +32,15 @@ pub fn read_chunked_hyperslab(
     file_data: &[u8],
     layout: &LayoutInfo,
     pipeline: &FilterPipeline,
-    dataset_dims: &[u64],
+    shape: DatasetShape<'_>,
     params: ChunkSliceParams<'_>,
     selection: &Hyperslab,
     cache: Option<&ChunkIndexCache>,
 ) -> Result<Vec<u8>, OxiH5Error> {
+    let DatasetShape {
+        dims: dataset_dims,
+        max_dims,
+    } = shape;
     let elem_size = params.elem_size;
     let fill_value = params.fill_value;
 
@@ -62,6 +66,10 @@ pub fn read_chunked_hyperslab(
             ndims,
         )));
     }
+    // A caller-constructed `DimSelection { stride: 0, .. }` would otherwise
+    // divide-by-zero panic inside `scatter_chunk_hyperslab` below; reject it
+    // up front with a typed error instead.
+    selection.validate()?;
 
     // Short-circuit: empty selection → nothing to read.
     if selection.is_empty() {
@@ -96,6 +104,18 @@ pub fn read_chunked_hyperslab(
         )));
     };
 
+    // Reject a zero chunk dimension before dividing by it below (see
+    // `read_chunked_slice` / `assemble_chunks_slice` in chunked.rs for the
+    // same guard on the sibling slice readers): a crafted/corrupted layout
+    // message could claim a zero-sized chunk dimension, which would
+    // otherwise panic with a divide-by-zero when computing the overlapping
+    // chunk-grid cell range below.
+    if let Some(d) = real_chunk_dims.iter().position(|&c| c == 0) {
+        return Err(OxiH5Error::Format(format!(
+            "read_chunked_hyperslab: chunk dimension {d} is zero"
+        )));
+    }
+
     let index = index_of(*index_type, "read_chunked_hyperslab")?;
 
     // Resolve all chunk records (with optional caching).
@@ -106,6 +126,7 @@ pub fn read_chunked_hyperslab(
             index_address: *data_address,
             real_chunk_dims: &real_chunk_dims,
             dataset_dims,
+            max_dims,
             elem_size,
             single_chunk: *single_chunk,
         },
@@ -274,6 +295,11 @@ pub fn gather_hyperslab_contiguous(
             ndims,
         )));
     }
+    // Keep this facade entry point consistent with `read_chunked_hyperslab`:
+    // a zero stride has no valid meaning even though this function's own
+    // arithmetic only divides by `block` (already guarded by `is_empty`
+    // below), not `stride`.
+    selection.validate()?;
 
     if selection.is_empty() {
         return Ok(vec![]);
@@ -331,6 +357,98 @@ pub fn gather_hyperslab_contiguous(
 mod tests {
     use super::*;
     use crate::hyperslab::DimSelection;
+
+    // -----------------------------------------------------------------------
+    // read_chunked_hyperslab: zero chunk dimension must error, not panic
+    // -----------------------------------------------------------------------
+
+    /// A crafted layout v3/v4 chunked message can claim a zero-sized chunk
+    /// dimension (`message.rs::parse_layout` rejects this too, but
+    /// `read_chunked_hyperslab` must not rely solely on that upstream check —
+    /// see `test_chunked_slice_zero_chunk_dim_errors` in chunked.rs for the
+    /// sibling slice readers). Before the fix, `first_ci`/`last_ci` divided
+    /// `bbox[d].start` / `bbox[d].end` directly by `real_chunk_dims[d]`,
+    /// panicking with a divide-by-zero the moment `File::dataset_hyperslab`
+    /// was called on such a file.
+    #[test]
+    fn test_read_chunked_hyperslab_zero_chunk_dim_errors() {
+        let file = vec![0u8; 64];
+        let layout = LayoutInfo::Chunked {
+            data_address: 0,
+            dimensionality: 2,
+            // chunk_dims[0] = 0 (zero geometric chunk dim), chunk_dims[1] = 4
+            // (the implicit trailing element-size slot for a 1-D dataset).
+            chunk_dims: vec![0, 4],
+            index_type: 0,
+            single_chunk: None,
+        };
+        let pipeline = FilterPipeline { filters: vec![] };
+        let dataset_dims = [8u64];
+        let r: std::ops::Range<u64> = 1..3;
+        let selection = Hyperslab::contiguous(&[r]);
+
+        let result = read_chunked_hyperslab(
+            &file,
+            &layout,
+            &pipeline,
+            DatasetShape::fixed(&dataset_dims),
+            ChunkSliceParams {
+                elem_size: 1,
+                fill_value: None,
+            },
+            &selection,
+            None,
+        );
+
+        assert!(
+            result.is_err(),
+            "zero chunk dimension must return an error, not panic"
+        );
+    }
+
+    /// A caller-constructed `DimSelection { stride: 0, .. }` passed into the
+    /// public `read_chunked_hyperslab` facade (the function backing
+    /// `File::dataset_hyperslab`) must return a typed error instead of
+    /// panicking with a divide-by-zero inside `scatter_chunk_hyperslab`.
+    #[test]
+    fn test_read_chunked_hyperslab_zero_stride_errors_not_panics() {
+        let file = vec![0u8; 64];
+        let layout = LayoutInfo::Chunked {
+            data_address: 0,
+            dimensionality: 2,
+            chunk_dims: vec![4, 4], // valid, non-zero chunk geometry
+            index_type: 0,
+            single_chunk: None,
+        };
+        let pipeline = FilterPipeline { filters: vec![] };
+        let dataset_dims = [8u64];
+        let selection = Hyperslab {
+            dims: vec![DimSelection {
+                start: 0,
+                stride: 0,
+                count: 1,
+                block: 1,
+            }],
+        };
+
+        let result = read_chunked_hyperslab(
+            &file,
+            &layout,
+            &pipeline,
+            DatasetShape::fixed(&dataset_dims),
+            ChunkSliceParams {
+                elem_size: 1,
+                fill_value: None,
+            },
+            &selection,
+            None,
+        );
+
+        assert!(
+            result.is_err(),
+            "stride=0 must return an error, not panic with divide-by-zero"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // gather_hyperslab_contiguous unit tests

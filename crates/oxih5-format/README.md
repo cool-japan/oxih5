@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/oxih5-format.svg)](https://crates.io/crates/oxih5-format)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**275 tests passing** (`cargo nextest run -p oxih5-format --all-features`; 269 with default features) · 2 doc tests · zero clippy / rustdoc warnings
+**306 tests passing** (`cargo nextest run -p oxih5-format --all-features`; 300 with default features) · 2 doc tests · zero clippy / rustdoc warnings
 
 `oxih5-format` is the binary-parsing layer of **OxiH5**, the COOLJAPAN Pure-Rust HDF5 reader/writer. It turns raw HDF5 file bytes — exactly as produced by h5py / libhdf5 — into the typed data model from [`oxih5-core`]. Every standard structure of the HDF5 file format is decoded here: the superblock (versions 0, 1, 2, and 3, including the v2/v3 superblock extension), object headers (v1 and v2), all standard header messages, local/global/fractal heaps, B-tree v1 and v2 nodes, the extensible- and fixed-array chunk indices, the filter pipeline, full chunked-dataset assembly, and Virtual Dataset (VDS) mapping-block parsing.
 
@@ -13,10 +13,10 @@ This crate sits between [`oxih5-core`] (the data model) and the [`oxih5`] facade
 
 ```toml
 [dependencies]
-oxih5-format = "0.2.2"
+oxih5-format = "0.2.3"
 
 # Optional: rayon-parallel chunk assembly
-oxih5-format = { version = "0.2.2", features = ["parallel"] }
+oxih5-format = { version = "0.2.3", features = ["parallel"] }
 ```
 
 ## Quick Start
@@ -128,7 +128,7 @@ The write-side counterpart to `global_heap` above — used when building HDF5 fi
 | `btree_v2::ChunkGeometry` | `chunk_dims: &[u64]`, `chunk_bytes: u32` — the dataset's chunk shape/size, needed because a v2 B-tree record stores *scaled* (chunk-grid) coordinates rather than element offsets, and an unfiltered record omits the stored size entirely |
 | `btree_v2::parse_name_index` | Resolve a B-tree v2 name index |
 | `btree_v1_chunk::parse` | B-tree v1 chunk index (`libver='earliest'`) |
-| `ea_index::parse_extensible_array` | Extensible-array chunk index (one unlimited dimension) |
+| `ea_index::parse_extensible_array` | Extensible-array chunk index (one unlimited dimension); takes an `EaGeometry` because the elements carry no chunk coordinates |
 | `fa_index::parse_fixed_array` / `parse_fixed_array_v4` | Fixed-array chunk index (no unlimited dimensions) |
 | `snod::SymTabEntry` | `name_offset: u64`, `object_header_address: u64`, `cache: SymTabCache` (decoded scratch-pad: `None`, `Group { btree_address, heap_address }`, `SoftLink { link_value_offset }`, or `Unknown(u32)`) |
 | `snod::parse(file_data, addr) -> Vec<SymTabEntry>` | Decode a symbol-table node |
@@ -139,7 +139,7 @@ The write-side counterpart to `global_heap` above — used when building HDF5 fi
 |------|-------------|
 | `struct ChunkIndexCache` (re-exported at root) | Thread-safe `(index_addr, ndims) → records` cache; `new()`, `get_or_insert(...)` |
 | `enum ChunkIndex` | `BTreeV1`, `BTreeV2`, `FixedArray`, `ExtensibleArray`, `SingleChunk`, `Implicit` |
-| `fn resolve_chunk_index(file_data, index, addr, ndims) -> Vec<ChunkRecord>` | Resolve a `BTreeV1`, `FixedArray`, or `ExtensibleArray` index into chunk records. `BTreeV2`, `SingleChunk`, and `Implicit` need additional chunk-geometry context and return `Err` here |
+| `fn resolve_chunk_index(file_data, index, addr, ndims) -> Vec<ChunkRecord>` | Resolve a `BTreeV1` or `FixedArray` index into chunk records. `ExtensibleArray`, `BTreeV2`, `SingleChunk`, and `Implicit` need additional chunk-geometry context and return `Err` here |
 | `fn assemble_chunks(...)` | Scatter chunk records into a contiguous row-major buffer |
 | `struct ChunkSliceParams<'a>` | `elem_size: usize`, `fill_value: Option<&'a [u8]>` — shared parameter bundle for `read_chunked_slice` and `chunked_hyperslab::read_chunked_hyperslab` |
 | `fn read_chunked(file_data, layout, pipeline, dataset_dims, elem_size, fill_value, cache) -> Vec<u8>` | High-level: resolve + read + unfilter + scatter a whole chunked dataset |

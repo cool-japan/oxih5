@@ -26,12 +26,16 @@ use std::collections::HashMap;
 use oxih5_core::OxiH5Error;
 
 use super::elem::VLEN_REF_SIZE;
-use super::format::{self, SnodEntry};
+use super::format::{self, SnodEntry, SnodValue};
 use super::oh::{self, OhAddrs};
 use super::payload::Payload;
-use super::plan::{self, DatasetPlan, GroupPlan, Link, LinkTarget, SymPlan};
-use super::tree::DatasetDesc;
+use super::plan::{self, DatasetPlan, GroupPlan, LinkStorage, LinkTarget, SymPlan};
+use super::tree::{DatasetDesc, LinkKind};
 use super::{check_size, chunked, narrow, FileWriter};
+
+/// The HDF5 "undefined address" sentinel, as a compact group's Link Info
+/// message and a soft link's symbol table entry both carry it.
+const UNDEFINED_ADDRESS: u64 = u64::MAX;
 
 // ---------------------------------------------------------------------------
 // Emission helpers
@@ -89,18 +93,26 @@ fn write_vlen_ref(buf: &mut [u8], offset: usize, seq_len: u32, obj_idx: u32, hea
 fn write_vlen_refs(
     buf: &mut [u8],
     base: usize,
-    strings: &[String],
+    seq_lens: &[u32],
     obj_ordinals: &[u32],
     gheap: GheapLayout<'_>,
 ) -> Result<usize, OxiH5Error> {
     let mut wrote = 0usize;
-    for (i, (s, &ordinal)) in strings.iter().zip(obj_ordinals.iter()).enumerate() {
+    for (i, (&seq_len, &ordinal)) in seq_lens.iter().zip(obj_ordinals.iter()).enumerate() {
+        if ordinal == 0 {
+            // An empty variable-length element registers no heap object; its
+            // reference is the all-zero null reference libhdf5 writes, which
+            // `decode_vlen_sequences` reads back as an empty sequence.
+            write_vlen_ref(buf, base + i * VLEN_REF_SIZE, 0, 0, 0);
+            wrote += VLEN_REF_SIZE;
+            continue;
+        }
         let loc = ordinal
             .checked_sub(1)
             .and_then(|z| gheap.locations.get(z as usize))
             .ok_or_else(|| {
                 OxiH5Error::Format(format!(
-                    "internal writer error: vlen string ordinal {ordinal} has no global-heap location"
+                    "internal writer error: vlen ordinal {ordinal} has no global-heap location"
                 ))
             })?;
         let heap_addr = gheap
@@ -113,16 +125,58 @@ fn write_vlen_refs(
                     loc.collection
                 ))
             })?;
-        write_vlen_ref(
-            buf,
-            base + i * VLEN_REF_SIZE,
-            s.len() as u32,
-            loc.index,
-            heap_addr,
-        );
+        write_vlen_ref(buf, base + i * VLEN_REF_SIZE, seq_len, loc.index, heap_addr);
         wrote += VLEN_REF_SIZE;
     }
     Ok(wrote)
+}
+
+/// The sequence length each element's vlen reference declares.
+///
+/// For a string that is `strlen` — the byte count, no NUL terminator — and for
+/// a sequence it is the **element** count, not the byte count: libhdf5 writes
+/// `seq_len = 3` beside a 12-byte heap object for a three-element `int32`
+/// sequence, and `decode_vlen_sequences` multiplies by the base type's width to
+/// find the bytes again.
+///
+/// # Errors
+///
+/// Returns `OxiH5Error::Format` if a sequence's byte length is not a whole
+/// number of elements, which would mean the payload and the datatype disagree.
+fn vlen_seq_lens(ds: &DatasetDesc) -> Result<Vec<u32>, OxiH5Error> {
+    if let Some(strings) = &ds.vlen_strings {
+        return strings
+            .iter()
+            .map(|s| narrow::<u32>("vlen string length", s.len()))
+            .collect();
+    }
+    let Some(seqs) = &ds.vlen_seqs else {
+        return Ok(Vec::new());
+    };
+    let base = ds
+        .dtype
+        .as_ref()
+        .and_then(|encoded| encoded.vlen_base)
+        .ok_or_else(|| {
+            OxiH5Error::Format(format!(
+                "internal writer error: dataset '{}' holds vlen sequences but no sequence type",
+                ds.name
+            ))
+        })?;
+    let width = base.byte_size();
+    seqs.iter()
+        .map(|bytes| {
+            if width == 0 || bytes.len() % width != 0 {
+                return Err(OxiH5Error::Format(format!(
+                    "dataset '{}': a vlen sequence of {} bytes is not a whole number of \
+                     {width}-byte elements",
+                    ds.name,
+                    bytes.len()
+                )));
+            }
+            narrow::<u32>("vlen sequence length", bytes.len() / width)
+        })
+        .collect()
 }
 
 /// Emit one dataset's data area, and the chunk index that addresses it.
@@ -152,10 +206,10 @@ fn emit_payload(
         ),
 
         Payload::VlenRefs { .. } => {
-            let strings = ds.vlen_strings.as_deref().unwrap_or(&[]);
+            let seq_lens = vlen_seq_lens(ds)?;
             check_size(
                 "vlen reference area",
-                write_vlen_refs(buf, plan.data_addr, strings, &plan.vlen_obj_idx, gheap)?,
+                write_vlen_refs(buf, plan.data_addr, &seq_lens, &plan.vlen_obj_idx, gheap)?,
                 ds.data_len(),
             )
         }
@@ -222,10 +276,12 @@ fn emit_dataset(
         btree: plan.btree_addr as u64,
         heap: 0,
         data: plan.data_addr as u64,
+        fractal_heap: UNDEFINED_ADDRESS,
+        name_index: UNDEFINED_ADDRESS,
     };
     check_size(
         "dataset object header",
-        oh::write_oh(buf, plan.oh_addr, &msgs, &addrs)?,
+        oh::write_oh(buf, plan.oh_addr, &msgs, &addrs, plan.refcount)?,
         plan.oh_size,
     )?;
 
@@ -242,49 +298,102 @@ fn emit_dataset(
 ///
 /// Returns `OxiH5Error::Format` if a link points at an object that was never
 /// planned, which would otherwise emit a symbol table entry addressing byte 0.
-fn snod_entries(
-    links: &[Link<'_>],
-    name_offsets: &[u64],
-    datasets: &[DatasetPlan<'_>],
-    groups: &[GroupPlan<'_>],
-) -> Result<Vec<SnodEntry>, OxiH5Error> {
+fn snod_entries(plan: &GroupPlan<'_>) -> Result<Vec<SnodEntry>, OxiH5Error> {
     let missing = |kind: &str, name: &str, index: usize| {
         OxiH5Error::Format(format!(
             "internal writer error: link '{name}' points at {kind} {index}, which was not planned"
         ))
     };
 
-    links
-        .iter()
-        .zip(name_offsets)
-        .map(|(link, &name_offset)| {
-            let (oh_addr, group_cache) = match link.target {
-                LinkTarget::Dataset(index) => {
-                    let plan = datasets
-                        .get(index)
-                        .ok_or_else(|| missing("dataset", link.name, index))?;
-                    (plan.oh_addr as u64, None)
+    let mut entries = Vec::with_capacity(plan.links.len());
+    for (position, link) in plan.links.iter().enumerate() {
+        let name_offset = plan
+            .sym
+            .heap
+            .name_offsets
+            .get(position)
+            .copied()
+            .ok_or_else(|| missing("local heap slot", link.name, position))?;
+
+        let value = match link.target {
+            LinkTarget::Dataset(index) => {
+                let ds = plan
+                    .datasets
+                    .get(index)
+                    .ok_or_else(|| missing("dataset", link.name, index))?;
+                SnodValue::Object(ds.oh_addr as u64)
+            }
+            LinkTarget::Group(index) => {
+                let grp = plan
+                    .groups
+                    .get(index)
+                    .ok_or_else(|| missing("group", link.name, index))?;
+                SnodValue::Group {
+                    oh_addr: grp.oh_addr as u64,
+                    btree_addr: grp.sym.table.root_addr() as u64,
+                    heap_addr: grp.sym.heap_hdr_addr as u64,
                 }
-                LinkTarget::Group(index) => {
-                    let plan = groups
-                        .get(index)
-                        .ok_or_else(|| missing("group", link.name, index))?;
-                    (
-                        plan.oh_addr as u64,
-                        Some((
-                            plan.sym.table.root_addr() as u64,
-                            plan.sym.heap_hdr_addr as u64,
-                        )),
-                    )
+            }
+            LinkTarget::Link(index) => {
+                let desc = plan
+                    .node
+                    .links
+                    .get(index)
+                    .ok_or_else(|| missing("link", link.name, index))?;
+                match &desc.kind {
+                    LinkKind::HardAlias { target } => {
+                        let addr =
+                            plan.link_addrs
+                                .get(index)
+                                .copied()
+                                .flatten()
+                                .ok_or_else(|| {
+                                    OxiH5Error::Format(format!(
+                                        "internal writer error: hard link '{}' to '{target}' was \
+                                     never resolved",
+                                        link.name
+                                    ))
+                                })?;
+                        SnodValue::Object(addr)
+                    }
+                    LinkKind::Soft { .. } => {
+                        // The target path was interned in this group's local
+                        // heap beside the names; the entry carries its offset.
+                        let offset = plan
+                            .sym
+                            .heap
+                            .value_offsets
+                            .get(position)
+                            .copied()
+                            .flatten()
+                            .ok_or_else(|| {
+                                OxiH5Error::Format(format!(
+                                    "internal writer error: soft link '{}' has no local-heap \
+                                     value",
+                                    link.name
+                                ))
+                            })?;
+                        SnodValue::SoftLink {
+                            link_value_offset: narrow("soft link value offset", offset as usize)?,
+                        }
+                    }
+                    LinkKind::External { .. } => {
+                        // Unreachable: a group holding an external link is
+                        // switched to link messages when the link is created,
+                        // and a link-style group emits no symbol table entries
+                        // at all.  Reported rather than silently mis-encoded.
+                        return Err(OxiH5Error::Format(format!(
+                            "internal writer error: external link '{}' reached an old-style \
+                             symbol table, which cannot represent one",
+                            link.name
+                        )));
+                    }
                 }
-            };
-            Ok(SnodEntry {
-                name_offset,
-                oh_addr,
-                group_cache,
-            })
-        })
-        .collect()
+            }
+        };
+        entries.push(SnodEntry { name_offset, value });
+    }
+    Ok(entries)
 }
 
 /// Emit one group's local heap, symbol table nodes, and symbol table B-tree.
@@ -342,25 +451,40 @@ fn emit_group(
         "sub-group"
     };
 
-    let msgs = oh::group_oh_msgs(&plan.attrs);
+    let msgs = match &plan.link_storage {
+        Some(storage) => oh::link_group_oh_msgs(storage, &plan.attrs)?,
+        None => oh::group_oh_msgs(&plan.attrs),
+    };
     let addrs = OhAddrs {
         btree: plan.sym.table.root_addr() as u64,
         heap: plan.sym.heap_hdr_addr as u64,
         data: 0,
+        fractal_heap: plan
+            .link_storage
+            .as_ref()
+            .map_or(UNDEFINED_ADDRESS, LinkStorage::fractal_heap_addr),
+        name_index: plan
+            .link_storage
+            .as_ref()
+            .map_or(UNDEFINED_ADDRESS, LinkStorage::name_index_addr),
     };
     check_size(
         &format!("{what} object header"),
-        oh::write_oh(buf, plan.oh_addr, &msgs, &addrs)?,
+        oh::write_oh(buf, plan.oh_addr, &msgs, &addrs, plan.refcount)?,
         plan.oh_size,
     )?;
 
-    let entries = snod_entries(
-        &plan.links,
-        &plan.sym.heap.name_offsets,
-        &plan.datasets,
-        &plan.groups,
-    )?;
+    // A new-style group's members are link messages, so its symbol table is
+    // written empty — the structures exist only so the parent's cached entry
+    // points at something real, matching what libhdf5 leaves behind when it
+    // converts a group.
+    let entries = if plan.link_storage.is_some() {
+        Vec::new()
+    } else {
+        snod_entries(plan)?
+    };
     emit_sym_table(buf, what, &plan.sym, &entries)?;
+    emit_dense_links(buf, what, plan)?;
 
     for ds in &plan.datasets {
         emit_dataset(buf, ds, gheap)?;
@@ -369,6 +493,44 @@ fn emit_group(
         emit_group(buf, grp, gheap)?;
     }
     Ok(())
+}
+
+/// Emit a dense group's fractal heap and link name index.
+///
+/// The heap's objects are the very link messages the compact form would have
+/// put in the object header, encoded now that every address is final.
+///
+/// # Errors
+///
+/// Returns `OxiH5Error::Format` if a link cannot be encoded or if either
+/// structure writes a different number of bytes than pass one reserved.
+fn emit_dense_links(buf: &mut [u8], what: &str, plan: &GroupPlan<'_>) -> Result<(), OxiH5Error> {
+    let Some(dense) = plan
+        .link_storage
+        .as_ref()
+        .and_then(|storage| storage.dense.as_ref())
+    else {
+        return Ok(());
+    };
+    let storage = plan
+        .link_storage
+        .as_ref()
+        .ok_or_else(|| OxiH5Error::Format("internal writer error: dense without storage".into()))?;
+
+    let mut objects = Vec::with_capacity(storage.links.len());
+    for link in &storage.links {
+        objects.push(link.msg.to_bytes()?);
+    }
+    check_size(
+        &format!("{what} link fractal heap"),
+        dense.heap.write(buf, &objects)?,
+        dense.heap.bytes(),
+    )?;
+    check_size(
+        &format!("{what} link name index"),
+        dense.index.write(buf)?,
+        dense.index.bytes(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +556,17 @@ pub(super) fn build_bytes(writer: &FileWriter) -> Result<Vec<u8>, OxiH5Error> {
     let mut path_to_addr: HashMap<String, u64> = HashMap::new();
     root_plan.collect_addresses("", &mut path_to_addr);
     root_plan.fill_obj_refs(&path_to_addr)?;
+
+    // -- Links: resolve hard aliases, then tally and apply reference counts. --
+    // Aliases are resolved against the same path map, and the tally is what
+    // makes each object header declare how many hard links actually reach it.
+    let mut alias_counts: HashMap<u64, u32> = HashMap::new();
+    root_plan.resolve_link_targets(&path_to_addr, &mut alias_counts)?;
+    root_plan.apply_refcounts(&alias_counts);
+    // Now that every object header address and every alias is settled, the
+    // new-style link messages can be given their target addresses.  This cannot
+    // move a byte: a hard link's value is a fixed-width address.
+    root_plan.patch_links()?;
 
     // -- Global heap collections, shared by every vlen-string dataset. --------
     // The writer splits objects into libhdf5-conformant collections (each padded

@@ -1120,53 +1120,82 @@ fn w1d_u16_u32_u64_i8_i16_roundtrip() {
     );
 }
 
-/// A big-endian `Dtype` must be refused rather than written little-endian.
+/// A big-endian `Dtype` is written big-endian, payload and datatype together.
 ///
 /// `create_dataset` and `create_dataset_unlimited` are the two entry points
-/// that take a caller-supplied `Dtype`, so they are the only places a
-/// big-endian request can arrive.  Before this guard the `order` field was
-/// dropped on the floor: the file claimed big-endian and contained
-/// little-endian bytes, and every value read back byte-swapped with no
-/// error reported anywhere.
+/// that take a caller-supplied `Dtype`; they used to refuse `ByteOrder::Big`
+/// because the writer had no byte-swap path, and before *that* guard existed
+/// they dropped the `order` field on the floor — the file claimed big-endian
+/// and contained little-endian bytes, so every value read back byte-swapped
+/// with no error anywhere.  Both are now closed: the declared order reaches the
+/// datatype message, and `write_dataset_numeric` supplies matching bytes.
 #[test]
-fn w1d_big_endian_dtype_rejected() {
+fn w1d_big_endian_dtype_round_trips() {
     let be = oxih5_core::ByteOrder::Big;
     let le = oxih5_core::ByteOrder::Little;
     let mut w = FileWriter::new();
 
     let be_f64 = Dtype::Float { size: 8, order: be };
-    assert!(
-        w.create_dataset("be_f64", &[2], &be_f64).is_err(),
-        "big-endian float must be rejected"
-    );
+    w.create_dataset("be_f64", &[2], &be_f64)
+        .expect("big-endian float is writable");
     let be_i32 = Dtype::Int {
         size: 4,
         signed: true,
         order: be,
     };
-    assert!(
-        w.create_dataset("be_i32", &[2], &be_i32).is_err(),
-        "big-endian int must be rejected"
-    );
+    w.create_dataset("be_i32", &[2], &be_i32)
+        .expect("big-endian int is writable");
     let raw = vec![0u8; 16];
-    assert!(
-        w.create_dataset_unlimited("be_chunk", &[2], &[2], &be_f64, &raw)
-            .is_err(),
-        "big-endian unlimited dataset must be rejected"
-    );
-
-    // The rejection must leave no trace: a dtype the writer refused must not
-    // have been half-registered before the check ran.
+    w.create_dataset_unlimited("be_chunk", &[2], &[2], &be_f64, &raw)
+        .expect("big-endian unlimited dataset is writable");
     w.create_dataset("le_f64", &[2], &Dtype::Float { size: 8, order: le })
         .expect("little-endian must still be accepted");
+
+    // Values written through the explicit-order entry point must survive the
+    // round trip, and must *not* match their byte-swapped twin.
+    w.write_dataset_numeric(
+        "be_values",
+        crate::NumericValues::I32(&[1, -2, 0x0102_0304]),
+        be,
+        &[3],
+    )
+    .expect("big-endian values");
 
     let tmp = std::env::temp_dir().join("oxih5_test_w1d_big_endian.h5");
     w.build(&tmp).expect("build");
     let f = File::open(&tmp).expect("open");
-    let _ = std::fs::remove_file(&tmp);
+
+    let mut names = f.dataset_names().expect("names");
+    names.sort();
     assert_eq!(
-        f.dataset_names().expect("names"),
-        vec!["le_f64".to_string()],
-        "rejected datasets must not reach the file"
+        names,
+        vec![
+            "be_chunk".to_string(),
+            "be_f64".to_string(),
+            "be_i32".to_string(),
+            "be_values".to_string(),
+            "le_f64".to_string(),
+        ]
     );
+
+    let ds = f.dataset("be_values").expect("be_values");
+    assert_eq!(
+        ds.dtype,
+        Dtype::Int {
+            size: 4,
+            signed: true,
+            order: be
+        }
+    );
+    assert_eq!(ds.as_i32().expect("i32"), vec![1, -2, 0x0102_0304]);
+
+    assert_eq!(
+        f.dataset("be_f64").expect("be_f64").dtype,
+        Dtype::Float { size: 8, order: be }
+    );
+    assert_eq!(
+        f.dataset("le_f64").expect("le_f64").dtype,
+        Dtype::Float { size: 8, order: le }
+    );
+    let _ = std::fs::remove_file(&tmp);
 }

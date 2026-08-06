@@ -353,72 +353,72 @@ fn parse_enum(
 // Array datatype (class 10)
 // ---------------------------------------------------------------------------
 
+/// Parse a class-10 (array) datatype's properties.
+///
+/// The array class was added with **version 2** of the datatype message, so
+/// there is no version-0 or version-1 form to parse: libhdf5 refuses to encode
+/// one (`H5T__array_encode`) and refuses to decode one.  Two forms exist:
+///
+/// ```text
+/// version 2   dimensionality (1)  reserved (3)  dim sizes (4 each)
+///             permutation indices (4 each)      base type
+/// version 3   dimensionality (1)  dim sizes (4 each)
+///                                                base type
+/// ```
+///
+/// Both are pinned against bytes libhdf5 2.0.0 wrote — see
+/// `tests::test_array_v2_matches_libhdf5`, whose body is a verbatim copy of the
+/// datatype message `h5t.array_create(NATIVE_INT32, (2, 3))` encodes.  The
+/// dimension sizes are 4-byte fields in **both** versions; reading them as
+/// 8-byte fields (as this did before) silently produced dimensions in the
+/// quintillions from a perfectly ordinary `(2, 3)` array.
 fn parse_array(body: &[u8], version: u8, depth: usize) -> Result<(Dtype, usize), OxiH5Error> {
-    if version == 1 || version == 0 {
-        // Version 1: body[8..12] = ndims (4 bytes), body[12..16] = reserved (4),
-        //            body[16..16+4*ndims] = dim_sizes (u32 each),
-        //            body[16+4*ndims..16+8*ndims] = dim_perm (u32 each),
-        //            then inline base type
-        if body.len() < 12 {
-            return Err(OxiH5Error::Format(
-                "array v1: body too short for ndims".into(),
-            ));
-        }
-        let ndims = read_u32_le(body, 8)? as usize;
-        // reserved 4 bytes at body[12]
-        let dims_start = 16;
-        let dims_end = dims_start + ndims * 4;
-        let perm_end = dims_end + ndims * 4;
-        if body.len() < perm_end {
-            return Err(OxiH5Error::Format(format!(
-                "array v1: body too short for dims (need {})",
-                perm_end
-            )));
-        }
-        let mut dims = Vec::with_capacity(ndims);
-        for i in 0..ndims {
-            dims.push(read_u32_le(body, dims_start + i * 4)? as usize);
-        }
-        let (base_dtype, base_consumed) = parse_datatype_consuming(&body[perm_end..], depth + 1)?;
-        let total = perm_end + base_consumed;
-        Ok((
-            Dtype::Array {
-                base: Box::new(base_dtype),
-                dims,
-            },
-            total,
-        ))
-    } else {
-        // Version 2: body[8] = ndims (1 byte), body[9..9+8*ndims] = dim_sizes (u64 each),
-        //            then inline base type
-        if body.len() < 9 {
-            return Err(OxiH5Error::Format(
-                "array v2: body too short for ndims".into(),
-            ));
-        }
-        let ndims = body[8] as usize;
-        let dims_start = 9;
-        let dims_end = dims_start + ndims * 8;
-        if body.len() < dims_end {
-            return Err(OxiH5Error::Format(format!(
-                "array v2: body too short for dims (need {})",
-                dims_end
-            )));
-        }
-        let mut dims = Vec::with_capacity(ndims);
-        for i in 0..ndims {
-            dims.push(read_u64_le(body, dims_start + i * 8)? as usize);
-        }
-        let (base_dtype, base_consumed) = parse_datatype_consuming(&body[dims_end..], depth + 1)?;
-        let total = dims_end + base_consumed;
-        Ok((
-            Dtype::Array {
-                base: Box::new(base_dtype),
-                dims,
-            },
-            total,
-        ))
+    if version < 2 {
+        return Err(OxiH5Error::Format(format!(
+            "array datatype: version {version} does not exist — the array class was \
+             introduced with datatype message version 2"
+        )));
     }
+    // Dimensionality is a single byte in every version of this class.
+    let ndims = *body
+        .get(8)
+        .ok_or_else(|| OxiH5Error::Format("array datatype: body too short for ndims".into()))?
+        as usize;
+
+    // Version 2 carries three reserved bytes after the dimensionality, and a
+    // permutation index per dimension after the sizes; version 3 has neither.
+    let dims_start: usize = if version == 2 { 12 } else { 9 };
+    let dims_end = dims_start
+        .checked_add(ndims.checked_mul(4).ok_or_else(|| {
+            OxiH5Error::Format("array datatype: dimension count overflows".into())
+        })?)
+        .ok_or_else(|| OxiH5Error::Format("array datatype: dimension range overflows".into()))?;
+    let props_end = if version == 2 {
+        dims_end
+            .checked_add(ndims * 4)
+            .ok_or_else(|| OxiH5Error::Format("array datatype: permutation overflows".into()))?
+    } else {
+        dims_end
+    };
+    if body.len() < props_end {
+        return Err(OxiH5Error::Format(format!(
+            "array datatype v{version}: body too short for {ndims} dimensions (need {props_end}, have {})",
+            body.len()
+        )));
+    }
+
+    let mut dims = Vec::with_capacity(ndims);
+    for i in 0..ndims {
+        dims.push(read_u32_le(body, dims_start + i * 4)? as usize);
+    }
+    let (base_dtype, base_consumed) = parse_datatype_consuming(&body[props_end..], depth + 1)?;
+    Ok((
+        Dtype::Array {
+            base: Box::new(base_dtype),
+            dims,
+        },
+        props_end + base_consumed,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -487,20 +487,6 @@ fn read_u32_le(data: &[u8], offset: usize) -> Result<u32, OxiH5Error> {
         data[offset + 2],
         data[offset + 3],
     ]))
-}
-
-fn read_u64_le(data: &[u8], offset: usize) -> Result<u64, OxiH5Error> {
-    if offset + 8 > data.len() {
-        return Err(OxiH5Error::Format(format!(
-            "read_u64_le: offset {} out of bounds (len={})",
-            offset,
-            data.len()
-        )));
-    }
-    let arr: [u8; 8] = data[offset..offset + 8]
-        .try_into()
-        .map_err(|_| OxiH5Error::Format("read_u64_le: slice error".into()))?;
-    Ok(u64::from_le_bytes(arr))
 }
 
 // ---------------------------------------------------------------------------
@@ -742,55 +728,78 @@ mod tests {
         );
     }
 
+    /// The exact datatype message body **h5py 3.16 / libhdf5 2.0.0** produced
+    /// for `h5t.array_create(h5t.NATIVE_INT32, (2, 3))`, captured from its
+    /// `H5Tencode` output (minus the two-byte wrapper).
+    ///
+    /// This is the regression guard for a parser that used to read the
+    /// dimension sizes as 8-byte fields: it turned a `(2, 3)` array into
+    /// `[216172782147338240, 72057594037927936]` and its `int32` base into a
+    /// 67-megabyte unsigned integer, without ever failing.
     #[test]
-    fn test_array_v2() {
-        // class 10, version 2: ndims=2, dims=[3,4], base = float32 LE v1
-        let mut body = build_dtype_header(10, 2, [0, 0, 0], 48);
-        body.push(2u8); // ndims
-        body.extend_from_slice(&3u64.to_le_bytes()); // dim[0]
-        body.extend_from_slice(&4u64.to_le_bytes()); // dim[1]
-                                                     // base type: float32 LE (header + v1 Properties)
-        body.extend_from_slice(&build_dtype_header(1, 1, [0x00, 0, 0], 4));
-        body.extend_from_slice(&build_float_props_v1());
-        let dtype = parse_datatype(&body).unwrap();
-        assert_eq!(
-            dtype,
-            Dtype::Array {
-                base: Box::new(Dtype::Float {
-                    size: 4,
-                    order: ByteOrder::Little
-                }),
-                dims: vec![3, 4]
-            }
-        );
-    }
-
-    #[test]
-    fn test_array_v1() {
-        // class 10, version 1: ndims=1, dim=[5], perm=[0], base = int8
-        let mut body = build_dtype_header(10, 1, [0, 0, 0], 5);
-        // ndims (4 bytes) + reserved (4 bytes)
-        body.extend_from_slice(&1u32.to_le_bytes()); // ndims
-        body.extend_from_slice(&0u32.to_le_bytes()); // reserved
-                                                     // dim_sizes (4 bytes each)
-        body.extend_from_slice(&5u32.to_le_bytes()); // dim[0]
-                                                     // dim_perm (4 bytes each)
-        body.extend_from_slice(&0u32.to_le_bytes()); // perm[0]
-                                                     // base type: int8 LE unsigned (header + v1 Properties)
-        body.extend_from_slice(&build_dtype_header(0, 1, [0x00, 0, 0], 1));
-        body.extend_from_slice(&build_int_props_v1(8));
+    fn test_array_v2_matches_libhdf5() {
+        let body: Vec<u8> = vec![
+            0x2a, 0x00, 0x00, 0x00, // class 10 (array), version 2
+            0x18, 0x00, 0x00, 0x00, // element size = 2 × 3 × 4 = 24
+            0x02, // dimensionality = 2
+            0x00, 0x00, 0x00, // reserved
+            0x02, 0x00, 0x00, 0x00, // dim[0] = 2
+            0x03, 0x00, 0x00, 0x00, // dim[1] = 3
+            0x00, 0x00, 0x00, 0x00, // permutation[0]
+            0x01, 0x00, 0x00, 0x00, // permutation[1]
+            // Base type: class 0 (fixed-point) v1, signed, 4 bytes, precision 32.
+            0x10, 0x08, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00,
+        ];
         let dtype = parse_datatype(&body).unwrap();
         assert_eq!(
             dtype,
             Dtype::Array {
                 base: Box::new(Dtype::Int {
-                    size: 1,
-                    signed: false,
+                    size: 4,
+                    signed: true,
+                    order: ByteOrder::Little
+                }),
+                dims: vec![2, 3]
+            }
+        );
+        assert_eq!(dtype.size(), Some(24));
+    }
+
+    /// Version 3 drops the reserved bytes and the permutation indices; the
+    /// dimension sizes stay 4-byte fields.
+    #[test]
+    fn test_array_v3_has_no_reserved_or_permutation() {
+        let mut body = build_dtype_header(10, 3, [0, 0, 0], 20);
+        body.push(1u8); // dimensionality
+        body.extend_from_slice(&5u32.to_le_bytes()); // dim[0] = 5
+        body.extend_from_slice(&build_dtype_header(1, 1, [0x00, 0, 0], 4));
+        body.extend_from_slice(&build_float_props_v1());
+        assert_eq!(
+            parse_datatype(&body).unwrap(),
+            Dtype::Array {
+                base: Box::new(Dtype::Float {
+                    size: 4,
                     order: ByteOrder::Little
                 }),
                 dims: vec![5]
             }
         );
+    }
+
+    /// There is no version-1 array datatype, and reporting one is better than
+    /// guessing at a layout that has never existed.
+    #[test]
+    fn test_array_version_below_two_is_rejected() {
+        for version in [0u8, 1] {
+            let mut body = build_dtype_header(10, version, [0, 0, 0], 4);
+            body.push(1u8);
+            body.extend_from_slice(&[0u8; 16]);
+            let err = parse_datatype(&body).expect_err("no such version");
+            assert!(
+                format!("{err}").contains("does not exist"),
+                "version {version}: {err}"
+            );
+        }
     }
 
     #[test]

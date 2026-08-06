@@ -27,6 +27,11 @@ use super::{FileWriter, MAX_DEFLATE_LEVEL};
 ///
 /// Returns `OxiH5Error::Format` naming `what` and `path`.
 fn ensure_filterable(ds: &DatasetDesc, what: &str, path: &str) -> Result<(), OxiH5Error> {
+    if ds.vlen_seqs.is_some() {
+        return Err(OxiH5Error::Format(format!(
+            "{what}('{path}'): a variable-length sequence dataset cannot be tiled or filtered —              its elements are global-heap references, which the reader refuses to decode              through a filter pipeline"
+        )));
+    }
     if ds.vlen_strings.is_some() {
         return Err(OxiH5Error::Format(format!(
             "{what}('{path}'): a variable-length string dataset cannot be tiled or filtered — \

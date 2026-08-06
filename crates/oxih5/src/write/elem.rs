@@ -40,8 +40,12 @@ pub(super) const VLEN_REF_SIZE: usize = 16;
 
 /// Datatype body size for a class-0 fixed-point type: 12 used + 4 padding.
 const FIXED_DT_BODY: usize = 16;
+/// Bytes a class-0 fixed-point body actually uses: 8 header + 4 properties.
+const FIXED_DT_NATURAL: usize = 12;
 /// Datatype body size for a class-1 float type: 20 used + 4 padding.
 const FLOAT_DT_BODY: usize = 24;
+/// Bytes a class-1 float body actually uses: 8 header + 12 properties.
+const FLOAT_DT_NATURAL: usize = 20;
 /// Datatype body size for a class-3 fixed-length string.
 const STRING_DT_BODY: usize = 8;
 /// Datatype body size for a class-7 object reference.
@@ -79,13 +83,101 @@ const UNDEFINED_ADDR: u64 = u64::MAX;
 // Dataset element types
 // ---------------------------------------------------------------------------
 
+/// The numeric element families, independent of byte order.
+///
+/// Split out of [`ElemType`] so that the width/signedness table lives once and
+/// both byte orders read from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NumType {
+    /// IEEE-754 binary16 (half precision).
+    F16,
+    /// IEEE-754 binary32.
+    F32,
+    /// IEEE-754 binary64.
+    F64,
+    /// Signed 8-bit integer.
+    I8,
+    /// Signed 16-bit integer.
+    I16,
+    /// Signed 32-bit integer.
+    I32,
+    /// Signed 64-bit integer.
+    I64,
+    /// Unsigned 8-bit integer.
+    U8,
+    /// Unsigned 16-bit integer.
+    U16,
+    /// Unsigned 32-bit integer.
+    U32,
+    /// Unsigned 64-bit integer.
+    U64,
+}
+
+impl NumType {
+    /// On-disk encoding of this family in `order`.
+    const fn spec(self, order: ByteOrder) -> ElemSpec {
+        /// Two's-complement signed fixed-point of `size` bytes.
+        const fn int(size: u8, order: ByteOrder) -> ElemSpec {
+            ElemSpec::Fixed {
+                size,
+                signed: true,
+                order,
+            }
+        }
+        /// Unsigned fixed-point of `size` bytes.
+        const fn uint(size: u8, order: ByteOrder) -> ElemSpec {
+            ElemSpec::Fixed {
+                size,
+                signed: false,
+                order,
+            }
+        }
+        match self {
+            NumType::F16 => ElemSpec::FloatIeee { size: 2, order },
+            NumType::F32 => ElemSpec::FloatIeee { size: 4, order },
+            NumType::F64 => ElemSpec::FloatIeee { size: 8, order },
+            NumType::I8 => int(1, order),
+            NumType::I16 => int(2, order),
+            NumType::I32 => int(4, order),
+            NumType::I64 => int(8, order),
+            NumType::U8 => uint(1, order),
+            NumType::U16 => uint(2, order),
+            NumType::U32 => uint(4, order),
+            NumType::U64 => uint(8, order),
+        }
+    }
+
+    /// This family in `order`, as an [`ElemType`].
+    pub(crate) const fn as_elem(self, order: ByteOrder) -> ElemType {
+        match order {
+            ByteOrder::Little => match self {
+                NumType::F16 => ElemType::F16,
+                NumType::F32 => ElemType::F32,
+                NumType::F64 => ElemType::F64,
+                NumType::I8 => ElemType::I8,
+                NumType::I16 => ElemType::I16,
+                NumType::I32 => ElemType::I32,
+                NumType::I64 => ElemType::I64,
+                NumType::U8 => ElemType::U8,
+                NumType::U16 => ElemType::U16,
+                NumType::U32 => ElemType::U32,
+                NumType::U64 => ElemType::U64,
+            },
+            ByteOrder::Big => ElemType::BigEndian(self),
+        }
+    }
+}
+
 /// Element type of a writable dataset.
 ///
-/// Every variant is little-endian: the writer serialises through
-/// `to_le_bytes` and has no byte-swap path, which is why
-/// [`dtype_to_elem_type`] refuses big-endian dtypes outright.
+/// Every variant except [`ElemType::BigEndian`] is little-endian: the
+/// `write_dataset_*` helpers serialise through `to_le_bytes`, and the
+/// big-endian ones through `to_be_bytes`, so the payload's order always matches
+/// the byte-order bit the datatype message declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ElemType {
+    /// IEEE-754 binary16 (half precision).
+    F16,
     /// IEEE-754 binary32.
     F32,
     /// IEEE-754 binary64.
@@ -123,6 +215,12 @@ pub(crate) enum ElemType {
     /// Each element is one `i8` (`0` or `1`); h5py reads the dataset back as a
     /// numpy `bool` array.
     Bool,
+    /// A numeric type stored **big-endian**.
+    ///
+    /// Identical to the matching little-endian variant except for the byte
+    /// order bit in the datatype message; the caller supplies payload bytes
+    /// already in that order.
+    BigEndian(NumType),
 }
 
 /// On-disk encoding family of an [`ElemType`].
@@ -132,17 +230,21 @@ pub(crate) enum ElemType {
 /// an element type means adding one [`ElemType::spec`] arm and nothing else.
 #[derive(Debug, Clone, Copy)]
 enum ElemSpec {
-    /// HDF5 class 0 — little-endian fixed-point integer, no padding.
+    /// HDF5 class 0 — fixed-point integer, no padding.
     Fixed {
         /// Width in bytes.
         size: u8,
         /// Two's-complement signed when set.
         signed: bool,
+        /// Byte order declared by the datatype message.
+        order: ByteOrder,
     },
-    /// HDF5 class 1 — little-endian IEEE-754 binary(`size * 8`) float.
+    /// HDF5 class 1 — IEEE-754 binary(`size * 8`) float.
     FloatIeee {
         /// Width in bytes.
         size: u8,
+        /// Byte order declared by the datatype message.
+        order: ByteOrder,
     },
     /// HDF5 class 9 — variable-length sequence of class-3 characters.
     VlenStr,
@@ -158,28 +260,20 @@ enum ElemSpec {
 impl ElemType {
     /// The one and only per-[`ElemType`] match in the writer.
     const fn spec(self) -> ElemSpec {
-        /// Two's-complement signed fixed-point of `size` bytes.
-        const fn int(size: u8) -> ElemSpec {
-            ElemSpec::Fixed { size, signed: true }
-        }
-        /// Unsigned fixed-point of `size` bytes.
-        const fn uint(size: u8) -> ElemSpec {
-            ElemSpec::Fixed {
-                size,
-                signed: false,
-            }
-        }
+        const LE: ByteOrder = ByteOrder::Little;
         match self {
-            ElemType::F32 => ElemSpec::FloatIeee { size: 4 },
-            ElemType::F64 => ElemSpec::FloatIeee { size: 8 },
-            ElemType::I8 => int(1),
-            ElemType::I16 => int(2),
-            ElemType::I32 => int(4),
-            ElemType::I64 => int(8),
-            ElemType::U8 => uint(1),
-            ElemType::U16 => uint(2),
-            ElemType::U32 => uint(4),
-            ElemType::U64 => uint(8),
+            ElemType::F16 => NumType::F16.spec(LE),
+            ElemType::F32 => NumType::F32.spec(LE),
+            ElemType::F64 => NumType::F64.spec(LE),
+            ElemType::I8 => NumType::I8.spec(LE),
+            ElemType::I16 => NumType::I16.spec(LE),
+            ElemType::I32 => NumType::I32.spec(LE),
+            ElemType::I64 => NumType::I64.spec(LE),
+            ElemType::U8 => NumType::U8.spec(LE),
+            ElemType::U16 => NumType::U16.spec(LE),
+            ElemType::U32 => NumType::U32.spec(LE),
+            ElemType::U64 => NumType::U64.spec(LE),
+            ElemType::BigEndian(num) => num.spec(ByteOrder::Big),
             ElemType::VlenStr => ElemSpec::VlenStr,
             ElemType::FixedStr(width) => ElemSpec::FixedStr { width },
             ElemType::Bool => ElemSpec::Bool,
@@ -191,7 +285,8 @@ impl ElemType {
     /// Guarded by [`tests::all_lists_every_variant_exactly_once`], whose
     /// wildcard-free `match` stops compiling the moment a variant is added.
     #[cfg(test)]
-    const ALL: [ElemType; 13] = [
+    const ALL: [ElemType; 16] = [
+        ElemType::F16,
         ElemType::F32,
         ElemType::F64,
         ElemType::I8,
@@ -207,6 +302,10 @@ impl ElemType {
         // encoder derives everything from it.
         ElemType::FixedStr(4),
         ElemType::Bool,
+        // Two representatives stand in for the whole `BigEndian` family, one
+        // per encoding shape; the encoder derives everything from `NumType`.
+        ElemType::BigEndian(NumType::F64),
+        ElemType::BigEndian(NumType::I32),
     ];
 
     /// On-disk size, in bytes, of a single element.
@@ -215,7 +314,7 @@ impl ElemType {
     /// the length of any string.
     pub(crate) const fn byte_size(self) -> usize {
         match self.spec() {
-            ElemSpec::Fixed { size, .. } | ElemSpec::FloatIeee { size } => size as usize,
+            ElemSpec::Fixed { size, .. } | ElemSpec::FloatIeee { size, .. } => size as usize,
             ElemSpec::VlenStr => VLEN_REF_SIZE,
             ElemSpec::FixedStr { width } => width as usize,
             // The enum's base type is one signed byte.
@@ -233,6 +332,57 @@ impl ElemType {
             ElemSpec::Bool => BOOL_ENUM_DT_BODY,
         }
     }
+
+    /// Body size of this type when it is **nested inside** another datatype
+    /// message — a compound member, a vlen or array base type, an enum base.
+    ///
+    /// This is *not* [`Self::dt_body_size`].  A top-level datatype message is
+    /// padded out to the object header's 8-byte grid, and a class-0 or class-1
+    /// body carries four bytes of that padding inside itself; a nested type has
+    /// no such grid, and every reader — ours in
+    /// `oxih5_format::datatype::parse_datatype_consuming`, and libhdf5 —
+    /// advances by the type's *consumed* length instead.  Emitting the padded
+    /// form in a nested position shifts everything after it by four bytes,
+    /// which is the exact failure mode the boolean enum's byte-pinned base type
+    /// already documents.
+    pub(crate) const fn nested_dt_body_size(self) -> usize {
+        match self.spec() {
+            ElemSpec::Fixed { .. } => FIXED_DT_NATURAL,
+            ElemSpec::FloatIeee { .. } => FLOAT_DT_NATURAL,
+            // Both halves of a vlen string are already unpadded.
+            ElemSpec::VlenStr => VLEN_DT_BODY,
+            ElemSpec::FixedStr { .. } => STRING_DT_BODY,
+            ElemSpec::Bool => BOOL_ENUM_DT_BODY,
+        }
+    }
+}
+
+/// Write `elem`'s datatype body at `start` in its **nested** form; returns
+/// bytes written, always [`ElemType::nested_dt_body_size`].
+///
+/// The padded encoders zero their own trailing bytes, which in a nested
+/// position would erase whatever the caller writes next, so the body is built
+/// in a scratch buffer and only its natural prefix is copied out.
+///
+/// # Errors
+///
+/// Returns `OxiH5Error::Format` if the element type has no encodable layout, or
+/// if an encoder disagrees with its own size formula.
+pub(super) fn write_nested_datatype_body(
+    buf: &mut [u8],
+    start: usize,
+    elem_type: ElemType,
+) -> Result<usize, OxiH5Error> {
+    let padded = elem_type.dt_body_size();
+    let mut scratch = vec![0u8; padded];
+    check_size(
+        "nested datatype body",
+        write_datatype_body(&mut scratch, 0, elem_type)?,
+        padded,
+    )?;
+    let natural = elem_type.nested_dt_body_size();
+    buf[start..start + natural].copy_from_slice(&scratch[..natural]);
+    Ok(natural)
 }
 
 // ---------------------------------------------------------------------------
@@ -251,12 +401,30 @@ const fn ieee_exp_bits(size: u8) -> Option<u8> {
     }
 }
 
+/// Bit 0 of a class-0 or class-1 datatype bit field: byte order.
+///
+/// The HDF5 format spec gives 0 for little-endian and 1 for big-endian in both
+/// classes.  Class 1 pairs it with bit 6 to also express VAX order (bit 6 set,
+/// bit 0 clear), which this writer never emits.
+const fn byte_order_bit(order: ByteOrder) -> u8 {
+    match order {
+        ByteOrder::Little => 0x00,
+        ByteOrder::Big => 0x01,
+    }
+}
+
 /// Write a class-0 (fixed-point) datatype body; returns bytes written.
-fn write_fixed_dtype(buf: &mut [u8], start: usize, size: u8, signed: bool) -> usize {
+fn write_fixed_dtype(
+    buf: &mut [u8],
+    start: usize,
+    size: u8,
+    signed: bool,
+    order: ByteOrder,
+) -> usize {
     fill_zero(buf, start, FIXED_DT_BODY);
     buf[start] = 0x10; // class 0 (fixed-point), version 1
-    buf[start + 1] = u8::from(signed) << 3; // little-endian, no padding, sign flag
-                                            // [2..4] remaining class bit fields = 0
+    buf[start + 1] = byte_order_bit(order) | (u8::from(signed) << 3); // no padding, sign flag
+                                                                      // [2..4] remaining class bit fields = 0
     write_u32_le(buf, start + 4, u32::from(size));
     // [8..10] bit offset = 0
     write_u16_le(buf, start + 10, u16::from(size) * 8); // bit precision
@@ -274,7 +442,12 @@ fn write_fixed_dtype(buf: &mut [u8], start: usize, size: u8, signed: bool) -> us
 /// # Errors
 ///
 /// Returns `OxiH5Error::Format` if `size` is not an IEEE-754 interchange width.
-fn write_float_dtype(buf: &mut [u8], start: usize, size: u8) -> Result<usize, OxiH5Error> {
+fn write_float_dtype(
+    buf: &mut [u8],
+    start: usize,
+    size: u8,
+    order: ByteOrder,
+) -> Result<usize, OxiH5Error> {
     let exp_bits = ieee_exp_bits(size).ok_or_else(|| {
         OxiH5Error::Format(format!(
             "internal writer error: no IEEE-754 layout for a {size}-byte float"
@@ -286,7 +459,8 @@ fn write_float_dtype(buf: &mut [u8], start: usize, size: u8) -> Result<usize, Ox
 
     fill_zero(buf, start, FLOAT_DT_BODY);
     buf[start] = 0x11; // class 1 (floating-point), version 1
-    buf[start + 1] = 0x20; // little-endian; mantissa normalization 2 (implied MSB, not stored)
+                       // Mantissa normalization 2 (implied MSB, not stored) plus the byte order bit.
+    buf[start + 1] = 0x20 | byte_order_bit(order);
     buf[start + 2] = precision - 1; // sign bit location
                                     // [3] remaining class bit field = 0
     write_u32_le(buf, start + 4, u32::from(size));
@@ -512,8 +686,12 @@ pub(super) fn write_datatype_body(
     elem_type: ElemType,
 ) -> Result<usize, OxiH5Error> {
     match elem_type.spec() {
-        ElemSpec::Fixed { size, signed } => Ok(write_fixed_dtype(buf, start, size, signed)),
-        ElemSpec::FloatIeee { size } => write_float_dtype(buf, start, size),
+        ElemSpec::Fixed {
+            size,
+            signed,
+            order,
+        } => Ok(write_fixed_dtype(buf, start, size, signed, order)),
+        ElemSpec::FloatIeee { size, order } => write_float_dtype(buf, start, size, order),
         ElemSpec::VlenStr => Ok(write_vlen_str_dtype(buf, start)),
         // A fixed-length string *dataset* declares ASCII, so h5py reads it as
         // numpy `S<width>` (raw bytes); the width is the on-disk element size.
@@ -538,78 +716,43 @@ pub(super) fn write_datatype_body(
 /// open, reader-side type description down to the closed set the writer can
 /// emit, which is a different question from how that set is encoded.
 ///
-/// The `order` field is load-bearing.  Every element type here is little-endian
-/// and every `write_dataset_*` helper serialises with `to_le_bytes`; there is no
-/// byte-swap path in the writer.  Accepting `ByteOrder::Big` would therefore
-/// emit little-endian payload bytes underneath a datatype message the caller
-/// asked to be big-endian — a file that reads back wrong rather than a file that
-/// fails to be written.  So big-endian is rejected here, at the one place a
-/// caller-supplied `Dtype` enters the writer.
+/// The `order` field is carried through: the writer now emits both byte orders,
+/// so a `ByteOrder::Big` dtype maps to [`ElemType::BigEndian`] rather than being
+/// refused.  `create_dataset` fills a zero buffer, whose bytes are the same in
+/// either order; every caller that supplies real bytes serialises them itself
+/// with the matching `to_le_bytes`/`to_be_bytes`.
 ///
 /// # Errors
 ///
-/// Returns `OxiH5Error::Format` if `dtype` is big-endian, or for any dtype the
-/// writer cannot emit.
+/// Returns `OxiH5Error::Format` for any dtype the writer cannot emit.
 pub(super) fn dtype_to_elem_type(dtype: &Dtype) -> Result<ElemType, OxiH5Error> {
-    if matches!(
-        dtype,
+    let numeric = match dtype {
+        Dtype::Float { size, order } => match size {
+            2 => Some((NumType::F16, *order)),
+            4 => Some((NumType::F32, *order)),
+            8 => Some((NumType::F64, *order)),
+            _ => None,
+        },
         Dtype::Int {
-            order: ByteOrder::Big,
-            ..
-        } | Dtype::Float {
-            order: ByteOrder::Big,
-            ..
-        }
-    ) {
-        return Err(OxiH5Error::Format(format!(
-            "unsupported dtype {dtype:?}: the writer emits little-endian only, \
-             big-endian is not supported"
-        )));
-    }
-    match dtype {
-        Dtype::Float { size: 4, .. } => Ok(ElemType::F32),
-        Dtype::Float { size: 8, .. } => Ok(ElemType::F64),
-        Dtype::Int {
-            size: 1,
-            signed: true,
-            ..
-        } => Ok(ElemType::I8),
-        Dtype::Int {
-            size: 2,
-            signed: true,
-            ..
-        } => Ok(ElemType::I16),
-        Dtype::Int {
-            size: 4,
-            signed: true,
-            ..
-        } => Ok(ElemType::I32),
-        Dtype::Int {
-            size: 8,
-            signed: true,
-            ..
-        } => Ok(ElemType::I64),
-        Dtype::Int {
-            size: 1,
-            signed: false,
-            ..
-        } => Ok(ElemType::U8),
-        Dtype::Int {
-            size: 2,
-            signed: false,
-            ..
-        } => Ok(ElemType::U16),
-        Dtype::Int {
-            size: 4,
-            signed: false,
-            ..
-        } => Ok(ElemType::U32),
-        Dtype::Int {
-            size: 8,
-            signed: false,
-            ..
-        } => Ok(ElemType::U64),
-        _ => Err(OxiH5Error::Format(format!("unsupported dtype {dtype:?}"))),
+            size,
+            signed,
+            order,
+        } => match (size, signed) {
+            (1, true) => Some((NumType::I8, *order)),
+            (2, true) => Some((NumType::I16, *order)),
+            (4, true) => Some((NumType::I32, *order)),
+            (8, true) => Some((NumType::I64, *order)),
+            (1, false) => Some((NumType::U8, *order)),
+            (2, false) => Some((NumType::U16, *order)),
+            (4, false) => Some((NumType::U32, *order)),
+            (8, false) => Some((NumType::U64, *order)),
+            _ => None,
+        },
+        _ => None,
+    };
+    match numeric {
+        Some((num, order)) => Ok(num.as_elem(order)),
+        None => Err(OxiH5Error::Format(format!("unsupported dtype {dtype:?}"))),
     }
 }
 
@@ -654,17 +797,18 @@ pub(crate) enum AttrKind {
     Num {
         /// The element type the bytes encode.
         elem: ElemType,
-        /// The value, already serialised little-endian; `elem.byte_size()` long.
-        le_bytes: Vec<u8>,
+        /// The value, already serialised in `elem`'s declared byte order;
+        /// `elem.byte_size()` long.
+        bytes: Vec<u8>,
     },
     /// A 1-D numeric array of any writer-supported element type, carried as its
-    /// concatenated little-endian on-disk bytes.
+    /// concatenated on-disk bytes.
     NumArray {
         /// The element type the bytes encode.
         elem: ElemType,
-        /// The values, concatenated little-endian; a multiple of
-        /// `elem.byte_size()` long.
-        le_bytes: Vec<u8>,
+        /// The values, concatenated in `elem`'s declared byte order; a multiple
+        /// of `elem.byte_size()` long.
+        bytes: Vec<u8>,
     },
     /// A 1-D vlen-of-object-reference attribute (netCDF-4 `DIMENSION_LIST`): one
     /// independent sequence of target object names per element.
@@ -780,19 +924,19 @@ pub(super) enum ResolvedAttrKind<'a> {
         /// Target object-header addresses, initially [`UNDEFINED_ADDR`].
         addrs: Vec<u64>,
     },
-    /// A scalar numeric value, as its little-endian on-disk bytes.
+    /// A scalar numeric value, as its on-disk bytes.
     Num {
         /// The element type the bytes encode.
         elem: ElemType,
-        /// The value's little-endian bytes.
-        le_bytes: &'a [u8],
+        /// The value's bytes, in `elem`'s declared byte order.
+        bytes: &'a [u8],
     },
-    /// A 1-D numeric array, as its concatenated little-endian on-disk bytes.
+    /// A 1-D numeric array, as its concatenated on-disk bytes.
     NumArray {
         /// The element type the bytes encode.
         elem: ElemType,
-        /// The values' concatenated little-endian bytes.
-        le_bytes: &'a [u8],
+        /// The values' concatenated bytes, in `elem`'s declared byte order.
+        bytes: &'a [u8],
     },
     /// A 1-D vlen-of-object-reference attribute.
     ///
@@ -878,9 +1022,7 @@ impl ResolvedAttrKind<'_> {
             ResolvedAttrKind::I64Array(values) => Some(values.len()),
             ResolvedAttrKind::StrArray { values, .. } => Some(values.len()),
             ResolvedAttrKind::ObjRefs { addrs, .. } => Some(addrs.len()),
-            ResolvedAttrKind::NumArray { elem, le_bytes } => {
-                Some(le_bytes.len() / elem.byte_size())
-            }
+            ResolvedAttrKind::NumArray { elem, bytes } => Some(bytes.len() / elem.byte_size()),
             ResolvedAttrKind::VlenObjRefs { elems, .. } => Some(elems.len()),
             ResolvedAttrKind::RefIndexList { pairs, .. } => Some(pairs.len()),
         }
@@ -902,9 +1044,8 @@ impl ResolvedAttrKind<'_> {
             ResolvedAttrKind::I64Array(values) => (FIXED_DT_BODY, values.len() * 8),
             ResolvedAttrKind::StrArray { values, width } => (STRING_DT_BODY, values.len() * width),
             ResolvedAttrKind::ObjRefs { addrs, .. } => (REF_DT_BODY, addrs.len() * 8),
-            ResolvedAttrKind::Num { elem, le_bytes }
-            | ResolvedAttrKind::NumArray { elem, le_bytes } => {
-                (elem.dt_body_size(), le_bytes.len())
+            ResolvedAttrKind::Num { elem, bytes } | ResolvedAttrKind::NumArray { elem, bytes } => {
+                (elem.dt_body_size(), bytes.len())
             }
             ResolvedAttrKind::VlenObjRefs { elems, .. } => {
                 (VLEN_REF_DT_BODY, elems.len() * VLEN_REF_SIZE)
@@ -1043,12 +1184,14 @@ impl ResolvedAttr<'_> {
                 StrCharset::Utf8,
             )),
             ResolvedAttrKind::F64(_) | ResolvedAttrKind::F64Array(_) => {
-                write_float_dtype(buf, start, 8)
+                write_float_dtype(buf, start, 8, ByteOrder::Little)
             }
             ResolvedAttrKind::I64(_) | ResolvedAttrKind::I64Array(_) => {
-                Ok(write_fixed_dtype(buf, start, 8, true))
+                Ok(write_fixed_dtype(buf, start, 8, true, ByteOrder::Little))
             }
-            ResolvedAttrKind::I32(_) => Ok(write_fixed_dtype(buf, start, 4, true)),
+            ResolvedAttrKind::I32(_) => {
+                Ok(write_fixed_dtype(buf, start, 4, true, ByteOrder::Little))
+            }
             ResolvedAttrKind::ObjRefs { .. } => Ok(write_ref_dtype(buf, start)),
             ResolvedAttrKind::Num { elem, .. } | ResolvedAttrKind::NumArray { elem, .. } => {
                 write_datatype_body(buf, start, *elem)
@@ -1146,10 +1289,9 @@ impl ResolvedAttr<'_> {
             }
             // A scalar and its array share this path: the region is pre-zeroed
             // and the bytes are already little-endian, so both just copy.
-            ResolvedAttrKind::Num { le_bytes, .. }
-            | ResolvedAttrKind::NumArray { le_bytes, .. } => {
-                buf[start..start + le_bytes.len()].copy_from_slice(le_bytes);
-                le_bytes.len()
+            ResolvedAttrKind::Num { bytes, .. } | ResolvedAttrKind::NumArray { bytes, .. } => {
+                buf[start..start + bytes.len()].copy_from_slice(bytes);
+                bytes.len()
             }
             ResolvedAttrKind::VlenObjRefs { elems, .. } => {
                 for (i, elem) in elems.iter().enumerate() {
@@ -1259,14 +1401,10 @@ pub(super) fn resolve_attrs(attrs: &[AttrDesc]) -> Vec<ResolvedAttr<'_>> {
                     names,
                     addrs: vec![UNDEFINED_ADDR; names.len()],
                 },
-                AttrKind::Num { elem, le_bytes } => ResolvedAttrKind::Num {
-                    elem: *elem,
-                    le_bytes,
-                },
-                AttrKind::NumArray { elem, le_bytes } => ResolvedAttrKind::NumArray {
-                    elem: *elem,
-                    le_bytes,
-                },
+                AttrKind::Num { elem, bytes } => ResolvedAttrKind::Num { elem: *elem, bytes },
+                AttrKind::NumArray { elem, bytes } => {
+                    ResolvedAttrKind::NumArray { elem: *elem, bytes }
+                }
                 AttrKind::VlenObjRefsByName(sequences) => ResolvedAttrKind::VlenObjRefs {
                     names: sequences,
                     elems: sequences

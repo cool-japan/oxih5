@@ -62,7 +62,8 @@ fn generated_dtype_bodies_match_the_historic_literals() {
 fn all_lists_every_variant_exactly_once() {
     for elem_type in ElemType::ALL {
         match elem_type {
-            ElemType::F32
+            ElemType::F16
+            | ElemType::F32
             | ElemType::F64
             | ElemType::I8
             | ElemType::I16
@@ -74,7 +75,8 @@ fn all_lists_every_variant_exactly_once() {
             | ElemType::U64
             | ElemType::VlenStr
             | ElemType::FixedStr(_)
-            | ElemType::Bool => {}
+            | ElemType::Bool
+            | ElemType::BigEndian(_) => {}
         }
     }
     for (i, a) in ElemType::ALL.iter().enumerate() {
@@ -141,10 +143,11 @@ fn every_dtype_body_parses_back_through_the_reader() {
         signed,
         order: le,
     };
-    let expected: [(ElemType, Dtype); 13] = [
+    let expected: [(ElemType, Dtype); 16] = [
         (ElemType::F32, Dtype::Float { size: 4, order: le }),
         (ElemType::F64, Dtype::Float { size: 8, order: le }),
         (ElemType::I8, int(1, true)),
+        (ElemType::F16, Dtype::Float { size: 2, order: le }),
         (ElemType::I16, int(2, true)),
         (ElemType::I32, int(4, true)),
         (ElemType::I64, int(8, true)),
@@ -174,6 +177,23 @@ fn every_dtype_body_parses_back_through_the_reader() {
             Dtype::Enum {
                 base: Box::new(int(1, true)),
                 members: vec![("FALSE".to_string(), 0), ("TRUE".to_string(), 1)],
+            },
+        ),
+        // The two big-endian representatives, which must read back with
+        // `ByteOrder::Big` — the whole point of the variant.
+        (
+            ElemType::BigEndian(NumType::F64),
+            Dtype::Float {
+                size: 8,
+                order: ByteOrder::Big,
+            },
+        ),
+        (
+            ElemType::BigEndian(NumType::I32),
+            Dtype::Int {
+                size: 4,
+                signed: true,
+                order: ByteOrder::Big,
             },
         ),
     ];
@@ -292,8 +312,8 @@ fn dt_body_sizes_match_the_encoders() {
 #[test]
 fn float_encoder_rejects_non_ieee_widths() {
     let mut buf = vec![0u8; FLOAT_DT_BODY];
-    assert!(write_float_dtype(&mut buf, 0, 3).is_err());
-    assert!(write_float_dtype(&mut buf, 0, 4).is_ok());
+    assert!(write_float_dtype(&mut buf, 0, 3, ByteOrder::Little).is_err());
+    assert!(write_float_dtype(&mut buf, 0, 4, ByteOrder::Little).is_ok());
 }
 
 #[test]
@@ -520,7 +540,8 @@ fn dtype_mapping_covers_the_writable_set() {
         signed,
         order: le,
     };
-    let cases: [(Dtype, ElemType); 10] = [
+    let cases: [(Dtype, ElemType); 11] = [
+        (Dtype::Float { size: 2, order: le }, ElemType::F16),
         (Dtype::Float { size: 4, order: le }, ElemType::F32),
         (Dtype::Float { size: 8, order: le }, ElemType::F64),
         (int(1, true), ElemType::I8),
@@ -540,7 +561,11 @@ fn dtype_mapping_covers_the_writable_set() {
     }
 
     // Widths the writer has no encoding for stay rejected.
-    assert!(dtype_to_elem_type(&Dtype::Float { size: 2, order: le }).is_err());
+    assert!(dtype_to_elem_type(&Dtype::Float {
+        size: 16,
+        order: le
+    })
+    .is_err());
     assert!(dtype_to_elem_type(&int(3, true)).is_err());
     assert!(dtype_to_elem_type(&Dtype::Reference {
         ref_type: oxih5_core::RefType::Object
@@ -548,55 +573,106 @@ fn dtype_mapping_covers_the_writable_set() {
     .is_err());
 }
 
-/// Big-endian dtypes must fail, not be written out as little-endian.
+/// Big-endian dtypes map to the big-endian element types, not to their
+/// little-endian twins.
 ///
-/// Every element type is little-endian and no `write_dataset_*` helper has a
-/// byte-swap path, so accepting `ByteOrder::Big` here would produce a file
-/// whose datatype message and payload disagree — data that reads back wrong
-/// with no error anywhere.  Real big-endian support is a separate change;
-/// until then this is the honest failure.
+/// The writer used to reject `ByteOrder::Big` outright, because no
+/// `write_dataset_*` helper had a byte-swap path and accepting it would have
+/// produced a file whose datatype message and payload disagreed.  Now
+/// `write_dataset_numeric` serialises with `to_be_bytes` for exactly these
+/// element types, so the mapping is sound — and a big-endian type must stay
+/// distinguishable from its little-endian twin, or a caller asking for `>f4`
+/// would silently get `<f4`.
 #[test]
-fn big_endian_dtypes_are_rejected() {
+fn big_endian_dtypes_map_to_big_endian_element_types() {
     let be = ByteOrder::Big;
+    let le = ByteOrder::Little;
     let candidates = [
-        Dtype::Float { size: 4, order: be },
-        Dtype::Float { size: 8, order: be },
-        Dtype::Int {
-            size: 4,
-            signed: true,
-            order: be,
-        },
-        Dtype::Int {
-            size: 2,
-            signed: false,
-            order: be,
-        },
-        Dtype::Int {
-            size: 8,
-            signed: false,
-            order: be,
-        },
+        (Dtype::Float { size: 2, order: be }, NumType::F16),
+        (Dtype::Float { size: 4, order: be }, NumType::F32),
+        (Dtype::Float { size: 8, order: be }, NumType::F64),
+        (
+            Dtype::Int {
+                size: 4,
+                signed: true,
+                order: be,
+            },
+            NumType::I32,
+        ),
+        (
+            Dtype::Int {
+                size: 2,
+                signed: false,
+                order: be,
+            },
+            NumType::U16,
+        ),
+        (
+            Dtype::Int {
+                size: 8,
+                signed: false,
+                order: be,
+            },
+            NumType::U64,
+        ),
     ];
-    for dtype in candidates {
-        let err = dtype_to_elem_type(&dtype)
-            .expect_err("big-endian must not be silently written as little-endian");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("big-endian"),
-            "{dtype:?}: error should name big-endian, got {msg:?}"
+    for (dtype, num) in candidates {
+        let elem = dtype_to_elem_type(&dtype).expect("big-endian dtypes are writable");
+        assert_eq!(elem, ElemType::BigEndian(num), "{dtype:?}");
+        assert_ne!(
+            elem,
+            num.as_elem(le),
+            "{dtype:?}: big-endian must not collapse onto its little-endian twin"
         );
+        // Same width either way — only the datatype message's order bit moves.
+        assert_eq!(elem.byte_size(), num.as_elem(le).byte_size(), "{dtype:?}");
     }
 
-    // The little-endian twin of each rejected dtype is still accepted, so
-    // the guard rejects the byte order and not the type.
-    let le = ByteOrder::Little;
-    assert!(dtype_to_elem_type(&Dtype::Float { size: 4, order: le }).is_ok());
-    assert!(dtype_to_elem_type(&Dtype::Int {
-        size: 2,
-        signed: false,
-        order: le
-    })
-    .is_ok());
+    // The little-endian twins still map to the little-endian element types.
+    assert_eq!(
+        dtype_to_elem_type(&Dtype::Float { size: 4, order: le }).expect("le f32"),
+        ElemType::F32
+    );
+    assert_eq!(
+        dtype_to_elem_type(&Dtype::Int {
+            size: 2,
+            signed: false,
+            order: le
+        })
+        .expect("le u16"),
+        ElemType::U16
+    );
+}
+
+/// Both classes put the byte-order flag in bit 0 of their bit field, and
+/// nothing else about the datatype body may move with it.
+#[test]
+fn byte_order_bit_is_the_only_difference() {
+    for num in [NumType::F16, NumType::F32, NumType::F64] {
+        let le = body_of(num.as_elem(ByteOrder::Little));
+        let be = body_of(num.as_elem(ByteOrder::Big));
+        assert_eq!(le.len(), be.len(), "{num:?}");
+        assert_eq!(le[1] & 0x01, 0, "{num:?}: little-endian clears bit 0");
+        assert_eq!(be[1] & 0x01, 1, "{num:?}: big-endian sets bit 0");
+        assert_eq!(le[1] | 0x01, be[1], "{num:?}: only bit 0 moves");
+        for (i, (a, b)) in le.iter().zip(be.iter()).enumerate() {
+            if i != 1 {
+                assert_eq!(a, b, "{num:?}: byte {i} must not change with byte order");
+            }
+        }
+    }
+    for num in [NumType::I16, NumType::I32, NumType::U32, NumType::U64] {
+        let le = body_of(num.as_elem(ByteOrder::Little));
+        let be = body_of(num.as_elem(ByteOrder::Big));
+        assert_eq!(le[1] & 0x01, 0, "{num:?}");
+        assert_eq!(be[1] & 0x01, 1, "{num:?}");
+        assert_eq!(le[1] | 0x01, be[1], "{num:?}");
+        for (i, (a, b)) in le.iter().zip(be.iter()).enumerate() {
+            if i != 1 {
+                assert_eq!(a, b, "{num:?}: byte {i} must not change with byte order");
+            }
+        }
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -800,11 +876,11 @@ fn widened_numeric_attr_datatypes_reuse_the_elem_encoder() {
         for kind in [
             ResolvedAttrKind::Num {
                 elem,
-                le_bytes: &empty,
+                bytes: &empty,
             },
             ResolvedAttrKind::NumArray {
                 elem,
-                le_bytes: &empty,
+                bytes: &empty,
             },
         ] {
             let got = attr_dtype_body(kind);
@@ -822,14 +898,14 @@ fn widened_numeric_scalar_and_array_reserve_equals_write() {
         name: "flag",
         kind: ResolvedAttrKind::Num {
             elem: ElemType::U16,
-            le_bytes: &u16le[..2],
+            bytes: &u16le[..2],
         },
     };
     let array = ResolvedAttr {
         name: "flags",
         kind: ResolvedAttrKind::NumArray {
             elem: ElemType::U16,
-            le_bytes: &u16le,
+            bytes: &u16le,
         },
     };
     assert_eq!(scalar.kind.vector_len(), None, "scalar dataspace");

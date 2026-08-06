@@ -715,7 +715,10 @@ mod tests {
                 unlimited_dim0,
             },
             filter: None,
+            dtype: None,
             vlen_strings: None,
+            vlen_seqs: None,
+            creation_order: 0,
         }
     }
 

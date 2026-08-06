@@ -1,40 +1,75 @@
-//! HDF5 file writer — attribute, nested-group, and chunked dataset support.
+//! HDF5 file writer — attribute, nested-group, link, and dataset support.
 //!
-//! Produces minimal, valid HDF5 files using superblock v0, old-style groups
-//! (B-tree v1 + SNOD + local heap), contiguous **and** chunked data layouts.
+//! Produces minimal, valid HDF5 files using superblock v0 and version-1 object
+//! headers, with contiguous, chunked **and** compact data layouts.
 //!
 //! The file is a tree of [`tree::GroupNode`]s rooted at a nameless group, and
 //! the root is planned and emitted by exactly the same code as every other
 //! group — see [`plan`] for the layout pass and [`build`] for the emit pass.
-//! Group links are laid out the way libhdf5 lays them out: sorted by name,
-//! chunked into fixed-width symbol table nodes, and indexed by a B-tree that
-//! grows a level whenever one node's children run out — see [`btree_v1`].
 //!
 //! Every entry point takes a *path*, resolved by [`tree::split_path`]; writing
 //! to `"/a/b/x"` creates the groups above `x`, matching h5py's
 //! `create_intermediate_group=True`.
+//!
+//! # How a group stores its members
+//!
+//! Both of HDF5's unrelated encodings, chosen per group:
+//!
+//! * **Old-style** (the default): a version-1 B-tree over symbol table nodes
+//!   plus a local heap — laid out the way libhdf5 lays it out, sorted by name
+//!   and chunked into fixed-width nodes indexed by a B-tree that grows a level
+//!   whenever one node's children run out (see [`btree_v1`]). Expresses hard
+//!   links and soft links, and nothing else.
+//! * **New-style** ([`link`]): a Link Info message and one Link message per
+//!   member, or — past libhdf5's `max_compact` of 8 — a [`fractal_heap`] of
+//!   link messages indexed by a type-5 [`btree_v2`] name index. This is the
+//!   only encoding that can hold an **external link** or record **creation
+//!   order**, so [`FileWriter::create_external_link`] and
+//!   [`FileWriter::set_track_order`] select it, exactly as libhdf5 does.
+//!
+//! # Datasets
 //!
 //! A dataset can be DEFLATE-compressed with [`FileWriter::set_deflate`], which
 //! converts it to chunked storage and attaches a filter pipeline message; see
 //! [`chunked`] for the index that addresses the compressed chunks and
 //! [`payload`] for why the compression happens during the layout pass.
 //!
+//! Element types come in two shapes. [`elem::ElemType`] is the closed, `Copy`
+//! set whose datatype message has a fixed length — every numeric family in
+//! either byte order, a fixed-length string, a vlen string, a boolean — and
+//! [`dtype::EncodedDtype`] is everything whose message length depends on the
+//! caller's description: compound records, variable-length sequences, arrays,
+//! opaque blobs and bitfields, each encoded once when the dataset is declared.
+//! [`tree::DatasetDesc::elem_size`] is the single definition of a dataset's
+//! stride across both.
+//!
 //! Constraints:
-//! - One filter, DEFLATE; a pipeline of several is not writable
-//! - Supported element types: f32, f64, i8, i16, i32, i64, u8, u16, u32, u64
-//!   (little-endian only — see [`elem::dtype_to_elem_type`])
+//! - Filters: shuffle, DEFLATE and fletcher32, in libhdf5's canonical order;
+//!   scaleoffset, nbit and szip have no write path
 //! - Attribute types: fixed-length string, f64, i64, i32, their `f64`/`i64`/
-//!   string vector forms, and object-reference lists
+//!   string vector forms, any numeric type in either byte order via
+//!   [`FileWriter::write_numeric_attr`], and object-reference lists
+//! - A dense group's links must fit one fractal-heap direct block, and its name
+//!   index is a single B-tree leaf; both refuse rather than grow
+//! - A structured datatype's members are inline scalars, not nested compound,
+//!   array or variable-length types
 
 mod api_attrs;
 mod api_datasets;
+mod api_dtypes;
 mod api_filters;
 mod api_groups;
+mod api_links;
 mod btree_v1;
+mod btree_v2;
 mod build;
+mod checksum;
 mod chunked;
+mod dtype;
 mod elem;
 mod format;
+mod fractal_heap;
+mod link;
 mod oh;
 mod payload;
 mod pipeline;
@@ -118,6 +153,8 @@ fn checked_byte_len(what: &str, shape: &[usize], elem_size: usize) -> Result<usi
 }
 
 // ---------------------------------------------------------------------------
+pub use api_datasets::NumericValues;
+
 // FileWriter — public API
 // ---------------------------------------------------------------------------
 

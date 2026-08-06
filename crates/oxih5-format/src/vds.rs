@@ -354,6 +354,24 @@ fn parse_hyperslab_v1_blocks(
     if num_blocks == 0 {
         return Ok(VdsSelection::None);
     }
+    // `num_blocks` is a raw `u32` read straight off disk
+    // (`parse_hyperslab_selection`'s version-1 arm) with no upstream bound,
+    // so `Vec::with_capacity(num_blocks)` below would otherwise let a tiny
+    // attacker-controlled input request an up-front allocation of tens of
+    // gigabytes — an OOM found by fuzzing (`fuzz/fuzz_targets/fuzz_vds.rs`,
+    // on a 39-byte input) — the same "count field used unchecked as
+    // `Vec::with_capacity`" hazard already fixed for the Fixed Array
+    // chunk-index parser's element count. Each block needs at least
+    // `rank * 8` bytes (`start[rank]` + `end[rank]`, each a `u32`), so reject
+    // any count that could not possibly fit in what's left of the buffer
+    // before allocating for it.
+    let min_bytes_per_block = rank * 8;
+    if num_blocks > cur.remaining() / min_bytes_per_block {
+        return Err(OxiH5Error::Format(format!(
+            "VDS hyperslab v1: block count {num_blocks} exceeds what fits in the remaining {} bytes",
+            cur.remaining()
+        )));
+    }
     // Read the blocks: each block is start[rank] then end[rank] (inclusive), all u32.
     let mut blocks = Vec::with_capacity(num_blocks);
     for _ in 0..num_blocks {
@@ -472,6 +490,15 @@ struct Reader<'a> {
 impl<'a> Reader<'a> {
     fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
+    }
+
+    /// Number of bytes not yet consumed.
+    ///
+    /// `pos` never exceeds `data.len()` (every advance goes through
+    /// [`Reader::take`], which bounds-checks before updating `pos`), so this
+    /// subtraction cannot underflow.
+    fn remaining(&self) -> usize {
+        self.data.len() - self.pos
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], OxiH5Error> {
@@ -664,6 +691,50 @@ mod tests {
         assert_eq!(mapping.entries[1].source_file, "shared.h5"); // resolved via reference
         assert_eq!(mapping.entries[0].source_dataset, "a");
         assert_eq!(mapping.entries[1].source_dataset, "b");
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: an implausible version-1 hyperslab block count must error,
+    // not attempt a huge up-front allocation.
+    //
+    // `num_blocks` is a raw `u32` read straight off disk with no upstream
+    // bound; before the fix, `Vec::with_capacity(num_blocks)` in
+    // `parse_hyperslab_v1_blocks` would try to reserve capacity for up to
+    // `u32::MAX` `(Vec<u64>, Vec<u64>)` tuples, aborting the process with an
+    // OOM well before any of those blocks were actually read from the
+    // (tiny) input buffer. Found by fuzzing
+    // (`fuzz/fuzz_targets/fuzz_vds.rs`, OOM on a 39-byte input).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_hyperslab_v1_num_blocks_implausible_rejected_not_oom() {
+        let data: &[u8] = &[0u8; 8]; // far too small to hold even one block
+        let mut cur = Reader::new(data);
+        let result = parse_hyperslab_v1_blocks(&mut cur, 2, u32::MAX as usize);
+        assert!(
+            result.is_err(),
+            "an implausible block count must return an error, not attempt a huge allocation"
+        );
+    }
+
+    /// Same hazard, exercised through the public parsing entry point
+    /// (`parse_selection`, as reached from `parse_vds_block`) rather than
+    /// calling the private helper directly.
+    #[test]
+    fn test_parse_selection_hyperslab_v1_huge_num_blocks_rejected_not_oom() {
+        let mut v = Vec::new();
+        v.extend_from_slice(&2u32.to_le_bytes()); // selection type = hyperslab
+        v.extend_from_slice(&1u32.to_le_bytes()); // version 1
+        v.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        v.extend_from_slice(&0u32.to_le_bytes()); // length
+        v.extend_from_slice(&2u32.to_le_bytes()); // rank = 2
+        v.extend_from_slice(&u32::MAX.to_le_bytes()); // num_blocks = implausible
+        let mut cur = Reader::new(&v);
+        let result = parse_selection(&mut cur);
+        assert!(
+            result.is_err(),
+            "an implausible v1 block count must return an error, not attempt a huge allocation"
+        );
     }
 
     #[test]

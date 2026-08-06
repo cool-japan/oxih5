@@ -272,4 +272,75 @@ with h5py.File(deflate_path, "w", libver="earliest") as f:
     )
 print(f"Generated {deflate_path}")
 
+# ---------------------------------------------------------------------------
+# Fixture 8: chunked_ea.h5 — every shape that drives the *extensible array*
+# chunk index (index type 4).  libhdf5 picks it for a chunked dataset with
+# exactly one unlimited dimension under libver='latest', which is the ordinary
+# `create_dataset(..., chunks=..., maxshape=(None, ...))` case.
+#
+# The datasets are sized to reach each level of the array's structure:
+#   /ea_1d           4 chunks  — fits in the index block's inline elements
+#   /ea_1d_blocks    125 chunks — data blocks addressed from the index block
+#   /ea_1d_secondary 400 chunks — reaches a secondary block (EASB)
+#   /ea_1d_gzip      25 chunks  — filtered client: address + size + filter mask
+#   /ea_1d_sparse    unwritten chunks stay unallocated and read as the fill value
+#   /ea_2d_unlim0    unlimited dimension first (no coordinate rotation)
+#   /ea_2d_unlim1    unlimited dimension last in a rank-2 dataset
+#   /ea_2d_wide_max  a fixed dimension whose *maximum* is wider than its current
+#                    size, so the chunk grid must come from the maximum dims
+#   /ea_3d_unlim2    rank 3 with the unlimited dimension last: the swizzle is a
+#                    rotation (0,1,2 → 2,0,1), not a swap of 0 and 2
+# ---------------------------------------------------------------------------
+ea_path = os.path.join(fixtures_dir, "chunked_ea.h5")
+with h5py.File(ea_path, "w", libver="latest") as f:
+    f.create_dataset("ea_1d", data=np.arange(10, dtype="int32"), chunks=(3,), maxshape=(None,))
+    f.create_dataset(
+        "ea_1d_blocks", data=np.arange(500, dtype="int32"), chunks=(4,), maxshape=(None,)
+    )
+    f.create_dataset(
+        "ea_1d_secondary", data=np.arange(400, dtype="int32"), chunks=(1,), maxshape=(None,)
+    )
+    f.create_dataset(
+        "ea_1d_gzip",
+        data=np.arange(200, dtype="int32"),
+        chunks=(8,),
+        maxshape=(None,),
+        compression="gzip",
+    )
+    sparse = f.create_dataset(
+        "ea_1d_sparse",
+        shape=(40,),
+        dtype="int32",
+        chunks=(4,),
+        maxshape=(None,),
+        fillvalue=-7,
+    )
+    sparse[0:4] = np.arange(100, 104, dtype="int32")
+    sparse[20:24] = np.arange(200, 204, dtype="int32")
+    f.create_dataset(
+        "ea_2d_unlim0",
+        data=np.arange(24, dtype="int32").reshape(6, 4),
+        chunks=(2, 2),
+        maxshape=(None, 4),
+    )
+    f.create_dataset(
+        "ea_2d_unlim1",
+        data=np.arange(24, dtype="int32").reshape(4, 6),
+        chunks=(2, 2),
+        maxshape=(4, None),
+    )
+    f.create_dataset(
+        "ea_2d_wide_max",
+        data=np.arange(24, dtype="int32").reshape(6, 4),
+        chunks=(2, 2),
+        maxshape=(None, 8),
+    )
+    f.create_dataset(
+        "ea_3d_unlim2",
+        data=np.arange(96, dtype="int32").reshape(4, 6, 4),
+        chunks=(2, 2, 2),
+        maxshape=(4, 6, None),
+    )
+print(f"Generated {ea_path}")
+
 print("Done.")

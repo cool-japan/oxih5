@@ -19,10 +19,14 @@ fn reads_oxih5_021_flat_dimension_list_fixture() {
         .join("tests")
         .join("fixtures")
         .join("prefix_021_basic.nc");
-    if !path.exists() {
-        eprintln!("fixture {} missing — skipping", path.display());
-        return;
-    }
+    // Tracked in git (`tests/fixtures/prefix_021_basic.nc`) — a missing file
+    // means a broken checkout and must fail the test loudly, not skip it
+    // silently.
+    assert!(
+        path.exists(),
+        "fixture prefix_021_basic.nc missing at {} — it is tracked in git",
+        path.display()
+    );
 
     let nc = NcFile::open(&path).expect("open 0.2.x fixture");
     let root = nc.root_group().expect("root_group");

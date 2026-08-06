@@ -568,8 +568,7 @@ mod tests {
         let entries: Vec<SnodEntry> = (0..n)
             .map(|i| SnodEntry {
                 name_offset: 8 * (i as u64 + 1),
-                oh_addr: 0x1_0000 + i as u64,
-                group_cache: None,
+                value: super::super::format::SnodValue::Object(0x1_0000 + i as u64),
             })
             .collect();
         let total = table.btree_bytes() + table.snod_bytes();

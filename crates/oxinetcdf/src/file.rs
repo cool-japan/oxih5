@@ -606,9 +606,14 @@ mod tests {
             .parent()
             .unwrap()
             .join("oxih5/tests/fixtures/string_datasets.h5");
-        if !fixture.exists() {
-            return; // fixture not available in this build environment
-        }
+        // Tracked in git (`crates/oxih5/tests/fixtures/string_datasets.h5`) — a
+        // missing file means a broken checkout, and returning early here would
+        // turn this test into a silent pass with no signal.
+        assert!(
+            fixture.exists(),
+            "fixture string_datasets.h5 missing at {} — it is tracked in git",
+            fixture.display()
+        );
         let nc = NcFile::open(&fixture).unwrap();
         let root = nc.root_group().unwrap();
         // The fixture has string datasets; just check that root_group() succeeds
