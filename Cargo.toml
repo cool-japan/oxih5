@@ -24,10 +24,10 @@ oxinetcdf      = { path = "crates/oxinetcdf",     version = "0.2.4" }
 thiserror      = { version = "2" }
 # COOLJAPAN Pure-Rust DEFLATE/zlib — used for the HDF5 gzip/deflate filter (id 1).
 # Never flate2 / miniz_oxide / zlib-ng (Pure Rust + COOLJAPAN policy).
-oxiarc-deflate = { version = "0.4.1" }
+oxiarc-deflate = { version = "0.4.2" }
 # COOLJAPAN Pure-Rust SZIP/AEC — used for the HDF5 szip filter (id 4), behind the `szip` feature.
 # Published on crates.io (since v0.3.2); resolved from the registry, no path override.
-oxiarc-szip    = "0.4.1"
+oxiarc-szip    = "0.4.2"
 memmap2        = { version = "0.9" }
 criterion      = { version = "0.8", features = ["html_reports"] }
 rayon          = { version = "1" }
